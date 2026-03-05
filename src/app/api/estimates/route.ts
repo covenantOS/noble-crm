@@ -7,6 +7,11 @@ export async function GET(request: NextRequest) {
         const searchParams = request.nextUrl.searchParams;
         const status = searchParams.get('status');
         const search = searchParams.get('search');
+        const dateFrom = searchParams.get('dateFrom');
+        const dateTo = searchParams.get('dateTo');
+        const priceMin = searchParams.get('priceMin');
+        const priceMax = searchParams.get('priceMax');
+        const sort = searchParams.get('sort') || 'date';
         const page = parseInt(searchParams.get('page') || '1');
         const limit = parseInt(searchParams.get('limit') || '20');
         const skip = (page - 1) * limit;
@@ -25,12 +30,36 @@ export async function GET(request: NextRequest) {
             ];
         }
 
+        if (dateFrom || dateTo) {
+            where.createdAt = {};
+            if (dateFrom) (where.createdAt as Record<string, Date>).gte = new Date(dateFrom);
+            if (dateTo) {
+                const end = new Date(dateTo);
+                end.setHours(23, 59, 59, 999);
+                (where.createdAt as Record<string, Date>).lte = end;
+            }
+        }
+        if (priceMin != null && priceMin !== '' || priceMax != null && priceMax !== '') {
+            const priceFilter: { gte?: number; lte?: number } = {};
+            if (priceMin != null && priceMin !== '') priceFilter.gte = parseFloat(priceMin);
+            if (priceMax != null && priceMax !== '') priceFilter.lte = parseFloat(priceMax);
+            where.basePrice = priceFilter;
+        }
+
+        const orderBy = sort === 'price_asc'
+            ? { basePrice: 'asc' as const }
+            : sort === 'price_desc'
+            ? { basePrice: 'desc' as const }
+            : sort === 'status'
+            ? [{ status: 'asc' as const }, { createdAt: 'desc' as const }]
+            : { createdAt: 'desc' as const };
+
         const [estimates, total] = await Promise.all([
             prisma.estimate.findMany({
                 where,
                 skip,
                 take: limit,
-                orderBy: { createdAt: 'desc' },
+                orderBy,
                 include: {
                     customer: { select: { firstName: true, lastName: true, email: true, phone: true } },
                     property: { select: { address: true, city: true, state: true, zip: true } },

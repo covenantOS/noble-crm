@@ -22,6 +22,7 @@ export async function GET(
                 contracts: {
                     include: {
                         payments: true,
+                        changeOrders: true,
                     },
                 },
             },

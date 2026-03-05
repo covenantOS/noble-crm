@@ -67,8 +67,33 @@ export async function POST(
     if (paymentType === 'COMPLETION') {
       await prisma.contract.update({
         where: { id: contractId },
-        data: { status: 'COMPLETED' },
+        data: { status: 'COMPLETED', completedAt: new Date() },
       });
+      // Review request (spec: "Review request sent via iMessage 24 hours after job completion")
+      const companyRows = await prisma.companySettings.findMany({
+        where: { key: { in: ['google_review_link', 'company_phone'] } },
+      });
+      const googleReviewLink = companyRows.find((r) => r.key === 'google_review_link')?.value || 'https://g.page/r/your-google-business/review';
+      const reviewMsg = renderTemplate(
+        'Hey {{firstName}}, your home looks amazing! We wrapped up at {{address}} and everything turned out great. Would you mind leaving us a quick Google review? It helps us a ton: {{googleReviewLink}}. Thanks for choosing Westchase Painting Company!',
+        {
+          firstName: contract.customer.firstName,
+          address: contract.estimate.property.address,
+          googleReviewLink,
+        }
+      );
+      if (contract.customer.phone) {
+        try { await sendBloo(contract.customer.phone, reviewMsg); } catch (_) {}
+      }
+      if (contract.customer.email) {
+        try {
+          await sendEmail({
+            to: contract.customer.email,
+            subject: `Thanks! — Review request for ${contract.estimate.property.address}`,
+            html: `<p>${reviewMsg.replace(/\n/g, '<br>')}</p><p><a href="${googleReviewLink}">Leave a Google review</a></p>`,
+          });
+        } catch (_) {}
+      }
     }
 
     const msg = renderTemplate(

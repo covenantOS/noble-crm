@@ -9,6 +9,7 @@ type Estimate = {
   status: string;
   scopeType: string;
   basePrice: number | null;
+  viewToken?: string | null;
   createdAt: string;
   customer: { firstName: string; lastName: string; email: string | null; phone: string };
   property: { address: string; city: string; state: string; zip: string };
@@ -27,21 +28,39 @@ const STATUS_OPTIONS = [
   { value: 'EXPIRED', label: 'Expired' },
 ];
 
+const SORT_OPTIONS = [
+  { value: 'date', label: 'Newest first' },
+  { value: 'price_desc', label: 'Price high–low' },
+  { value: 'price_asc', label: 'Price low–high' },
+  { value: 'status', label: 'Status' },
+];
+
 export default function EstimatesListPage() {
   const [estimates, setEstimates] = useState<Estimate[]>([]);
   const [pagination, setPagination] = useState({ page: 1, limit: 20, total: 0, pages: 0 });
   const [status, setStatus] = useState('all');
   const [search, setSearch] = useState('');
   const [searchApplied, setSearchApplied] = useState('');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+  const [priceMin, setPriceMin] = useState('');
+  const [priceMax, setPriceMax] = useState('');
+  const [sort, setSort] = useState('date');
   const [loading, setLoading] = useState(true);
+  const [actioningId, setActioningId] = useState<string | null>(null);
 
-  useEffect(() => {
+  const fetchList = () => {
     setLoading(true);
     const params = new URLSearchParams();
     params.set('page', String(pagination.page));
     params.set('limit', String(pagination.limit));
     if (status !== 'all') params.set('status', status);
     if (searchApplied.trim()) params.set('search', searchApplied.trim());
+    if (dateFrom) params.set('dateFrom', dateFrom);
+    if (dateTo) params.set('dateTo', dateTo);
+    if (priceMin) params.set('priceMin', priceMin);
+    if (priceMax) params.set('priceMax', priceMax);
+    params.set('sort', sort);
     fetch(`/api/estimates?${params}`)
       .then((r) => r.json())
       .then((data) => {
@@ -50,12 +69,58 @@ export default function EstimatesListPage() {
       })
       .catch(console.error)
       .finally(() => setLoading(false));
-  }, [status, pagination.page, searchApplied]);
+  };
+
+  useEffect(() => {
+    fetchList();
+  }, [status, pagination.page, searchApplied, dateFrom, dateTo, priceMin, priceMax, sort]);
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
     setSearchApplied(search);
     setPagination((p) => ({ ...p, page: 1 }));
+  };
+
+  const handleSend = async (est: Estimate) => {
+    if (!est.customer.email && !est.customer.phone) return alert('Customer has no email or phone.');
+    setActioningId(est.id);
+    try {
+      const res = await fetch(`/api/estimates/${est.id}/send`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Send failed');
+      fetchList();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Send failed');
+    } finally {
+      setActioningId(null);
+    }
+  };
+
+  const handleDuplicate = async (est: Estimate) => {
+    setActioningId(est.id);
+    try {
+      const res = await fetch(`/api/estimates/${est.id}/duplicate`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Duplicate failed');
+      window.location.href = `/estimates/${data.id}`;
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Duplicate failed');
+      setActioningId(null);
+    }
+  };
+
+  const handleDelete = async (est: Estimate) => {
+    if (!confirm(`Delete estimate for ${est.customer.firstName} ${est.customer.lastName} — ${est.property.address}?`)) return;
+    setActioningId(est.id);
+    try {
+      const res = await fetch(`/api/estimates/${est.id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error('Delete failed');
+      fetchList();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Delete failed');
+    } finally {
+      setActioningId(null);
+    }
   };
 
   const formatCurrency = (n: number | null) =>
@@ -92,7 +157,7 @@ export default function EstimatesListPage() {
       <div className="page-body">
         <div className="card">
           <div className="card-body">
-            <form onSubmit={handleSearch} style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 20 }}>
+            <form onSubmit={handleSearch} style={{ display: 'flex', flexWrap: 'wrap', gap: 12, marginBottom: 20 }}>
               <input
                 type="search"
                 placeholder="Search by customer or address..."
@@ -110,22 +175,22 @@ export default function EstimatesListPage() {
               <select
                 value={status}
                 onChange={(e) => setStatus(e.target.value)}
-                style={{
-                  padding: '10px 14px',
-                  border: '1px solid var(--gray-200)',
-                  borderRadius: 'var(--radius-sm)',
-                  fontSize: 14,
-                }}
+                style={{ padding: '10px 14px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)', fontSize: 14 }}
               >
                 {STATUS_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
+                  <option key={o.value} value={o.value}>{o.label}</option>
                 ))}
               </select>
-              <button type="submit" className="btn btn-primary">
-                Search
-              </button>
+              <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} style={{ padding: '10px 14px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)', fontSize: 14 }} title="From date" />
+              <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} style={{ padding: '10px 14px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)', fontSize: 14 }} title="To date" />
+              <input type="number" placeholder="Min $" value={priceMin} onChange={(e) => setPriceMin(e.target.value)} min={0} step={100} style={{ width: 90, padding: '10px 14px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)', fontSize: 14 }} />
+              <input type="number" placeholder="Max $" value={priceMax} onChange={(e) => setPriceMax(e.target.value)} min={0} step={100} style={{ width: 90, padding: '10px 14px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)', fontSize: 14 }} />
+              <select value={sort} onChange={(e) => setSort(e.target.value)} style={{ padding: '10px 14px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)', fontSize: 14 }}>
+                {SORT_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+              <button type="submit" className="btn btn-primary">Search</button>
             </form>
 
             {loading ? (
@@ -167,10 +232,13 @@ export default function EstimatesListPage() {
                         </td>
                         <td className="cell-primary">{formatCurrency(est.basePrice)}</td>
                         <td className="cell-muted">{formatDate(est.createdAt)}</td>
-                        <td>
-                          <Link href={`/estimates/${est.id}`} className="btn btn-ghost btn-sm">
-                            View
-                          </Link>
+                        <td style={{ whiteSpace: 'nowrap' }}>
+                          <Link href={`/estimates/${est.id}`} className="btn btn-ghost btn-sm">View</Link>
+                          {['DRAFT', 'REVIEW'].includes(est.status) && (est.customer.email || est.customer.phone) && (
+                            <button type="button" className="btn btn-ghost btn-sm" disabled={actioningId === est.id} onClick={() => handleSend(est)}>{actioningId === est.id ? '…' : 'Send'}</button>
+                          )}
+                          <button type="button" className="btn btn-ghost btn-sm" disabled={!!actioningId} onClick={() => handleDuplicate(est)}>Duplicate</button>
+                          <button type="button" className="btn btn-ghost btn-sm" disabled={!!actioningId} onClick={() => handleDelete(est)}>Delete</button>
                         </td>
                       </tr>
                     ))}

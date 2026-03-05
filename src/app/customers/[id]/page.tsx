@@ -5,6 +5,23 @@ import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { useEffect, useState } from 'react';
 
+type PaymentRow = {
+  id: string;
+  type: string;
+  amount: number;
+  status: string;
+  paidAt: string | null;
+  dueDate: string | null;
+  propertyAddress?: string;
+};
+type MessageRow = {
+  id: string;
+  direction: string;
+  channel: string;
+  content: string;
+  status: string;
+  createdAt: string;
+};
 type Customer = {
   id: string;
   firstName: string;
@@ -16,6 +33,8 @@ type Customer = {
   state: string | null;
   zip: string | null;
   notes: string | null;
+  totalRevenue?: number;
+  lastActivity?: string | null;
   properties: Array<{ id: string; address: string; city: string; state: string; zip: string }>;
   estimates: Array<{
     id: string;
@@ -25,6 +44,8 @@ type Customer = {
     property: { address: string };
   }>;
   contracts: Array<{ id: string; status: string; totalAmount: number; createdAt: string }>;
+  payments?: PaymentRow[];
+  messages?: MessageRow[];
 };
 
 export default function CustomerDetailPage() {
@@ -70,6 +91,12 @@ export default function CustomerDetailPage() {
             {customer.phone}
             {customer.email && <> · {customer.email}</>}
           </p>
+          {(customer.totalRevenue != null && customer.totalRevenue > 0) && (
+            <p style={{ marginTop: 4, fontSize: 14, color: 'var(--gray-600)' }}>
+              Total revenue: {formatCurrency(customer.totalRevenue)}
+              {customer.lastActivity && ` · Last activity: ${formatDate(customer.lastActivity)}`}
+            </p>
+          )}
         </div>
         <Link href={`/estimates/new`} className="btn btn-primary">
           New estimate for this customer
@@ -181,6 +208,65 @@ export default function CustomerDetailPage() {
             )}
           </div>
         </div>
+
+        {customer.payments && customer.payments.length > 0 && (
+          <div className="card">
+            <div className="card-header"><h2>Payments</h2></div>
+            <div className="card-body" style={{ padding: 0 }}>
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Type</th>
+                    <th>Amount</th>
+                    <th>Status</th>
+                    <th>Due</th>
+                    <th>Paid</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {customer.payments.map((p) => (
+                    <tr key={p.id}>
+                      <td>{formatStatus(p.type)}</td>
+                      <td>{formatCurrency(p.amount)}</td>
+                      <td>{formatStatus(p.status)}</td>
+                      <td className="cell-muted">{p.dueDate ? formatDate(p.dueDate) : '—'}</td>
+                      <td className="cell-muted">{p.paidAt ? formatDate(p.paidAt) : '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {customer.messages && customer.messages.length > 0 && (
+          <div className="card">
+            <div className="card-header"><h2>Message History</h2></div>
+            <div className="card-body" style={{ padding: 0 }}>
+              <ul style={{ margin: 0, padding: 0, listStyle: 'none' }}>
+                {customer.messages.map((m) => (
+                  <li
+                    key={m.id}
+                    style={{
+                      padding: '12px 16px',
+                      borderBottom: '1px solid var(--gray-100)',
+                      fontSize: 13,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 4,
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span style={{ fontWeight: 600, textTransform: 'capitalize' }}>{m.direction.toLowerCase()} · {m.channel}</span>
+                      <span style={{ color: 'var(--gray-500)', fontSize: 12 }}>{formatDate(m.createdAt)}</span>
+                    </div>
+                    <div style={{ color: 'var(--gray-700)', whiteSpace: 'pre-wrap' }}>{m.content.slice(0, 200)}{m.content.length > 200 ? '…' : ''}</div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
       </div>
     </AppLayout>
   );

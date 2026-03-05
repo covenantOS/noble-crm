@@ -19,6 +19,13 @@ const COMPANY_KEYS = [
   'credentials',
 ];
 
+const POLICY_KEYS: { key: string; label: string }[] = [
+  { key: 'policy_subcontractor', label: 'Sub-Contractor Payment Policy' },
+  { key: 'policy_material', label: 'Material Procurement Policy' },
+  { key: 'policy_quality', label: 'Quality Control Policy' },
+  { key: 'policy_review', label: 'Review Collection Policy' },
+];
+
 export default function SettingsPage() {
   const [pricing, setPricing] = useState<PricingItem[]>([]);
   const [company, setCompany] = useState<Record<string, string>>({});
@@ -197,6 +204,46 @@ export default function SettingsPage() {
                 </div>
               ))}
             </div>
+          </div>
+        </div>
+
+        {/* Internal policies (admin reference) */}
+        <div className="card" style={{ marginBottom: 24 }}>
+          <div className="card-header">
+            <h2>Internal Operations Policies</h2>
+            <button
+              type="button"
+              className="btn btn-primary btn-sm"
+              onClick={saveCompany}
+              disabled={savingSection === 'company'}
+            >
+              {savingSection === 'company' ? 'Saving…' : 'Save policies'}
+            </button>
+          </div>
+          <div className="card-body">
+            <p style={{ fontSize: 13, color: 'var(--gray-500)', marginBottom: 16 }}>
+              Reference policies for the team. Stored in company settings.
+            </p>
+            {POLICY_KEYS.map(({ key: pk, label }) => (
+              <div key={pk} style={{ marginBottom: 20 }}>
+                <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--gray-600)', display: 'block', marginBottom: 6 }}>
+                  {label}
+                </label>
+                <textarea
+                  value={company[pk] ?? ''}
+                  onChange={(e) => setCompany((prev) => ({ ...prev, [pk]: e.target.value }))}
+                  rows={4}
+                  style={{
+                    width: '100%',
+                    padding: '10px 12px',
+                    border: '1px solid var(--gray-200)',
+                    borderRadius: 'var(--radius-sm)',
+                    fontSize: 14,
+                    fontFamily: 'inherit',
+                  }}
+                />
+              </div>
+            ))}
           </div>
         </div>
 

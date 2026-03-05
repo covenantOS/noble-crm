@@ -9,6 +9,14 @@ interface DashboardStats {
   closeRate: number;
   revenueThisMonth: number;
   averageJobSize: number;
+  activeEstimatesCount: number;
+}
+
+interface ActivityItem {
+  type: string;
+  id: string;
+  at: string | null;
+  label: string;
 }
 
 interface RecentEstimate {
@@ -63,8 +71,10 @@ export default function DashboardPage() {
     closeRate: 0,
     revenueThisMonth: 0,
     averageJobSize: 0,
+    activeEstimatesCount: 0,
   });
   const [recentEstimates, setRecentEstimates] = useState<RecentEstimate[]>([]);
+  const [recentActivity, setRecentActivity] = useState<ActivityItem[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -76,8 +86,9 @@ export default function DashboardPage() {
       const response = await fetch('/api/dashboard');
       if (response.ok) {
         const data = await response.json();
-        setStats(data.stats);
-        setRecentEstimates(data.recentEstimates);
+        setStats(data.stats ?? {});
+        setRecentEstimates(data.recentEstimates ?? []);
+        setRecentActivity(data.recentActivity ?? []);
       }
     } catch (error) {
       console.error('Failed to fetch dashboard data:', error);
@@ -149,6 +160,16 @@ export default function DashboardPage() {
               {loading ? <div className="skeleton" style={{ width: 60, height: 32 }} /> : stats.estimatesThisMonth}
             </div>
             <div className="stat-card-label">Estimates This Month</div>
+          </div>
+
+          <div className="stat-card animate-fade-in stagger-1b">
+            <div className="stat-card-icon navy">
+              <EstimateStatIcon />
+            </div>
+            <div className="stat-card-value">
+              {loading ? <div className="skeleton" style={{ width: 60, height: 32 }} /> : (stats.activeEstimatesCount ?? 0)}
+            </div>
+            <div className="stat-card-label">Active (in progress / awaiting)</div>
           </div>
 
           <div className="stat-card animate-fade-in stagger-2">
@@ -279,6 +300,37 @@ export default function DashboardPage() {
                 </Link>
               </div>
             </div>
+
+            {/* Recent Activity */}
+            {recentActivity.length > 0 && (
+              <div className="card animate-fade-in" style={{ animationDelay: '350ms' }}>
+                <div className="card-header">
+                  <h2>Recent Activity</h2>
+                </div>
+                <div className="card-body" style={{ padding: 0 }}>
+                  <ul style={{ margin: 0, padding: 0, listStyle: 'none' }}>
+                    {recentActivity.map((a) => (
+                      <li
+                        key={`${a.type}-${a.id}`}
+                        style={{
+                          padding: '10px 16px',
+                          borderBottom: '1px solid var(--gray-100)',
+                          fontSize: 13,
+                          color: 'var(--gray-700)',
+                        }}
+                      >
+                        {a.at && (
+                          <span style={{ color: 'var(--gray-500)', marginRight: 8 }}>
+                            {formatTimeAgo(a.at)}
+                          </span>
+                        )}
+                        {a.label}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            )}
 
             {/* Company Credentials Card */}
             <div className="card animate-fade-in" style={{ animationDelay: '400ms' }}>

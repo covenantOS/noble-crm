@@ -10,7 +10,9 @@ type Customer = {
   lastName: string;
   email: string | null;
   phone: string;
-  _count?: { estimates: number };
+  estimateCount?: number;
+  totalRevenue?: number;
+  lastActivity?: string | null;
 };
 
 export default function CustomersListPage() {
@@ -70,6 +72,9 @@ export default function CustomersListPage() {
                     <th>Name</th>
                     <th>Phone</th>
                     <th>Email</th>
+                    <th>Estimates</th>
+                    <th>Revenue</th>
+                    <th>Last activity</th>
                     <th></th>
                   </tr>
                 </thead>
@@ -83,6 +88,15 @@ export default function CustomersListPage() {
                       </td>
                       <td>{c.phone}</td>
                       <td className="cell-muted">{c.email ?? '—'}</td>
+                      <td>{c.estimateCount ?? 0}</td>
+                      <td>
+                        {c.totalRevenue != null && c.totalRevenue > 0
+                          ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(c.totalRevenue)
+                          : '—'}
+                      </td>
+                      <td className="cell-muted">
+                        {c.lastActivity ? new Date(c.lastActivity).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—'}
+                      </td>
                       <td>
                         <Link href={`/customers/${c.id}`} className="btn btn-ghost btn-sm">
                           View

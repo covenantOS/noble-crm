@@ -27,7 +27,14 @@ export async function GET(
         },
         contracts: {
           orderBy: { createdAt: 'desc' },
-          take: 10,
+          include: {
+            payments: true,
+            estimate: { select: { property: { select: { address: true } } } },
+          },
+        },
+        messages: {
+          orderBy: { createdAt: 'desc' },
+          take: 50,
         },
       },
     });
@@ -36,7 +43,29 @@ export async function GET(
       return NextResponse.json({ error: 'Customer not found' }, { status: 404 });
     }
 
-    return NextResponse.json(customer);
+    const payments = customer.contracts.flatMap((c: { payments: unknown[]; estimate: { property: { address: string } }; id: string }) =>
+      (c.payments as { id: string; type: string; amount: number; status: string; paidAt: Date | null; dueDate: Date | null; contractId: string }[]).map((p) => ({
+        ...p,
+        contractId: c.id,
+        propertyAddress: c.estimate?.property?.address,
+      }))
+    );
+    const totalRevenue = payments
+      .filter((p: { status: string }) => p.status === 'COMPLETED')
+      .reduce((sum: number, p: { amount: number }) => sum + p.amount, 0);
+    const dates: Date[] = [];
+    if (customer.messages[0]?.createdAt) dates.push(customer.messages[0].createdAt);
+    payments.forEach((p: { paidAt: Date | null }) => { if (p.paidAt) dates.push(p.paidAt); });
+    customer.contracts.forEach((c: { signedAt: Date | null }) => { if (c.signedAt) dates.push(c.signedAt); });
+    customer.estimates.forEach((e: { createdAt: Date }) => dates.push(e.createdAt));
+    const lastActivity = dates.length > 0 ? new Date(Math.max(...dates.map((d) => d.getTime()))).toISOString() : null;
+
+    return NextResponse.json({
+      ...customer,
+      payments,
+      totalRevenue,
+      lastActivity,
+    });
   } catch (error) {
     console.error('Customer detail error:', error);
     return NextResponse.json({ error: 'Failed to fetch customer' }, { status: 500 });

@@ -54,6 +54,159 @@ function SendToCustomerButton({ estimateId, onSent }: { estimateId: string; onSe
   );
 }
 
+function ContractStartDate({ contract, onUpdated }: { contract: Contract; onUpdated: () => void }) {
+  const [date, setDate] = useState(contract.scheduledStartDate ? contract.scheduledStartDate.slice(0, 10) : '');
+  const [saving, setSaving] = useState(false);
+
+  const save = async (newDate: string) => {
+    setSaving(true);
+    try {
+      const res = await fetch(`/api/contracts/${contract.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scheduledStartDate: newDate || null }),
+      });
+      if (!res.ok) throw new Error('Failed');
+      onUpdated();
+    } catch (_) {
+      setDate(contract.scheduledStartDate ? contract.scheduledStartDate.slice(0, 10) : '');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <span style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+      <label style={{ color: 'var(--gray-600)' }}>Job start:</label>
+      <input
+        type="date"
+        value={date}
+        onChange={(e) => setDate(e.target.value)}
+        onBlur={(e) => e.target.value !== (contract.scheduledStartDate?.slice(0, 10) ?? '') && save(e.target.value)}
+        disabled={saving}
+        style={{ padding: '4px 8px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)', fontSize: 13 }}
+      />
+    </span>
+  );
+}
+
+function AddChangeOrderButton({ contractId, onAdded }: { contractId: string; onAdded: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [description, setDescription] = useState('');
+  const [material, setMaterial] = useState('');
+  const [labor, setLabor] = useState('');
+
+  const submit = async () => {
+    if (!description.trim()) return;
+    setLoading(true);
+    try {
+      const res = await fetch('/api/change-orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contractId,
+          description: description.trim(),
+          additionalMaterialCost: material ? parseFloat(material) : 0,
+          additionalLaborCost: labor ? parseFloat(labor) : 0,
+        }),
+      });
+      if (!res.ok) throw new Error((await res.json()).error || 'Failed');
+      setDescription('');
+      setMaterial('');
+      setLabor('');
+      setOpen(false);
+      onAdded();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <button type="button" className="btn btn-ghost btn-sm" onClick={() => setOpen(true)}>
+        Add change order
+      </button>
+    );
+  }
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+      <input
+        placeholder="Description"
+        value={description}
+        onChange={(e) => setDescription(e.target.value)}
+        style={{ padding: '8px 12px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)', fontSize: 14 }}
+      />
+      <div style={{ display: 'flex', gap: 8 }}>
+        <input type="number" placeholder="Material $" value={material} onChange={(e) => setMaterial(e.target.value)} min={0} step={10} style={{ width: 100, padding: '8px 12px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)', fontSize: 14 }} />
+        <input type="number" placeholder="Labor $" value={labor} onChange={(e) => setLabor(e.target.value)} min={0} step={10} style={{ width: 100, padding: '8px 12px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)', fontSize: 14 }} />
+      </div>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button type="button" className="btn btn-primary btn-sm" disabled={loading} onClick={submit}>Save</button>
+        <button type="button" className="btn btn-ghost btn-sm" onClick={() => setOpen(false)}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+function ContractMilestoneButtons({ contracts, onDone }: { contracts: Contract[]; onDone: () => void }) {
+  const [loading, setLoading] = useState<string | null>(null);
+  const active = contracts.find((c) => c.paymentTier === 'PAYMENT_PLAN' && (c.status === 'ACTIVE' || c.status === 'SIGNED'));
+  if (!active) return null;
+  const hasScheduledMidpoint = active.payments.some((p) => p.type === 'MIDPOINT' && p.status === 'SCHEDULED');
+  const hasScheduledCompletion = active.payments.some((p) => p.type === 'COMPLETION' && p.status === 'SCHEDULED');
+  const charge = async (paymentType: 'MIDPOINT' | 'COMPLETION') => {
+    setLoading(paymentType);
+    try {
+      const res = await fetch(`/api/contracts/${active.id}/charge-payment`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paymentType }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Charge failed');
+      onDone();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Charge failed');
+    } finally {
+      setLoading(null);
+    }
+  };
+  return (
+    <>
+      {hasScheduledMidpoint && (
+        <button type="button" className="btn btn-outline btn-sm" disabled={!!loading} onClick={() => charge('MIDPOINT')}>
+          {loading === 'MIDPOINT' ? '…' : 'Mark midpoint'}
+        </button>
+      )}
+      {hasScheduledCompletion && (
+        <button type="button" className="btn btn-outline btn-sm" disabled={!!loading} onClick={() => charge('COMPLETION')}>
+          {loading === 'COMPLETION' ? '…' : 'Mark complete'}
+        </button>
+      )}
+    </>
+  );
+}
+
+type ChangeOrder = {
+  id: string;
+  description: string;
+  status: string;
+  additionalPrice: number | null;
+  proposedAt: string;
+};
+type Contract = {
+  id: string;
+  status: string;
+  paymentTier: string;
+  totalAmount: number;
+  scheduledStartDate?: string | null;
+  stripePaymentMethodId: string | null;
+  payments: Array<{ id: string; type: string; status: string; amount: number }>;
+  changeOrders?: ChangeOrder[];
+};
 type Estimate = {
   id: string;
   status: string;
@@ -72,6 +225,7 @@ type Estimate = {
   property: { address: string; city: string; state: string; zip: string };
   lineItems: Array<{ id: string; category: string; description: string; quantity: number; unit: string; unitCost: number; totalCost: number }>;
   photos: Array<{ id: string; url: string; caption: string | null; location: string | null }>;
+  contracts?: Contract[];
   aiAnalysis?: {
     photoAnalysis?: Array<{ photoIndex: number; findings: string; severity: string; recommendation?: string }>;
     flags?: Array<{ type: string; message: string; estimatedAdditionalCost?: number | null }>;
@@ -85,6 +239,14 @@ export default function EstimateDetailPage() {
   const isReview = searchParams?.get('review') === '1';
   const [estimate, setEstimate] = useState<Estimate | null>(null);
   const [loading, setLoading] = useState(true);
+
+  const refreshEstimate = () => {
+    if (!id) return;
+    fetch(`/api/estimates/${id}`)
+      .then((r) => r.json())
+      .then(setEstimate)
+      .catch(console.error);
+  };
 
   useEffect(() => {
     if (!id) return;
@@ -143,9 +305,14 @@ export default function EstimateDetailPage() {
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           <span className={getStatusClass(estimate.status)}>{formatStatus(estimate.status)}</span>
           {viewLink && (
-            <a href={viewLink} target="_blank" rel="noopener noreferrer" className="btn btn-outline btn-sm">
-              View customer page
-            </a>
+            <>
+              <a href={viewLink} target="_blank" rel="noopener noreferrer" className="btn btn-outline btn-sm">
+                View customer page
+              </a>
+              <a href={`${viewLink}/contract`} target="_blank" rel="noopener noreferrer" className="btn btn-outline btn-sm">
+                Contract / Sign link
+              </a>
+            </>
           )}
           {['DRAFT', 'REVIEW'].includes(estimate.status) && (estimate.customer.email || estimate.customer.phone) && (
             <SendToCustomerButton estimateId={estimate.id} onSent={() => setEstimate((e) => e ? { ...e, status: 'SENT' } : null)} />
@@ -154,6 +321,9 @@ export default function EstimateDetailPage() {
             Edit
           </Link>
           <DuplicateEstimateButton estimateId={estimate.id} />
+          {estimate.contracts?.some((c) => c.paymentTier === 'PAYMENT_PLAN' && (c.status === 'ACTIVE' || c.status === 'SIGNED')) && (
+            <ContractMilestoneButtons contracts={estimate.contracts} onDone={() => fetch(`/api/estimates/${id}`).then((r) => r.json()).then(setEstimate)} />
+          )}
         </div>
       </div>
 
@@ -290,6 +460,45 @@ export default function EstimateDetailPage() {
                   {pa.recommendation && <p style={{ margin: '8px 0 0', fontSize: 13, fontStyle: 'italic' }}>{pa.recommendation}</p>}
                 </div>
               ))}
+            </div>
+          </div>
+        )}
+
+        {estimate.contracts && estimate.contracts.length > 0 && (
+          <div className="card">
+            <div className="card-header">
+              <h2>Contracts & change orders</h2>
+            </div>
+            <div className="card-body">
+              {estimate.contracts.map((contract) => {
+                const approvedTotal = (contract.changeOrders ?? []).filter((co) => co.status === 'APPROVED' || co.status === 'COMPLETED').reduce((s, co) => s + (co.additionalPrice ?? 0), 0);
+                const adjustedTotal = contract.totalAmount + approvedTotal;
+                return (
+                  <div key={contract.id} style={{ marginBottom: 24, paddingBottom: 24, borderBottom: '1px solid var(--gray-100)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                      <span style={{ fontWeight: 600 }}>Contract · {formatStatus(contract.status)} · {formatCurrency(contract.totalAmount)}</span>
+                      {approvedTotal > 0 && (
+                        <span style={{ fontSize: 14, color: 'var(--gray-600)' }}>
+                          + {formatCurrency(approvedTotal)} change orders = <strong>{formatCurrency(adjustedTotal)}</strong> adjusted
+                        </span>
+                      )}
+                    </div>
+                    {(contract.changeOrders ?? []).length > 0 && (
+                      <ul style={{ margin: '0 0 12px', paddingLeft: 20, fontSize: 14 }}>
+                        {(contract.changeOrders ?? []).map((co) => (
+                          <li key={co.id}>
+                            {co.description} — {formatStatus(co.status)} {co.additionalPrice != null ? formatCurrency(co.additionalPrice) : ''}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginTop: 8 }}>
+                      <AddChangeOrderButton contractId={contract.id} onAdded={refreshEstimate} />
+                      <ContractStartDate contract={contract} onUpdated={refreshEstimate} />
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}
