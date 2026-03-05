@@ -32,7 +32,7 @@ export async function GET(request: NextRequest) {
     where: { key: { in: ['deposit_percent', 'midpoint_percent', 'completion_percent'] } },
   });
   const map: Record<string, number> = {};
-  configs.forEach((c) => { map[c.key] = parseFloat(c.value) || 0; });
+  configs.forEach((c: { key: string; value: string }) => { map[c.key] = parseFloat(c.value) || 0; });
   const depPct = map.deposit_percent || 50;
   const midPct = map.midpoint_percent || 40;
   const compPct = map.completion_percent || 10;
@@ -44,7 +44,7 @@ export async function GET(request: NextRequest) {
     where: { key: { in: ['companyName', 'companyAddress', 'companyPhone', 'companyEmail'] } },
   });
   const company: Record<string, string> = {};
-  companyRows.forEach((r) => { company[r.key] = r.value; });
+  companyRows.forEach((r: { key: string; value: string }) => { company[r.key] = r.value; });
 
   await prisma.estimate.update({
     where: { id: estimateId },
