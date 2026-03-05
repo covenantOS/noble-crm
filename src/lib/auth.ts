@@ -8,6 +8,12 @@ import CredentialsProvider from 'next-auth/providers/credentials';
 import { scryptSync, timingSafeEqual } from 'crypto';
 import prisma from '@/lib/prisma';
 
+// Trim so Vercel env (often stored with trailing newline) doesn't break JWT signing
+export function getNextAuthSecret(): string | undefined {
+  const s = process.env.NEXTAUTH_SECRET;
+  return s ? String(s).trim() || undefined : undefined;
+}
+
 const SALT = process.env.AUTH_PASSWORD_SALT || 'noble-estimator-default-salt-change-in-production';
 
 function hashPassword(password: string): string {
@@ -25,6 +31,7 @@ export function hashPasswordForSeed(password: string): string {
 }
 
 export const authOptions: NextAuthOptions = {
+  secret: getNextAuthSecret(),
   providers: [
     CredentialsProvider({
       name: 'Credentials',

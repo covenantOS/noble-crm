@@ -4,12 +4,17 @@ import type { NextRequest } from 'next/server';
 
 const API_AUTH_PREFIX = '/api/auth';
 
+function getSecret(): string | undefined {
+  const s = process.env.NEXTAUTH_SECRET;
+  return s ? String(s).trim() || undefined : undefined;
+}
+
 function isPublicPath(pathname: string): boolean {
   if (pathname.startsWith(API_AUTH_PREFIX)) return true;
   if (pathname === '/login') return true;
   if (pathname.startsWith('/view')) return true;
   if (pathname.startsWith('/customer')) return true;
-  if (pathname.startsWith('/api/view') || pathname.startsWith('/api/customer') || pathname.startsWith('/api/contracts') || pathname.startsWith('/api/webhooks')) return true;
+  if (pathname.startsWith('/api/view') || pathname.startsWith('/api/customer') || pathname.startsWith('/api/contracts') || pathname.startsWith('/api/webhooks') || pathname === '/api/bootstrap') return true;
   return false;
 }
 
@@ -21,7 +26,7 @@ export async function middleware(request: NextRequest) {
 
   const token = await getToken({
     req: request,
-    secret: process.env.NEXTAUTH_SECRET,
+    secret: getSecret(),
   });
 
   if (!token) {
