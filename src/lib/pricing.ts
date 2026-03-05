@@ -141,7 +141,7 @@ export function calculateMaterialCosts(
     const surfacesNeedingPrimer = measurements.filter(
         m => m.condition === 'FAIR' || m.condition === 'POOR'
     );
-    const primerArea = surfacesNeedingPrimer.reduce((sum, m) => sum + (m.netPaintableArea || 0), 0);
+    const primerArea = surfacesNeedingPrimer.reduce((sum: number, m: SurfaceMeasurement) => sum + (m.netPaintableArea || 0), 0);
     const primerCoverage = getNum(config, 'primer_coverage_sqft_per_gallon', 350);
     const primerGallons = Math.ceil(primerArea / primerCoverage);
     const primerCost = getNum(config, 'primer_cost_per_gallon', 35);
@@ -195,7 +195,7 @@ export function calculateMaterialCosts(
         totalCost: miscCost,
     });
 
-    const totalMaterialCost = materials.reduce((sum, m) => sum + m.totalCost, 0);
+    const totalMaterialCost = materials.reduce((sum: number, m: MaterialCalculation) => sum + m.totalCost, 0);
 
     return { materials, totalMaterialCost };
 }
@@ -281,7 +281,7 @@ export function calculateLaborCosts(
         });
     }
 
-    const totalLaborCost = laborItems.reduce((sum, l) => sum + l.totalCost, 0);
+    const totalLaborCost = laborItems.reduce((sum: number, l: LaborCalculation) => sum + l.totalCost, 0);
 
     return { laborItems, totalLaborCost };
 }

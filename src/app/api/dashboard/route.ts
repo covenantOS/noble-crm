@@ -41,7 +41,7 @@ export async function GET() {
             select: { totalAmount: true },
         });
 
-        const revenueThisMonth = contracts.reduce((sum, c) => sum + c.totalAmount, 0);
+        const revenueThisMonth = contracts.reduce((sum: number, c: { totalAmount: number }) => sum + c.totalAmount, 0);
         const averageJobSize = contracts.length > 0
             ? Math.round(revenueThisMonth / contracts.length)
             : 0;
@@ -56,7 +56,7 @@ export async function GET() {
             },
         });
 
-        const formattedEstimates = recentEstimates.map(est => ({
+        const formattedEstimates = recentEstimates.map((est: { id: string; customer: { firstName: string; lastName: string }; property: { address: string }; status: string; basePrice: number | null; createdAt: Date }) => ({
             id: est.id,
             customerName: `${est.customer.firstName} ${est.customer.lastName}`,
             propertyAddress: est.property.address,
