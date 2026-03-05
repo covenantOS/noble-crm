@@ -53,7 +53,7 @@ export async function POST(request: NextRequest) {
       {}
     );
 
-    const measurementsForPricing: SurfaceMeasurement[] = estimate.measurements.map((m) => ({
+    const measurementsForPricing: SurfaceMeasurement[] = estimate.measurements.map((m: { surface: string; description: string | null; linearFeet: number | null; height: number | null; grossArea: number | null; windowDeduction: number | null; doorDeduction: number | null; netPaintableArea: number | null; coatsRequired: number | null }) => ({
       surfaceType: m.surface,
       description: m.description ?? undefined,
       linearFeet: m.linearFeet ?? undefined,
@@ -77,13 +77,13 @@ export async function POST(request: NextRequest) {
         yearBuilt: estimate.property.yearBuilt ?? undefined,
       },
       scopeType: estimate.scopeType,
-      surfaces: estimate.surfaces.map((s) => ({
+      surfaces: estimate.surfaces.map((s: { surfaceType: string; description: string | null; condition: string; notes: string | null }) => ({
         surfaceType: s.surfaceType,
         description: s.description ?? undefined,
         condition: s.condition,
         notes: s.notes ?? undefined,
       })),
-      measurements: estimate.measurements.map((m) => ({
+      measurements: estimate.measurements.map((m: { surface: string; description: string | null; linearFeet: number | null; height: number | null; grossArea: number | null; windowDeduction: number | null; doorDeduction: number | null; netPaintableArea: number | null; coatsRequired: number | null; notes: string | null }) => ({
         surface: m.surface,
         description: m.description ?? undefined,
         linearFeet: m.linearFeet ?? undefined,
