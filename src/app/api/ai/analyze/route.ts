@@ -37,15 +37,21 @@ export async function POST(request: NextRequest) {
     }
 
     const configRows = await prisma.pricingConfig.findMany();
-    const pricingConfig = configRows.reduce<Record<string, string>>((acc: Record<string, string>, r) => {
-      acc[r.key] = r.value;
-      return acc;
-    }, {});
+    const pricingConfig = configRows.reduce<Record<string, string>>(
+      (acc: Record<string, string>, r: { key: string; value: string }) => {
+        acc[r.key] = r.value;
+        return acc;
+      },
+      {}
+    );
 
-    const surfaceByType = estimate.surfaces.reduce<Record<string, { condition: string }>>((acc: Record<string, { condition: string }>, s) => {
-      acc[s.surfaceType] = { condition: s.condition };
-      return acc;
-    }, {});
+    const surfaceByType = estimate.surfaces.reduce<Record<string, { condition: string }>>(
+      (acc: Record<string, { condition: string }>, s: { surfaceType: string; condition: string }) => {
+        acc[s.surfaceType] = { condition: s.condition };
+        return acc;
+      },
+      {}
+    );
 
     const measurementsForPricing: SurfaceMeasurement[] = estimate.measurements.map((m) => ({
       surfaceType: m.surface,
