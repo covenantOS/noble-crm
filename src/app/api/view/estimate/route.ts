@@ -41,10 +41,14 @@ export async function GET(request: NextRequest) {
   const completionAmount = paymentPlanPrice - depositAmount - midpointAmount;
 
   const companyRows = await prisma.companySettings.findMany({
-    where: { key: { in: ['companyName', 'companyAddress', 'companyPhone', 'companyEmail'] } },
+    where: { key: { in: ['company_name', 'company_address', 'company_phone', 'company_email', 'companyName', 'companyAddress', 'companyPhone', 'companyEmail'] } },
   });
   const company: Record<string, string> = {};
-  companyRows.forEach((r: { key: string; value: string }) => { company[r.key] = r.value; });
+  const keyMap: Record<string, string> = { company_name: 'companyName', company_address: 'companyAddress', company_phone: 'companyPhone', company_email: 'companyEmail' };
+  companyRows.forEach((r: { key: string; value: string }) => {
+    const camel = keyMap[r.key] || r.key;
+    company[camel] = r.value;
+  });
 
   await prisma.estimate.update({
     where: { id: estimateId },

@@ -6,6 +6,23 @@
 - **Password:** `password`  
   *(Change after first login via Settings or by re-running seed with a new password.)*
 
+**If that account doesn’t exist:** use one of these:
+
+1. **Bootstrap from the live app (easiest)**  
+   Ensure `DATABASE_URL` and `NEXTAUTH_SECRET` are set in Vercel. Then call once:
+   ```bash
+   curl -X POST https://my.nobletampa.com/api/bootstrap -H "Content-Type: application/json" -d "{\"secret\": \"YOUR_NEXTAUTH_SECRET\"}"
+   ```
+   That creates the admin user. Then log in at `/login` with **will@westchasepainting.com** / **password**.  
+   (Optional: set `BOOTSTRAP_SECRET` in Vercel and use that instead of `NEXTAUTH_SECRET` in the request.)
+
+2. **Or run the full seed locally**  
+   Set `DATABASE_URL` (and `AUTH_PASSWORD_SALT` if you use it in Vercel) in your environment, then run:
+   ```bash
+   npx prisma db seed
+   ```
+   That creates the admin user plus all pricing config, message templates, and company settings.
+
 ---
 
 ## 1. Supabase database (Noble CRM project)

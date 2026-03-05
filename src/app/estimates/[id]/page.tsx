@@ -5,6 +5,55 @@ import Link from 'next/link';
 import { useParams, useSearchParams } from 'next/navigation';
 import { useEffect, useState } from 'react';
 
+function DuplicateEstimateButton({ estimateId }: { estimateId: string }) {
+  const [loading, setLoading] = useState(false);
+  const handleDuplicate = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`/api/estimates/${estimateId}/duplicate`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Duplicate failed');
+      window.location.href = `/estimates/${data.id}`;
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Duplicate failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+  return (
+    <button type="button" onClick={handleDuplicate} disabled={loading} className="btn btn-ghost btn-sm">
+      {loading ? 'Copying…' : 'Duplicate'}
+    </button>
+  );
+}
+
+function SendToCustomerButton({ estimateId, onSent }: { estimateId: string; onSent: () => void }) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const handleSend = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/estimates/${estimateId}/send`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Send failed');
+      onSent();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Send failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+  return (
+    <>
+      <button type="button" onClick={handleSend} disabled={loading} className="btn btn-primary btn-sm">
+        {loading ? 'Sending…' : 'Send to Customer'}
+      </button>
+      {error && <span style={{ color: 'var(--danger)', fontSize: 13 }}>{error}</span>}
+    </>
+  );
+}
+
 type Estimate = {
   id: string;
   status: string;
@@ -98,9 +147,13 @@ export default function EstimateDetailPage() {
               View customer page
             </a>
           )}
+          {['DRAFT', 'REVIEW'].includes(estimate.status) && (estimate.customer.email || estimate.customer.phone) && (
+            <SendToCustomerButton estimateId={estimate.id} onSent={() => setEstimate((e) => e ? { ...e, status: 'SENT' } : null)} />
+          )}
           <Link href={`/estimates/${estimate.id}/edit`} className="btn btn-ghost btn-sm">
             Edit
           </Link>
+          <DuplicateEstimateButton estimateId={estimate.id} />
         </div>
       </div>
 

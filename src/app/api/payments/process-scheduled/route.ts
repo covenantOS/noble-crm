@@ -51,7 +51,7 @@ export async function POST(request: NextRequest) {
       });
       if (!sentReminder) {
         try {
-          const companyPhone = (await prisma.companySettings.findUnique({ where: { key: 'companyPhone' } }))?.value || '(813) 555-0123';
+          const companyPhone = (await prisma.companySettings.findFirst({ where: { key: { in: ['company_phone', 'companyPhone'] } } }))?.value || '(813) 555-0123';
           const msg = renderTemplate(
             'Hey {{firstName}}, heads up — your scheduled payment of ${{amount}} for {{address}} will be charged to your card on file on {{date}}. If you need to update your payment method, reply or call us.',
             {
@@ -117,7 +117,7 @@ export async function POST(request: NextRequest) {
         where: { id: payment.id },
         data: { status: 'FAILED', failedAt: new Date() },
       });
-      const companyPhone = (await prisma.companySettings.findUnique({ where: { key: 'companyPhone' } }))?.value || '(813) 555-0123';
+      const companyPhone = (await prisma.companySettings.findFirst({ where: { key: { in: ['company_phone', 'companyPhone'] } } }))?.value || '(813) 555-0123';
       const failMsg = `We tried to process your scheduled payment of $${payment.amount} for ${contract.estimate.property.address} but it didn't go through. Please call us at ${companyPhone} or reply to update your payment method.`;
       if (contract.customer.phone) await sendBloo(contract.customer.phone, failMsg);
       if (contract.customer.email) {
