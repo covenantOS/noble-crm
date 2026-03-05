@@ -17,7 +17,7 @@ export async function GET() {
       prisma.messageTemplate.findMany({ orderBy: { key: 'asc' } }),
     ]);
 
-    const company = companySettings.reduce<Record<string, string>>((acc, s) => {
+    const company = companySettings.reduce<Record<string, string>>((acc: Record<string, string>, s: { key: string; value: string }) => {
       acc[s.key] = s.value;
       return acc;
     }, {});
