@@ -4,9 +4,17 @@
 
 import { Resend } from 'resend';
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+let resendInstance: Resend | null = null;
+function getResend(): Resend {
+  if (!resendInstance) {
+    const key = process.env.RESEND_API_KEY;
+    if (!key) throw new Error('RESEND_API_KEY is not set');
+    resendInstance = new Resend(key);
+  }
+  return resendInstance;
+}
 
-const DEFAULT_FROM = process.env.RESEND_FROM_EMAIL || 'estimates@westchasepainting.com';
+const DEFAULT_FROM = process.env.RESEND_FROM_EMAIL || 'estimates@mail.nobletampa.com';
 
 interface EmailOptions {
     to: string;
@@ -17,12 +25,12 @@ interface EmailOptions {
 }
 
 export async function sendEmail(options: EmailOptions) {
-    const { data, error } = await resend.emails.send({
+    const { data, error } = await getResend().emails.send({
         from: options.from || `Westchase Painting Company <${DEFAULT_FROM}>`,
         to: options.to,
         subject: options.subject,
         html: options.html,
-        reply_to: options.replyTo || 'will@westchasepainting.com',
+        replyTo: options.replyTo || 'will@westchasepainting.com',
     });
 
     if (error) {
@@ -157,5 +165,10 @@ export function buildPaymentReceiptEmail(
   `);
 }
 
+const resend = new Proxy({} as Resend, {
+  get(_, prop) {
+    return (getResend() as unknown as Record<string, unknown>)[prop as string];
+  },
+});
 export { resend };
 export default resend;

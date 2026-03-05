@@ -2,9 +2,9 @@
 
 import { signIn } from 'next-auth/react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { useState } from 'react';
+import { useState, Suspense } from 'react';
 
-export default function LoginPage() {
+function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const callbackUrl = searchParams.get('callbackUrl') || '/';
@@ -78,5 +78,13 @@ export default function LoginPage() {
         </form>
       </div>
     </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={<div className="login-page"><div className="login-card"><div className="login-header"><h1>Westchase Painting Co.</h1><p>By Noble</p></div><div style={{ padding: 32, textAlign: 'center' }}>Loading…</div></div></div>}>
+      <LoginForm />
+    </Suspense>
   );
 }

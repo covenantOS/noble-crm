@@ -1,104 +1,124 @@
 // ============================================
-// NOBLE ESTIMATOR — BLOO.IO CLIENT
+// NOBLE ESTIMATOR — BLOO.IO CLIENT (v2 API)
 // ============================================
-// iMessage (iOS) and RCS (Android) delivery
-// NOT SMS — arrives as blue bubble / RCS
+// iMessage (iOS) and RCS (Android) via https://docs.blooio.com/
+// Base URL: https://backend.blooio.com/v2/api
 
-const BLOO_API_BASE = 'https://api.bloo.io/v1';
+const BLOO_API_BASE = 'https://backend.blooio.com/v2/api';
 
-interface BlooSendResult {
-    messageId: string;
+export interface BlooSendResult {
+    message_id: string;
+    message_ids?: string[];
     status: string;
+    group_id?: string;
+    group_created?: boolean;
+    participants?: string[];
 }
 
 interface BlooMessageStatus {
-    messageId: string;
+    message_id: string;
     status: 'queued' | 'sent' | 'delivered' | 'read' | 'failed';
-    deliveredAt?: string;
-    readAt?: string;
+    delivered_at?: number;
+    read_at?: number;
+}
+
+function getApiKey(): string {
+    const apiKey = process.env.BLOO_API_KEY;
+    if (!apiKey) throw new Error('BLOO_API_KEY is not set');
+    return apiKey;
+}
+
+function getFromNumber(): string | undefined {
+    return process.env.BLOO_FROM_NUMBER?.trim() || undefined;
 }
 
 async function blooFetch(
     endpoint: string,
     options: RequestInit = {}
 ): Promise<Response> {
-    const apiKey = process.env.BLOO_API_KEY;
-    if (!apiKey) {
-        throw new Error('BLOO_API_KEY is not set');
-    }
-
     return fetch(`${BLOO_API_BASE}${endpoint}`, {
         ...options,
         headers: {
-            'Authorization': `Bearer ${apiKey}`,
+            'Authorization': `Bearer ${getApiKey()}`,
             'Content-Type': 'application/json',
             ...options.headers,
         },
     });
 }
 
-// Send a message via iMessage/RCS
+// Normalize phone to E.164 (e.g. +14245145517)
+export function normalizePhone(phone: string): string {
+    const digits = phone.replace(/\D/g, '');
+    if (digits.length === 10) return `+1${digits}`;
+    if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+    return `+${digits}`;
+}
+
+/**
+ * Send a message via iMessage/RCS.
+ * Uses BLOO_FROM_NUMBER (+14245145517) when set.
+ */
 export async function sendMessage(
     to: string,
     content: string,
     metadata?: Record<string, string>
 ): Promise<BlooSendResult> {
-    const response = await blooFetch('/messages', {
+    const chatId = encodeURIComponent(normalizePhone(to));
+    const fromNumber = getFromNumber();
+
+    const body: { text: string; from_number?: string; metadata?: Record<string, string> } = {
+        text: content,
+    };
+    if (fromNumber) body.from_number = normalizePhone(fromNumber);
+    if (metadata) body.metadata = metadata;
+
+    const response = await blooFetch(`/chats/${chatId}/messages`, {
         method: 'POST',
-        body: JSON.stringify({
-            to: normalizePhone(to),
-            content,
-            metadata,
-        }),
+        body: JSON.stringify(body),
     });
 
     if (!response.ok) {
-        const error = await response.text();
-        throw new Error(`Bloo API error: ${response.status} — ${error}`);
+        const err = await response.text();
+        throw new Error(`Bloo API error: ${response.status} — ${err}`);
     }
 
-    return response.json();
+    const data = (await response.json()) as BlooSendResult;
+    return data;
 }
 
-// Check message delivery status
-export async function getMessageStatus(messageId: string): Promise<BlooMessageStatus> {
-    const response = await blooFetch(`/messages/${messageId}`);
+/**
+ * Get message status (optional; webhooks are preferred).
+ * chatId = recipient E.164 phone.
+ */
+export async function getMessageStatus(
+    chatId: string,
+    messageId: string
+): Promise<BlooMessageStatus> {
+    const encoded = encodeURIComponent(normalizePhone(chatId));
+    const response = await blooFetch(
+        `/chats/${encoded}/messages/${encodeURIComponent(messageId)}/status`
+    );
 
-    if (!response.ok) {
-        throw new Error(`Bloo API error: ${response.status}`);
-    }
-
-    return response.json();
+    if (!response.ok) throw new Error(`Bloo API error: ${response.status}`);
+    return response.json() as Promise<BlooMessageStatus>;
 }
 
-// Template variable replacement
 export function renderTemplate(
     template: string,
     variables: Record<string, string>
 ): string {
-    let rendered = template;
-    for (const [key, value] of Object.entries(variables)) {
-        rendered = rendered.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value);
+    let out = template;
+    for (const [k, v] of Object.entries(variables)) {
+        out = out.replace(new RegExp(`\\{\\{${k}\\}\\}`, 'g'), v);
     }
-    return rendered;
-}
-
-// Normalize phone number to E.164 format
-function normalizePhone(phone: string): string {
-    const digits = phone.replace(/\D/g, '');
-    if (digits.length === 10) {
-        return `+1${digits}`;
-    }
-    if (digits.length === 11 && digits.startsWith('1')) {
-        return `+${digits}`;
-    }
-    return `+${digits}`;
+    return out;
 }
 
 export const bloo = {
     sendMessage,
     getMessageStatus,
     renderTemplate,
+    normalizePhone,
 };
 
 export default bloo;

@@ -6,10 +6,18 @@
 
 import Stripe from 'stripe';
 
-export const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
-    apiVersion: '2025-02-24.acacia' as Stripe.LatestApiVersion,
-    typescript: true,
-});
+let stripeInstance: Stripe | null = null;
+export function getStripe(): Stripe {
+    if (!stripeInstance) {
+        const key = process.env.STRIPE_SECRET_KEY;
+        if (!key) throw new Error('STRIPE_SECRET_KEY is not set');
+        stripeInstance = new Stripe(key, {
+            apiVersion: '2025-02-24.acacia' as Stripe.LatestApiVersion,
+            typescript: true,
+        });
+    }
+    return stripeInstance;
+}
 
 // Create or get a Stripe customer
 export async function getOrCreateStripeCustomer(
@@ -18,12 +26,12 @@ export async function getOrCreateStripeCustomer(
     phone?: string | null
 ): Promise<string> {
     // Search for existing customer
-    const existing = await stripe.customers.list({ email, limit: 1 });
+    const existing = await getStripe().customers.list({ email, limit: 1 });
     if (existing.data.length > 0) {
         return existing.data[0].id;
     }
 
-    const customer = await stripe.customers.create({
+    const customer = await getStripe().customers.create({
         email,
         name,
         phone: phone || undefined,
@@ -47,7 +55,7 @@ export async function createUpfrontCardCheckout(
     successUrl: string,
     cancelUrl: string
 ): Promise<Stripe.Checkout.Session> {
-    return stripe.checkout.sessions.create({
+    return getStripe().checkout.sessions.create({
         customer: stripeCustomerId,
         payment_method_types: ['card'],
         line_items: [
@@ -83,7 +91,7 @@ export async function createFinanceCheckout(
     successUrl: string,
     cancelUrl: string
 ): Promise<Stripe.Checkout.Session> {
-    return stripe.checkout.sessions.create({
+    return getStripe().checkout.sessions.create({
         customer: stripeCustomerId,
         payment_method_types: ['card', 'klarna', 'afterpay_clearpay'],
         line_items: [
@@ -119,7 +127,7 @@ export async function createPaymentPlanCheckout(
     successUrl: string,
     cancelUrl: string
 ): Promise<Stripe.Checkout.Session> {
-    return stripe.checkout.sessions.create({
+    return getStripe().checkout.sessions.create({
         customer: stripeCustomerId,
         payment_method_types: ['card'],
         line_items: [
@@ -158,7 +166,7 @@ export async function chargePaymentMethod(
     paymentType: 'MIDPOINT' | 'COMPLETION',
     propertyAddress: string
 ): Promise<Stripe.PaymentIntent> {
-    return stripe.paymentIntents.create({
+    return getStripe().paymentIntents.create({
         customer: stripeCustomerId,
         payment_method: paymentMethodId,
         amount: Math.round(amount * 100),
@@ -178,7 +186,7 @@ export async function chargePaymentMethod(
 export async function getSavedPaymentMethods(
     stripeCustomerId: string
 ): Promise<Stripe.PaymentMethod[]> {
-    const result = await stripe.paymentMethods.list({
+    const result = await getStripe().paymentMethods.list({
         customer: stripeCustomerId,
         type: 'card',
     });
@@ -190,11 +198,11 @@ export function constructWebhookEvent(
     payload: string | Buffer,
     signature: string
 ): Stripe.Event {
-    return stripe.webhooks.constructEvent(
+    return getStripe().webhooks.constructEvent(
         payload,
         signature,
         process.env.STRIPE_WEBHOOK_SECRET || ''
     );
 }
 
-export default stripe;
+export default getStripe;

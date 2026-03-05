@@ -4,7 +4,7 @@ import { authOptions } from '@/lib/auth';
 import prisma from '@/lib/prisma';
 import { analyzeEstimate } from '@/lib/ai';
 import { calculateFullPricing } from '@/lib/pricing';
-import type { SurfaceMeasurement } from '@/lib/pricing';
+import type { LineItem, SurfaceMeasurement } from '@/lib/pricing';
 
 export async function POST(request: NextRequest) {
   let estimateId: string | undefined;
@@ -37,12 +37,12 @@ export async function POST(request: NextRequest) {
     }
 
     const configRows = await prisma.pricingConfig.findMany();
-    const pricingConfig = configRows.reduce<Record<string, string>>((acc, r) => {
+    const pricingConfig = configRows.reduce<Record<string, string>>((acc: Record<string, string>, r) => {
       acc[r.key] = r.value;
       return acc;
     }, {});
 
-    const surfaceByType = estimate.surfaces.reduce<Record<string, { condition: string }>>((acc, s) => {
+    const surfaceByType = estimate.surfaces.reduce<Record<string, { condition: string }>>((acc: Record<string, { condition: string }>, s) => {
       acc[s.surfaceType] = { condition: s.condition };
       return acc;
     }, {});
@@ -105,7 +105,7 @@ export async function POST(request: NextRequest) {
     const pricingSummary = calculateFullPricing(measurementsForPricing, pricingConfig, {
       totalMaterialCost: summary.totalMaterialCost,
       totalLaborCost: summary.totalLaborCost,
-      lineItems: aiResult.lineItems,
+      lineItems: aiResult.lineItems as LineItem[],
     });
 
     const timelineStr = aiResult.timeline
@@ -125,14 +125,15 @@ export async function POST(request: NextRequest) {
           paymentPlanPrice: pricingSummary.tiers.paymentPlanPrice,
           scopeOfWork: aiResult.scopeOfWork,
           timeline: timelineStr,
-          aiAnalysis: aiResult as unknown as Record<string, unknown>,
+          aiAnalysis: JSON.parse(JSON.stringify(aiResult)),
         },
       }),
     ]);
 
+    const eid = estimateId as string;
     await prisma.estimateLineItem.createMany({
       data: aiResult.lineItems.map((item, i) => ({
-        estimateId,
+        estimateId: eid,
         category: item.category as 'PREP' | 'PAINT' | 'PRIMER' | 'TRIM' | 'DETAIL' | 'REPAIR' | 'MATERIAL' | 'OTHER',
         description: item.description,
         quantity: item.quantity,
@@ -144,7 +145,7 @@ export async function POST(request: NextRequest) {
     });
 
     const updated = await prisma.estimate.findUnique({
-      where: { id: estimateId },
+      where: { id: eid },
       include: { lineItems: true, customer: true, property: true },
     });
 
