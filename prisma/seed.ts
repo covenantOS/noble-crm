@@ -1,7 +1,12 @@
 import { PrismaClient, PricingCategory, MessageChannel } from '@prisma/client';
-import { hash } from 'crypto';
+import { scryptSync } from 'crypto';
 
 const prisma = new PrismaClient();
+
+const AUTH_SALT = process.env.AUTH_PASSWORD_SALT || 'noble-estimator-default-salt-change-in-production';
+function hashPassword(password: string): string {
+  return scryptSync(password, AUTH_SALT, 64).toString('hex');
+}
 
 async function main() {
   console.log('🌱 Seeding database...');
@@ -254,7 +259,8 @@ Westchase Painting Company by Noble`,
   // ========================
   // DEFAULT ADMIN USER
   // ========================
-  // We'll create a simple default admin user; in production, use NextAuth/Clerk
+  // Default password: "password" — change in production
+  const defaultPasswordHash = hashPassword('password');
   const adminExists = await prisma.user.findFirst({ where: { email: 'will@westchasepainting.com' } });
   if (!adminExists) {
     await prisma.user.create({
@@ -263,10 +269,16 @@ Westchase Painting Company by Noble`,
         email: 'will@westchasepainting.com',
         phone: '(813) 555-0123',
         role: 'OWNER',
-        passwordHash: 'placeholder_hash_change_in_production',
+        passwordHash: defaultPasswordHash,
       },
     });
-    console.log('✅ Created default admin user');
+    console.log('✅ Created default admin user (email: will@westchasepainting.com, password: password)');
+  } else {
+    await prisma.user.update({
+      where: { email: 'will@westchasepainting.com' },
+      data: { passwordHash: defaultPasswordHash },
+    });
+    console.log('✅ Updated default admin user password (password: password)');
   }
 
   console.log('🎉 Seeding complete!');
