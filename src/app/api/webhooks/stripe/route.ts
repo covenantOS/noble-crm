@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import Stripe from 'stripe';
 import prisma from '@/lib/prisma';
 import { getStripe } from '@/lib/stripe';
+import { sendEmail, buildContractSignedEmail, buildPaymentReceiptEmail } from '@/lib/resend';
+import { sendMessage as sendBloo } from '@/lib/bloo';
 
 export async function POST(request: NextRequest) {
   const rawBody = await request.text();
@@ -35,6 +37,13 @@ export async function POST(request: NextRequest) {
 
         const paymentTier = session.metadata?.paymentTier;
         const stripeCustomerId = session.customer as string;
+        const expectedCents = session.metadata?.expectedAmountCents;
+        const actualCents = session.amount_total ?? 0;
+        if (expectedCents != null && String(actualCents) !== String(expectedCents)) {
+          console.error(
+            `[Stripe webhook] Amount mismatch for contract ${contractId}: expected ${expectedCents} cents, got ${actualCents}. Proceeding with actual charge.`
+          );
+        }
 
         let paymentMethodId: string | undefined;
         if (session.payment_intent) {
@@ -42,12 +51,16 @@ export async function POST(request: NextRequest) {
           paymentMethodId = typeof pi.payment_method === 'string' ? pi.payment_method : pi.payment_method?.id;
         }
 
+        const viewToken = contract.estimate?.viewToken ?? (await prisma.estimate.findUnique({ where: { id: contract.estimateId }, select: { viewToken: true } }))?.viewToken ?? null;
+        const baseUrl = process.env.NEXTAUTH_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:3000');
+        const documentUrl = viewToken ? `${baseUrl}/api/contracts/${contractId}/pdf?token=${viewToken}` : null;
         await prisma.contract.update({
           where: { id: contractId },
           data: {
             status: 'SIGNED',
             stripeCustomerId: stripeCustomerId || undefined,
             ...(paymentMethodId && { stripePaymentMethodId: paymentMethodId }),
+            ...(documentUrl && { documentUrl }),
           },
         });
 
@@ -82,6 +95,38 @@ export async function POST(request: NextRequest) {
           where: { id: contract.estimateId },
           data: { status: 'APPROVED', approvedAt: new Date() },
         });
+
+        // Contract-signed + payment confirmation (one email + iMessage)
+        const firstName = contract.customer?.firstName ?? contract.customer?.lastName?.split(/\s+/)[0] ?? 'there';
+        const propertyAddress = contract.estimate?.property?.address ?? 'your property';
+        const paymentType = paymentTier === 'PAYMENT_PLAN' ? 'Deposit' : 'Full payment';
+        const amountStr = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
+        if (contract.customer?.email) {
+          try {
+            await sendEmail({
+              to: contract.customer.email,
+              subject: "You're all set – contract & payment received",
+              html: buildContractSignedEmail(firstName, propertyAddress),
+            });
+            await sendEmail({
+              to: contract.customer.email,
+              subject: `Payment receipt – ${amountStr}`,
+              html: buildPaymentReceiptEmail(firstName, propertyAddress, amountStr, paymentType),
+            });
+          } catch (emailErr) {
+            console.error('Stripe webhook: confirmation email failed', emailErr);
+          }
+        }
+        if (contract.customer?.phone) {
+          try {
+            await sendBloo(
+              contract.customer.phone,
+              `Hi ${firstName}, we've received your signed contract and ${paymentType.toLowerCase()} of ${amountStr} for ${propertyAddress}. You're on our schedule – we'll confirm your start date soon.`
+            );
+          } catch (blooErr) {
+            console.error('Stripe webhook: iMessage failed', blooErr);
+          }
+        }
         break;
       }
 

@@ -106,6 +106,7 @@ enum PaymentType {
   MIDPOINT
   COMPLETION
   FULL_UPFRONT
+  CHANGE_ORDER
 }
 
 enum PaymentMethod {
@@ -197,8 +198,24 @@ model User {
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
   estimates    Estimate[] @relation("CreatedByUser")
+  passwordResets PasswordResetToken[]
 
   @@index([email])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([token])
+  @@index([expiresAt])
 }
 
 model Customer {
@@ -234,7 +251,8 @@ model Property {
   city                   String           @default("Tampa")
   state                  String           @default("FL")
   zip                    String
-  squareFootageInterior  Int?
+  squareFootageInterior   Int?
+  squareFootageExterior   Int?   // quick estimate mode
   stories                Int?             @default(1)
   constructionType       ConstructionType @default(STUCCO)
   yearBuilt              Int?
@@ -395,7 +413,8 @@ model Contract {
 
 model Payment {
   id                    String        @id @default(cuid())
-  contractId            String
+  contractId             String
+  changeOrderId         String?       // when type is CHANGE_ORDER
   type                  PaymentType
   method                PaymentMethod?
   amount                Float
@@ -408,10 +427,12 @@ model Payment {
   retryCount            Int           @default(0)
   createdAt             DateTime      @default(now())
 
-  contract  Contract          @relation(fields: [contractId], references: [id], onDelete: Cascade)
-  reminders PaymentReminder[]
+  contract    Contract          @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  changeOrder ChangeOrder?      @relation(fields: [changeOrderId], references: [id], onDelete: SetNull)
+  reminders   PaymentReminder[]
 
   @@index([contractId])
+  @@index([changeOrderId])
   @@index([status])
   @@index([scheduledDate])
 }
@@ -483,7 +504,8 @@ model ChangeOrder {
   completedAt              DateTime?
   createdAt                DateTime          @default(now())
 
-  contract Contract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  contract Contract  @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  payments Payment[]
 
   @@index([contractId])
   @@index([status])

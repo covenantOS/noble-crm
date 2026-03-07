@@ -405,6 +405,83 @@ export function calculateFullPricing(
 }
 
 // ============================================
+// TIER PRICES & PAYMENT SCHEDULE (single source of truth)
+// ============================================
+// Use these when displaying or charging: ensures view, contract sign, and Stripe
+// always use the same formulas (spec: cash discount, card discount, plan surcharge, 50/40/10).
+
+/** Derive all 4 tier prices from base price (Tier 3) using config. */
+export function getTierPricesFromBase(
+    basePrice: number,
+    config: PricingConfigMap
+): TierPricing {
+    const cashDiscountPct = getNum(config, 'upfront_cash_discount_percent', 8);
+    const cardDiscountPct = getNum(config, 'upfront_card_discount_percent', 4);
+    const planSurchargePct = getNum(config, 'payment_plan_surcharge_percent', 3);
+
+    const upfrontCashPrice = Math.round(basePrice * (1 - cashDiscountPct / 100));
+    const upfrontCardPrice = Math.round(basePrice * (1 - cardDiscountPct / 100));
+    const financePrice = basePrice;
+    const paymentPlanPrice = Math.round(basePrice * (1 + planSurchargePct / 100));
+
+    return {
+        basePrice,
+        upfrontCashPrice,
+        upfrontCardPrice,
+        financePrice,
+        paymentPlanPrice,
+        cashSavings: basePrice - upfrontCashPrice,
+        cardSavings: basePrice - upfrontCardPrice,
+        planSurcharge: paymentPlanPrice - basePrice,
+    };
+}
+
+/** Payment plan schedule (50/40/10 by default). Completion = remainder to avoid rounding drift. */
+export function getPaymentPlanScheduleFromTotal(
+    paymentPlanPrice: number,
+    config: PricingConfigMap
+): PaymentSchedule {
+    const depositPct = getNum(config, 'deposit_percent', 50);
+    const midpointPct = getNum(config, 'midpoint_percent', 40);
+
+    const depositAmount = Math.round(paymentPlanPrice * depositPct / 100);
+    const midpointAmount = Math.round(paymentPlanPrice * midpointPct / 100);
+    const completionAmount = paymentPlanPrice - depositAmount - midpointAmount;
+
+    return {
+        depositAmount,
+        midpointAmount,
+        completionAmount,
+        totalAmount: paymentPlanPrice,
+    };
+}
+
+/** Get the exact amount to charge for a given tier (for Stripe / contract). */
+export function getAmountForTier(
+    tier: 'UPFRONT_CASH' | 'UPFRONT_CARD' | 'FINANCE' | 'PAYMENT_PLAN',
+    estimate: { basePrice: number | null; upfrontCashPrice: number | null; upfrontCardPrice: number | null; financePrice: number | null; paymentPlanPrice: number | null },
+    schedule?: PaymentSchedule
+): { totalAmount: number; depositAmount?: number; midpointAmount?: number; completionAmount?: number } {
+    const base = estimate.basePrice ?? 0;
+    const total =
+        tier === 'UPFRONT_CASH' ? (estimate.upfrontCashPrice ?? base)
+        : tier === 'UPFRONT_CARD' ? (estimate.upfrontCardPrice ?? base)
+        : tier === 'FINANCE' ? (estimate.financePrice ?? base)
+        : tier === 'PAYMENT_PLAN' ? (estimate.paymentPlanPrice ?? base)
+        : base;
+
+    if (tier === 'PAYMENT_PLAN' && schedule) {
+        return {
+            totalAmount: total,
+            depositAmount: schedule.depositAmount,
+            midpointAmount: schedule.midpointAmount,
+            completionAmount: schedule.completionAmount,
+        };
+    }
+    return { totalAmount: total };
+}
+
+// ============================================
 // CHANGE ORDER PRICING
 // ============================================
 export function calculateChangeOrderPrice(

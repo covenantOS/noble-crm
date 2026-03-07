@@ -34,6 +34,24 @@ export async function PATCH(
       include: { contract: { include: { payments: true, estimate: { include: { property: true } } } } },
     });
 
+    // When approving a change order, create a Payment record for the additional amount
+    if (status === 'APPROVED' && order.additionalPrice != null && order.additionalPrice > 0) {
+      const existing = await prisma.payment.findFirst({
+        where: { changeOrderId: order.id },
+      });
+      if (!existing) {
+        await prisma.payment.create({
+          data: {
+            contractId: order.contractId,
+            changeOrderId: order.id,
+            type: 'CHANGE_ORDER',
+            amount: order.additionalPrice,
+            status: 'SCHEDULED',
+          },
+        });
+      }
+    }
+
     return NextResponse.json(order);
   } catch (error) {
     console.error('Update change order error:', error);

@@ -150,6 +150,36 @@ export async function POST(request: NextRequest) {
       })),
     });
 
+    // Save photos so customer view and estimate detail show them
+    await prisma.estimatePhoto.deleteMany({ where: { estimateId: eid } });
+    if (photos.length > 0) {
+      const photoAnalysis = Array.isArray(aiResult.photoAnalysis) ? aiResult.photoAnalysis as Array<{ photoIndex: number; findings?: string; recommendation?: string }> : [];
+      const photoRows = photos
+        .map((p, i) => {
+          if (!p.base64) return null;
+          const dataUrl = `data:${p.mediaType || 'image/jpeg'};base64,${p.base64}`;
+          const analysis = photoAnalysis.find((pa) => pa.photoIndex === i);
+          return {
+            estimateId: eid,
+            url: dataUrl,
+            caption: p.notes || null,
+            location: p.location || null,
+            aiAnalysis: (() => {
+              if (!analysis) return null;
+              const parts = [analysis.findings || '', analysis.recommendation ? ' Recommendation: ' + analysis.recommendation : ''];
+              const s = parts.join('').trim();
+              return s || null;
+            })(),
+            showToCustomer: true,
+            sortOrder: i,
+          };
+        })
+        .filter((r): r is NonNullable<typeof r> => r !== null);
+      if (photoRows.length > 0) {
+        await prisma.estimatePhoto.createMany({ data: photoRows });
+      }
+    }
+
     const updated = await prisma.estimate.findUnique({
       where: { id: eid },
       include: { lineItems: true, customer: true, property: true },

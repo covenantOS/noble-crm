@@ -6,6 +6,7 @@ import {
   createFinanceCheckout,
   createPaymentPlanCheckout,
 } from '@/lib/stripe';
+import { getPaymentPlanScheduleFromTotal, getAmountForTier } from '@/lib/pricing';
 
 const BASE_URL = process.env.NEXTAUTH_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:3000');
 
@@ -35,44 +36,35 @@ export async function POST(request: NextRequest) {
 
     const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || request.headers.get('x-real-ip') || undefined;
 
-    const basePrice = estimate.basePrice ?? 0;
-    const upfrontCash = estimate.upfrontCashPrice ?? basePrice;
-    const upfrontCard = estimate.upfrontCardPrice ?? basePrice;
-    const finance = estimate.financePrice ?? basePrice;
-    const planPrice = estimate.paymentPlanPrice ?? basePrice;
+    // Single source of truth: tier amounts from estimate + pricing engine schedule (50/40/10)
+    const configRows = await prisma.pricingConfig.findMany();
+    const pricingConfig = configRows.reduce<Record<string, string>>(
+      (acc: Record<string, string>, r: { key: string; value: string }) => {
+        acc[r.key] = r.value;
+        return acc;
+      },
+      {}
+    );
+    const planPrice = estimate.paymentPlanPrice ?? estimate.basePrice ?? 0;
+    const schedule = getPaymentPlanScheduleFromTotal(planPrice, pricingConfig);
+    const amounts = getAmountForTier(
+      paymentTier as 'UPFRONT_CASH' | 'UPFRONT_CARD' | 'FINANCE' | 'PAYMENT_PLAN',
+      estimate,
+      paymentTier === 'PAYMENT_PLAN' ? schedule : undefined
+    );
 
-    const configs = await prisma.pricingConfig.findMany({
-      where: { key: { in: ['deposit_percent', 'midpoint_percent', 'completion_percent'] } },
-    });
-    const map: Record<string, number> = {};
-    configs.forEach((c: { key: string; value: string }) => { map[c.key] = parseFloat(c.value) || 0; });
-    const depPct = map.deposit_percent || 50;
-    const midPct = map.midpoint_percent || 40;
-    const compPct = map.completion_percent || 10;
+    const totalAmount = amounts.totalAmount;
+    const depositAmount = amounts.depositAmount ?? null;
+    const midpointAmount = amounts.midpointAmount ?? null;
+    const completionAmount = amounts.completionAmount ?? null;
 
-    let totalAmount = basePrice;
-    let depositAmount: number | null = null;
-    let midpointAmount: number | null = null;
-    let completionAmount: number | null = null;
-
-    switch (paymentTier) {
-      case 'UPFRONT_CASH':
-        totalAmount = upfrontCash;
-        break;
-      case 'UPFRONT_CARD':
-        totalAmount = upfrontCard;
-        break;
-      case 'FINANCE':
-        totalAmount = finance;
-        break;
-      case 'PAYMENT_PLAN':
-        totalAmount = planPrice;
-        depositAmount = Math.round(planPrice * (depPct / 100));
-        midpointAmount = Math.round(planPrice * (midPct / 100));
-        completionAmount = totalAmount - depositAmount - midpointAmount;
-        break;
-      default:
-        return NextResponse.json({ error: 'Invalid payment tier' }, { status: 400 });
+    if (
+      paymentTier !== 'UPFRONT_CASH' &&
+      paymentTier !== 'UPFRONT_CARD' &&
+      paymentTier !== 'FINANCE' &&
+      paymentTier !== 'PAYMENT_PLAN'
+    ) {
+      return NextResponse.json({ error: 'Invalid payment tier' }, { status: 400 });
     }
 
     const contractSnapshot = {
@@ -110,9 +102,17 @@ export async function POST(request: NextRequest) {
     });
 
     if (paymentTier === 'UPFRONT_CASH') {
+      const viewToken = (await prisma.estimate.findUnique({ where: { id: estimateId }, select: { viewToken: true } }))?.viewToken;
+      const docUrl = viewToken
+        ? `${BASE_URL}/api/contracts/${contract.id}/pdf?token=${viewToken}`
+        : null;
       await prisma.contract.update({
         where: { id: contract.id },
-        data: { status: 'SIGNED' },
+        data: { status: 'SIGNED', ...(docUrl && { documentUrl: docUrl }) },
+      });
+      await prisma.estimate.update({
+        where: { id: estimateId },
+        data: { status: 'APPROVED', approvedAt: new Date() },
       });
       return NextResponse.json({ success: true, contractId: contract.id });
     }

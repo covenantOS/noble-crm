@@ -131,6 +131,7 @@ export async function POST(request: NextRequest) {
                 state: property.state || 'FL',
                 zip: property.zip,
                 squareFootageInterior: property.squareFootageInterior ? parseInt(property.squareFootageInterior) : null,
+                squareFootageExterior: property.squareFootageExterior ? parseInt(property.squareFootageExterior) : null,
                 stories: property.stories ? parseInt(property.stories) : 1,
                 constructionType: property.constructionType || 'STUCCO',
                 yearBuilt: property.yearBuilt ? parseInt(property.yearBuilt) : null,
@@ -157,18 +158,28 @@ export async function POST(request: NextRequest) {
                     })),
                 },
                 measurements: {
-                    create: (measurements || []).map((m: { surface: string; description?: string; linearFeet?: number; height?: number; grossArea?: number; windowDeduction?: number; doorDeduction?: number; netPaintableArea?: number; coatsRequired?: number; notes?: string }) => ({
-                        surface: m.surface,
-                        description: m.description || null,
-                        linearFeet: m.linearFeet ? parseFloat(String(m.linearFeet)) : null,
-                        height: m.height ? parseFloat(String(m.height)) : null,
-                        grossArea: m.grossArea ? parseFloat(String(m.grossArea)) : null,
-                        windowDeduction: m.windowDeduction ? parseFloat(String(m.windowDeduction)) : 0,
-                        doorDeduction: m.doorDeduction ? parseFloat(String(m.doorDeduction)) : 0,
-                        netPaintableArea: m.netPaintableArea ? parseFloat(String(m.netPaintableArea)) : null,
-                        coatsRequired: m.coatsRequired || 2,
-                        notes: m.notes || null,
-                    })),
+                    create: (() => {
+                        const list = (measurements || []).map((m: { surface: string; description?: string; linearFeet?: number; height?: number; grossArea?: number; windowDeduction?: number; doorDeduction?: number; netPaintableArea?: number; coatsRequired?: number; notes?: string }) => ({
+                            surface: m.surface,
+                            description: m.description || null,
+                            linearFeet: m.linearFeet ? parseFloat(String(m.linearFeet)) : null,
+                            height: m.height ? parseFloat(String(m.height)) : null,
+                            grossArea: m.grossArea ? parseFloat(String(m.grossArea)) : null,
+                            windowDeduction: m.windowDeduction ? parseFloat(String(m.windowDeduction)) : 0,
+                            doorDeduction: m.doorDeduction ? parseFloat(String(m.doorDeduction)) : 0,
+                            netPaintableArea: m.netPaintableArea ? parseFloat(String(m.netPaintableArea)) : null,
+                            coatsRequired: m.coatsRequired || 2,
+                            notes: m.notes || null,
+                        }));
+                        // Quick estimate mode: when no per-surface measurements but total sqft provided, add synthetic rows for pricing
+                        if (list.length === 0 && (property.squareFootageExterior || property.squareFootageInterior)) {
+                            const ext = property.squareFootageExterior ? parseInt(String(property.squareFootageExterior), 10) : 0;
+                            const int = property.squareFootageInterior ? parseInt(String(property.squareFootageInterior), 10) : 0;
+                            if (ext > 0) list.push({ surface: 'EXTERIOR_WALL', description: 'Quick total exterior', linearFeet: null, height: null, grossArea: null, windowDeduction: 0, doorDeduction: 0, netPaintableArea: ext, coatsRequired: 2, notes: null });
+                            if (int > 0) list.push({ surface: 'INTERIOR_WALL', description: 'Quick total interior', linearFeet: null, height: null, grossArea: null, windowDeduction: 0, doorDeduction: 0, netPaintableArea: int, coatsRequired: 2, notes: null });
+                        }
+                        return list;
+                    })(),
                 },
             },
             include: {

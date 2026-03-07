@@ -11,7 +11,7 @@ function getSecret(): string | undefined {
 
 function isPublicPath(pathname: string): boolean {
   if (pathname.startsWith(API_AUTH_PREFIX)) return true;
-  if (pathname === '/login') return true;
+  if (pathname === '/login' || pathname === '/forgot-password' || pathname === '/reset-password') return true;
   if (pathname.startsWith('/view')) return true;
   if (pathname.startsWith('/customer')) return true;
   if (pathname.startsWith('/api/view') || pathname.startsWith('/api/customer') || pathname.startsWith('/api/contracts') || pathname.startsWith('/api/webhooks') || pathname === '/api/bootstrap' || pathname === '/api/estimates/send-reminders' || pathname.startsWith('/api/cron/')) return true;

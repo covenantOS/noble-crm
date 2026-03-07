@@ -16,7 +16,7 @@ export function getNextAuthSecret(): string | undefined {
 
 const SALT = process.env.AUTH_PASSWORD_SALT || 'noble-estimator-default-salt-change-in-production';
 
-function hashPassword(password: string): string {
+export function hashPassword(password: string): string {
   return scryptSync(password, SALT, 64).toString('hex');
 }
 

@@ -69,8 +69,11 @@ export async function POST(request: NextRequest) {
               html: `<p>${msg.replace(/\n/g, '<br>')}</p>`,
             });
           }
-          await prisma.paymentReminder.create({
-            data: { paymentId: payment.id, type: 'UPCOMING', channel: 'EMAIL' },
+          await prisma.paymentReminder.createMany({
+            data: [
+              { paymentId: payment.id, type: 'UPCOMING', channel: 'EMAIL' },
+              ...(contract.customer.phone ? [{ paymentId: payment.id, type: 'UPCOMING' as const, channel: 'IMESSAGE' as const }] : []),
+            ],
           });
           results.push({ paymentId: payment.id, action: '48h_reminder', success: true });
         } catch (e) {
@@ -127,6 +130,12 @@ export async function POST(request: NextRequest) {
           html: `<p>${failMsg}</p>`,
         });
       }
+      await prisma.paymentReminder.createMany({
+        data: [
+          { paymentId: payment.id, type: 'FAILED', channel: 'EMAIL' },
+          ...(contract.customer.phone ? [{ paymentId: payment.id, type: 'FAILED' as const, channel: 'IMESSAGE' as const }] : []),
+        ],
+      });
       results.push({ paymentId: payment.id, action: 'charge', success: false, error: String(e) });
     }
   }

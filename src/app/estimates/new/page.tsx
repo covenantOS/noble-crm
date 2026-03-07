@@ -3,7 +3,7 @@
 import AppLayout from '@/components/layout/AppLayout';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 
 const SCOPE_OPTIONS = [
   { value: 'EXTERIOR', label: 'Exterior' },
@@ -61,6 +61,7 @@ export default function NewEstimatePage() {
     state: 'FL',
     zip: '',
     squareFootageInterior: '',
+    squareFootageExterior: '',
     stories: '1',
     constructionType: 'STUCCO',
     yearBuilt: '',
@@ -75,6 +76,7 @@ export default function NewEstimatePage() {
   const [customerResults, setCustomerResults] = useState<Array<{ id: string; firstName: string; lastName: string; email: string | null; phone: string }>>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const addressInputRef = useRef<HTMLInputElement>(null);
 
   const surfaceTypes = scopeType === 'BOTH' ? [...new Set([...EXTERIOR_SURFACES, ...INTERIOR_SURFACES])] : scopeType === 'EXTERIOR' ? EXTERIOR_SURFACES : INTERIOR_SURFACES;
 
@@ -104,6 +106,36 @@ export default function NewEstimatePage() {
       ensureMeasurements();
     }
   }, [step, scopeType, ensureSurfaces, ensureMeasurements]);
+
+  // Optional Google Places address autocomplete (when NEXT_PUBLIC_GOOGLE_PLACES_API_KEY is set)
+  useEffect(() => {
+    const key = process.env.NEXT_PUBLIC_GOOGLE_PLACES_API_KEY;
+    if (!key || !addressInputRef.current) return;
+    let cancelled = false;
+    const script = document.createElement('script');
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${key}&libraries=places`;
+    script.async = true;
+    script.onload = () => {
+      if (cancelled || !addressInputRef.current || typeof (window as unknown as { google?: { maps?: { places?: { Autocomplete?: unknown } } } }).google?.maps?.places?.Autocomplete !== 'function') return;
+      const Autocomplete = (window as unknown as { google: { maps: { places: { Autocomplete: new (el: HTMLInputElement, opts: { types?: string[] }) => { addListener: (ev: string, fn: () => void) => void; getPlace: () => { address_components?: Array<{ long_name: string; short_name: string; types: string[] }>; formatted_address?: string } } } } } }).google.maps.places.Autocomplete;
+      const autocomplete = new Autocomplete(addressInputRef.current, { types: ['address'] });
+      autocomplete.addListener('place_changed', () => {
+        const place = autocomplete.getPlace();
+        const addr = place.formatted_address || '';
+        let city = '';
+        let state = '';
+        let zip = '';
+        for (const c of place.address_components || []) {
+          if (c.types.includes('locality')) city = c.long_name;
+          if (c.types.includes('administrative_area_level_1')) state = c.short_name;
+          if (c.types.includes('postal_code')) zip = c.long_name;
+        }
+        setProperty((p) => ({ ...p, address: addr, ...(city && { city }), ...(state && { state }), ...(zip && { zip }) }));
+      });
+    };
+    document.head.appendChild(script);
+    return () => { cancelled = true; script.remove(); };
+  }, [step]);
 
   const searchCustomers = () => {
     if (!customerSearch.trim()) return;
@@ -156,6 +188,7 @@ export default function NewEstimatePage() {
       state: property.state,
       zip: property.zip,
       squareFootageInterior: property.squareFootageInterior ? parseInt(property.squareFootageInterior, 10) : undefined,
+      squareFootageExterior: property.squareFootageExterior ? parseInt(property.squareFootageExterior, 10) : undefined,
       stories: property.stories ? parseInt(property.stories, 10) : 1,
       constructionType: property.constructionType,
       yearBuilt: property.yearBuilt ? parseInt(property.yearBuilt, 10) : undefined,
@@ -315,17 +348,28 @@ export default function NewEstimatePage() {
               <hr style={{ border: 'none', borderTop: '1px solid var(--gray-200)', margin: '24px 0' }} />
               <div style={{ marginBottom: 16 }}>
                 <label style={{ display: 'block', marginBottom: 4, fontWeight: 600, fontSize: 14 }}>Property address *</label>
-                <input value={property.address} onChange={(e) => setProperty((p) => ({ ...p, address: e.target.value }))} placeholder="Street address" required style={{ width: '100%', padding: '10px 12px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)' }} />
+                <input
+                  ref={addressInputRef}
+                  value={property.address}
+                  onChange={(e) => setProperty((p) => ({ ...p, address: e.target.value }))}
+                  placeholder="Street address (start typing for suggestions if enabled)"
+                  required
+                  style={{ width: '100%', padding: '10px 12px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)' }}
+                />
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 80px', gap: 12, marginBottom: 16 }}>
                 <input value={property.city} onChange={(e) => setProperty((p) => ({ ...p, city: e.target.value }))} placeholder="City" style={{ padding: '10px 12px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)' }} />
                 <input value={property.state} onChange={(e) => setProperty((p) => ({ ...p, state: e.target.value }))} placeholder="State" style={{ padding: '10px 12px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)' }} />
                 <input value={property.zip} onChange={(e) => setProperty((p) => ({ ...p, zip: e.target.value }))} placeholder="ZIP" required style={{ padding: '10px 12px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)' }} />
               </div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16, marginBottom: 16 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 16, marginBottom: 16 }}>
                 <div>
                   <label style={{ display: 'block', marginBottom: 4, fontWeight: 600, fontSize: 14 }}>Interior sq ft</label>
-                  <input type="number" value={property.squareFootageInterior} onChange={(e) => setProperty((p) => ({ ...p, squareFootageInterior: e.target.value }))} min={0} style={{ width: '100%', padding: '10px 12px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)' }} />
+                  <input type="number" value={property.squareFootageInterior} onChange={(e) => setProperty((p) => ({ ...p, squareFootageInterior: e.target.value }))} min={0} placeholder="Quick total" style={{ width: '100%', padding: '10px 12px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)' }} />
+                </div>
+                <div>
+                  <label style={{ display: 'block', marginBottom: 4, fontWeight: 600, fontSize: 14 }}>Exterior sq ft</label>
+                  <input type="number" value={property.squareFootageExterior} onChange={(e) => setProperty((p) => ({ ...p, squareFootageExterior: e.target.value }))} min={0} placeholder="Quick total" style={{ width: '100%', padding: '10px 12px', border: '1px solid var(--gray-200)', borderRadius: 'var(--radius-sm)' }} />
                 </div>
                 <div>
                   <label style={{ display: 'block', marginBottom: 4, fontWeight: 600, fontSize: 14 }}>Stories</label>

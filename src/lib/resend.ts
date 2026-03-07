@@ -165,6 +165,20 @@ export function buildPaymentReceiptEmail(
   `);
 }
 
+export function buildPasswordResetEmail(userName: string, resetLink: string): string {
+    return wrapInBrandedTemplate(`
+    <h2>Reset Your Password</h2>
+    <p>Hi ${userName},</p>
+    <p>We received a request to reset your password for Noble Estimator.</p>
+    <p style="text-align: center;">
+      <a href="${resetLink}" class="cta-button">Reset Password</a>
+    </p>
+    <p>This link expires in 1 hour. If you didn't request this, you can ignore this email.</p>
+    <div class="divider"></div>
+    <p>Best,<br><strong>Westchase Painting Company by Noble</strong></p>
+  `);
+}
+
 const resend = new Proxy({} as Resend, {
   get(_, prop) {
     return (getResend() as unknown as Record<string, unknown>)[prop as string];

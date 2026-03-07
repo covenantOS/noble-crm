@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import { signIn } from 'next-auth/react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useState, Suspense } from 'react';
@@ -60,7 +61,7 @@ function LoginForm() {
             value={email}
             onChange={(e) => setEmail(e.target.value)}
             required
-            placeholder="will@westchasepainting.com"
+            placeholder="will@servicelinepro.com"
           />
           <label htmlFor="password">Password</label>
           <input
@@ -72,6 +73,11 @@ function LoginForm() {
             onChange={(e) => setPassword(e.target.value)}
             required
           />
+          <div style={{ marginBottom: 16, textAlign: 'right' }}>
+            <Link href="/forgot-password" style={{ fontSize: 14, color: 'var(--gold)', textDecoration: 'none' }}>
+              Forgot password?
+            </Link>
+          </div>
           <button type="submit" className="btn btn-primary btn-lg" disabled={loading}>
             {loading ? 'Signing in…' : 'Sign in'}
           </button>

@@ -235,7 +235,7 @@ Westchase Painting Company by Noble`,
     { key: 'company_legal_name', value: 'Westchase Painting Company LLC' },
     { key: 'company_address', value: 'Tampa, FL' },
     { key: 'company_phone', value: '(813) 555-0123' },
-    { key: 'company_email', value: 'will@westchasepainting.com' },
+    { key: 'company_email', value: 'will@servicelinepro.com' },
     { key: 'estimates_email', value: 'estimates@westchasepainting.com' },
     { key: 'company_website', value: 'https://westchasepainting.com' },
     { key: 'google_review_link', value: 'https://g.page/r/westchasepainting/review' },
@@ -261,21 +261,21 @@ Westchase Painting Company by Noble`,
   // ========================
   // Default password: "password" — change in production
   const defaultPasswordHash = hashPassword('password');
-  const adminExists = await prisma.user.findFirst({ where: { email: 'will@westchasepainting.com' } });
+  const adminExists = await prisma.user.findFirst({ where: { email: 'will@servicelinepro.com' } });
   if (!adminExists) {
     await prisma.user.create({
       data: {
         name: 'Will Noble',
-        email: 'will@westchasepainting.com',
+        email: 'will@servicelinepro.com',
         phone: '(813) 555-0123',
         role: 'OWNER',
         passwordHash: defaultPasswordHash,
       },
     });
-    console.log('✅ Created default admin user (email: will@westchasepainting.com, password: password)');
+    console.log('✅ Created default admin user (email: will@servicelinepro.com, password: password)');
   } else {
     await prisma.user.update({
-      where: { email: 'will@westchasepainting.com' },
+      where: { email: 'will@servicelinepro.com' },
       data: { passwordHash: defaultPasswordHash },
     });
     console.log('✅ Updated default admin user password (password: password)');

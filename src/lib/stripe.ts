@@ -46,7 +46,7 @@ export function getUpfrontCashInstructions(amount: number): string {
     return `Please make payment of $${amount.toLocaleString()} by check or bank transfer before work begins. Make checks payable to "Westchase Painting Company LLC".`;
 }
 
-// Tier 2: Upfront Card — Checkout Session for full amount
+// Tier 2: Upfront Card — Checkout Session for full tier amount (dynamically calculated)
 export async function createUpfrontCardCheckout(
     stripeCustomerId: string,
     amount: number,
@@ -55,6 +55,8 @@ export async function createUpfrontCardCheckout(
     successUrl: string,
     cancelUrl: string
 ): Promise<Stripe.Checkout.Session> {
+    const amountCents = Math.round(amount * 100);
+    const amountFormatted = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(amount);
     return getStripe().checkout.sessions.create({
         customer: stripeCustomerId,
         payment_method_types: ['card'],
@@ -64,9 +66,9 @@ export async function createUpfrontCardCheckout(
                     currency: 'usd',
                     product_data: {
                         name: `Painting Services — ${propertyAddress}`,
-                        description: 'Full payment for painting services',
+                        description: `Full payment (Pay in Full by Card) — ${amountFormatted}`,
                     },
-                    unit_amount: Math.round(amount * 100), // cents
+                    unit_amount: amountCents,
                 },
                 quantity: 1,
             },
@@ -78,11 +80,12 @@ export async function createUpfrontCardCheckout(
             contractId,
             paymentTier: 'UPFRONT_CARD',
             type: 'FULL_UPFRONT',
+            expectedAmountCents: String(amountCents),
         },
     });
 }
 
-// Tier 3: Finance via Klarna/Afterpay — Checkout Session
+// Tier 3: Finance via Klarna/Afterpay — Checkout Session for full base price (we get 100% upfront)
 export async function createFinanceCheckout(
     stripeCustomerId: string,
     amount: number,
@@ -91,6 +94,8 @@ export async function createFinanceCheckout(
     successUrl: string,
     cancelUrl: string
 ): Promise<Stripe.Checkout.Session> {
+    const amountCents = Math.round(amount * 100);
+    const amountFormatted = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(amount);
     return getStripe().checkout.sessions.create({
         customer: stripeCustomerId,
         payment_method_types: ['card', 'klarna', 'afterpay_clearpay'],
@@ -100,9 +105,9 @@ export async function createFinanceCheckout(
                     currency: 'usd',
                     product_data: {
                         name: `Painting Services — ${propertyAddress}`,
-                        description: 'Finance your painting project with Klarna or Afterpay',
+                        description: `Finance with Klarna or Afterpay — ${amountFormatted} (standard price)`,
                     },
-                    unit_amount: Math.round(amount * 100),
+                    unit_amount: amountCents,
                 },
                 quantity: 1,
             },
@@ -114,11 +119,12 @@ export async function createFinanceCheckout(
             contractId,
             paymentTier: 'FINANCE',
             type: 'FULL_UPFRONT',
+            expectedAmountCents: String(amountCents),
         },
     });
 }
 
-// Tier 4: Payment Plan — Deposit Checkout + SetupIntent for auto-charges
+// Tier 4: Payment Plan — Deposit only at checkout; midpoint/completion auto-charged later
 export async function createPaymentPlanCheckout(
     stripeCustomerId: string,
     depositAmount: number,
@@ -127,6 +133,8 @@ export async function createPaymentPlanCheckout(
     successUrl: string,
     cancelUrl: string
 ): Promise<Stripe.Checkout.Session> {
+    const amountCents = Math.round(depositAmount * 100);
+    const amountFormatted = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(depositAmount);
     return getStripe().checkout.sessions.create({
         customer: stripeCustomerId,
         payment_method_types: ['card'],
@@ -135,17 +143,17 @@ export async function createPaymentPlanCheckout(
                 price_data: {
                     currency: 'usd',
                     product_data: {
-                        name: `Painting Services Deposit — ${propertyAddress}`,
-                        description: 'Deposit payment (50% of total)',
+                        name: `Painting Services — ${propertyAddress}`,
+                        description: `Deposit (Payment Plan 50/40/10) — ${amountFormatted}. Midpoint and completion will be charged automatically.`,
                     },
-                    unit_amount: Math.round(depositAmount * 100),
+                    unit_amount: amountCents,
                 },
                 quantity: 1,
             },
         ],
         mode: 'payment',
         payment_intent_data: {
-            setup_future_usage: 'off_session', // Save the card for future charges
+            setup_future_usage: 'off_session', // Save card for midpoint/completion auto-charge
         },
         success_url: successUrl,
         cancel_url: cancelUrl,
@@ -153,6 +161,7 @@ export async function createPaymentPlanCheckout(
             contractId,
             paymentTier: 'PAYMENT_PLAN',
             type: 'DEPOSIT',
+            expectedAmountCents: String(amountCents),
         },
     });
 }

@@ -11,7 +11,14 @@ function createPrismaClient(): PrismaClient {
     if (!connectionString) {
         throw new Error('DATABASE_URL is not set');
     }
-    const pool = new Pool({ connectionString });
+    const isSupabaseConnection = /supabase\.co|pooler\.supabase\.com/i.test(connectionString);
+    // Supabase poolers/direct hosts can present cert chains that fail strict verification
+    // in some serverless environments. Allowing this only for Supabase endpoints avoids
+    // breaking connectivity while keeping defaults for other providers.
+    const pool = new Pool({
+        connectionString,
+        ...(isSupabaseConnection ? { ssl: { rejectUnauthorized: false } } : {}),
+    });
     const adapter = new PrismaPg(pool);
     return new PrismaClient({
         adapter,

@@ -1,6 +1,7 @@
 // One-time bootstrap: create default admin if no users exist.
 // Call with POST and body { "secret": "<NEXTAUTH_SECRET or BOOTSTRAP_SECRET>" }.
-// After this, log in at /login with will@westchasepainting.com / password
+// To reset admin password: POST with { "secret": "...", "resetPassword": true } or { "resetPassword": "newpassword" }.
+// After this, log in at /login with will@servicelinepro.com / password
 
 import { NextRequest, NextResponse } from 'next/server';
 import { scryptSync } from 'crypto';
@@ -12,21 +13,54 @@ function hashPassword(password: string): string {
   return scryptSync(password, AUTH_SALT, 64).toString('hex');
 }
 
+export async function GET() {
+  const userCount = await prisma.user.count();
+  return NextResponse.json({
+    hasAdmin: userCount > 0,
+    hint: 'To create or reset admin: POST to /api/bootstrap with body { "secret": "your NEXTAUTH_SECRET" }. Optional: "resetPassword": true to set password to "password", or "resetPassword": "yournewpass" to set a new one.',
+    loginEmail: 'will@servicelinepro.com',
+    defaultPassword: 'password',
+    loginUrl: '/login',
+  });
+}
+
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json().catch(() => ({})) as { secret?: string };
-    const secret = body.secret ?? request.headers.get('x-bootstrap-secret') ?? '';
-    const expected = process.env.BOOTSTRAP_SECRET || process.env.NEXTAUTH_SECRET;
+    const body = await request.json().catch(() => ({})) as { secret?: string; resetPassword?: boolean | string };
+    const secret = String(body.secret ?? request.headers.get('x-bootstrap-secret') ?? '').trim();
+    const expected = (process.env.BOOTSTRAP_SECRET || process.env.NEXTAUTH_SECRET || '').trim();
     if (!expected || secret !== expected) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const resetPassword = body.resetPassword;
+    const newPassword =
+      resetPassword === true ? 'password' : typeof resetPassword === 'string' && resetPassword.length > 0 ? resetPassword : null;
+
+    if (newPassword) {
+      const admin = await prisma.user.findFirst({ where: { email: 'will@servicelinepro.com' } });
+      if (!admin) {
+        return NextResponse.json({ error: 'No admin user found. Run bootstrap without resetPassword first to create one.' }, { status: 400 });
+      }
+      await prisma.user.update({
+        where: { id: admin.id },
+        data: { passwordHash: hashPassword(newPassword) },
+      });
+      return NextResponse.json({
+        ok: true,
+        message: 'Admin password reset. You can log in now.',
+        email: 'will@servicelinepro.com',
+        password: newPassword,
+        loginUrl: '/login',
+      });
     }
 
     const userCount = await prisma.user.count();
     if (userCount > 0) {
       return NextResponse.json({
         ok: true,
-        message: 'Admin user already exists. Use existing credentials to log in.',
-        login: 'will@westchasepainting.com',
+        message: 'Admin user already exists. Use existing credentials to log in. To reset password, send { "secret": "...", "resetPassword": true }.',
+        login: 'will@servicelinepro.com',
       });
     }
 
@@ -34,7 +68,7 @@ export async function POST(request: NextRequest) {
     await prisma.user.create({
       data: {
         name: 'Will Noble',
-        email: 'will@westchasepainting.com',
+        email: 'will@servicelinepro.com',
         phone: '(813) 555-0123',
         role: 'OWNER',
         passwordHash: defaultPasswordHash,
@@ -44,7 +78,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       ok: true,
       message: 'Default admin created. You can log in now.',
-      email: 'will@westchasepainting.com',
+      email: 'will@servicelinepro.com',
       password: 'password',
       loginUrl: '/login',
     });

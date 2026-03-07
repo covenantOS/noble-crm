@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
+import { getPaymentPlanScheduleFromTotal } from '@/lib/pricing';
 
 /**
  * GET /api/view/estimate?estimateId=xxx&token=yyy
@@ -28,17 +29,15 @@ export async function GET(request: NextRequest) {
   }
 
   const paymentPlanPrice = estimate.paymentPlanPrice ?? estimate.basePrice ?? 0;
-  const configs = await prisma.pricingConfig.findMany({
-    where: { key: { in: ['deposit_percent', 'midpoint_percent', 'completion_percent'] } },
-  });
-  const map: Record<string, number> = {};
-  configs.forEach((c: { key: string; value: string }) => { map[c.key] = parseFloat(c.value) || 0; });
-  const depPct = map.deposit_percent || 50;
-  const midPct = map.midpoint_percent || 40;
-  const compPct = map.completion_percent || 10;
-  const depositAmount = Math.round(paymentPlanPrice * (depPct / 100));
-  const midpointAmount = Math.round(paymentPlanPrice * (midPct / 100));
-  const completionAmount = paymentPlanPrice - depositAmount - midpointAmount;
+  const configRows = await prisma.pricingConfig.findMany();
+  const pricingConfig = configRows.reduce<Record<string, string>>(
+    (acc: Record<string, string>, r: { key: string; value: string }) => {
+      acc[r.key] = r.value;
+      return acc;
+    },
+    {}
+  );
+  const paymentSchedule = getPaymentPlanScheduleFromTotal(paymentPlanPrice, pricingConfig);
 
   const companyRows = await prisma.companySettings.findMany({
     where: { key: { in: ['company_name', 'company_address', 'company_phone', 'company_email', 'companyName', 'companyAddress', 'companyPhone', 'companyEmail'] } },
@@ -60,7 +59,12 @@ export async function GET(request: NextRequest) {
 
   return NextResponse.json({
     ...estimate,
-    paymentSchedule: { depositAmount, midpointAmount, completionAmount, total: paymentPlanPrice },
+    paymentSchedule: {
+      depositAmount: paymentSchedule.depositAmount,
+      midpointAmount: paymentSchedule.midpointAmount,
+      completionAmount: paymentSchedule.completionAmount,
+      total: paymentSchedule.totalAmount,
+    },
     company,
   });
 }
