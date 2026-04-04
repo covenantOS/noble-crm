@@ -50,8 +50,8 @@ Open Field Scheduling is **vertical-agnostic** — configure service types, pric
 ## Quickstart
 
 ```bash
-git clone https://github.com/clawnify/open-field-scheduling.git
-cd open-field-scheduling
+git clone https://github.com/clawnify/open-fieldservice.git
+cd open-fieldservice
 pnpm install
 pnpm run dev
 ```
