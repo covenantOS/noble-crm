@@ -1,0 +1,115 @@
+import { useState } from "preact/hooks";
+import { useApp } from "../context";
+import { X } from "lucide-preact";
+
+export function CreateJob({ onClose }: { onClose: () => void }) {
+  const { addJob, customerLookup, technicianLookup, serviceTypes, setError } = useApp();
+
+  const today = new Date().toISOString().split("T")[0];
+  const [customerId, setCustomerId] = useState("");
+  const [technicianId, setTechnicianId] = useState("");
+  const [serviceTypeId, setServiceTypeId] = useState("");
+  const [scheduledDate, setScheduledDate] = useState(today);
+  const [scheduledTime, setScheduledTime] = useState("09:00");
+  const [priority, setPriority] = useState("normal");
+  const [address, setAddress] = useState("");
+  const [notes, setNotes] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleSubmit = async (e: Event) => {
+    e.preventDefault();
+    if (!customerId) { setError("Please select a customer"); return; }
+    if (!scheduledDate) { setError("Please select a date"); return; }
+    setSubmitting(true);
+    try {
+      await addJob({
+        customer_id: parseInt(customerId, 10),
+        technician_id: technicianId ? parseInt(technicianId, 10) : null,
+        service_type_id: serviceTypeId ? parseInt(serviceTypeId, 10) : null,
+        scheduled_date: scheduledDate,
+        scheduled_time: scheduledTime,
+        priority: priority as "low" | "normal" | "high" | "urgent",
+        address,
+        notes,
+      });
+      onClose();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div class="modal-overlay" onClick={onClose}>
+      <div class="modal" onClick={(e) => e.stopPropagation()}>
+        <div class="modal-header">
+          <h2>New Job</h2>
+          <button class="btn-icon" onClick={onClose}><X size={18} /></button>
+        </div>
+        <form onSubmit={handleSubmit}>
+          <div class="form-grid">
+            <div class="form-group">
+              <label>Customer *</label>
+              <select value={customerId} onChange={(e) => setCustomerId((e.target as HTMLSelectElement).value)} required>
+                <option value="">Select customer...</option>
+                {customerLookup.map((c) => (
+                  <option key={c.id} value={c.id}>{c.name}</option>
+                ))}
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Service Type</label>
+              <select value={serviceTypeId} onChange={(e) => setServiceTypeId((e.target as HTMLSelectElement).value)}>
+                <option value="">Select service...</option>
+                {serviceTypes.map((s) => (
+                  <option key={s.id} value={s.id}>{s.name} (${s.default_price})</option>
+                ))}
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Technician</label>
+              <select value={technicianId} onChange={(e) => setTechnicianId((e.target as HTMLSelectElement).value)}>
+                <option value="">Unassigned</option>
+                {technicianLookup.map((t) => (
+                  <option key={t.id} value={t.id}>{t.name}</option>
+                ))}
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Priority</label>
+              <select value={priority} onChange={(e) => setPriority((e.target as HTMLSelectElement).value)}>
+                <option value="low">Low</option>
+                <option value="normal">Normal</option>
+                <option value="high">High</option>
+                <option value="urgent">Urgent</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Date *</label>
+              <input type="date" value={scheduledDate} onChange={(e) => setScheduledDate((e.target as HTMLInputElement).value)} required />
+            </div>
+            <div class="form-group">
+              <label>Time</label>
+              <input type="time" value={scheduledTime} onChange={(e) => setScheduledTime((e.target as HTMLInputElement).value)} />
+            </div>
+            <div class="form-group full-width">
+              <label>Address (leave blank to use customer address)</label>
+              <input type="text" value={address} onInput={(e) => setAddress((e.target as HTMLInputElement).value)} placeholder="123 Main St, City, ST 12345" />
+            </div>
+            <div class="form-group full-width">
+              <label>Notes</label>
+              <textarea rows={3} value={notes} onInput={(e) => setNotes((e.target as HTMLTextAreaElement).value)} placeholder="Job notes..." />
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn" onClick={onClose}>Cancel</button>
+            <button type="submit" class="btn btn-primary" disabled={submitting}>
+              {submitting ? "Creating..." : "Create Job"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
