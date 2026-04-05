@@ -1,5 +1,7 @@
 # Open Field Scheduling: The Open-Source PestPac & ServiceTitan Alternative
 
+[![Deploy with Clawnify](https://clawnify.com/deploy-button.svg)](https://clawnify.com/deploy?repo=clawnify/open-fieldservice)
+
 A field service scheduling and business management app for service companies — pest control, HVAC, plumbing, cleaning, landscaping, and more. Part of the [OpenClaw](https://github.com/openclaw/openclaw) ecosystem. Zero cloud dependencies — runs locally with SQLite.
 
 Built with **Preact + Hono + SQLite**. Ships with a clean dashboard UI, weekly calendar view, job management, customer database, invoicing, materials tracking, and technician dispatch.

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://clawnify.com/schema/v1/clawnify.json",
+  "version": 1,
+  "name": "Field Service Scheduler",
+  "description": "Field service scheduling and business management with customers, technicians, service types, and job tracking. Like PestPac, FieldWork, or ServiceTitan. Best for pest control, HVAC, plumbing, cleaning, landscaping, or any field service business that needs appointment scheduling, technician dispatch, recurring jobs, and service history.",
+  "icon": "icon.svg",
+  "screenshot": "https://github.com/user-attachments/assets/f200eed4-ac02-49fc-9898-a46d209dc432",
+  "tags": ["scheduling", "field-service", "dispatch", "crm", "invoicing"],
+
+  "app": {
+    "framework": "preact+hono",
+    "database": true,
+    "storage": false
+  },
+
+  "deploy": {
+    "title": "Deploy your Field Service Scheduler",
+    "subtitle": "Like PestPac or ServiceTitan — customized for your business in minutes",
+    "prompts": [
+      {
+        "key": "business_type",
+        "label": "What kind of business?",
+        "placeholder": "e.g. Residential pest control, HVAC repair, pool cleaning",
+        "required": true
+      },
+      {
+        "key": "company_name",
+        "label": "Company name",
+        "placeholder": "e.g. Austin Pest Pros",
+        "required": true
+      },
+      {
+        "key": "location",
+        "label": "Where are you based?",
+        "placeholder": "e.g. Austin, TX"
+      },
+      {
+        "key": "details",
+        "label": "Any other details?",
+        "type": "textarea",
+        "placeholder": "Services you offer, brand colors, special features, terminology you use..."
+      }
+    ]
+  },
+
+  "agent": "agent.md"
+}
