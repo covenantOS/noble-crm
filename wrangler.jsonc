@@ -1,0 +1,39 @@
+{
+  // Cloudflare Workers config for the Westchase Painting field service app.
+  // Account: admin@goparadigmportal.com. Domain (my.nobletampa.com) added later.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "westchase-fieldservice",
+  "main": "src/server/index.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "westchase-fieldservice",
+      "database_id": "b234c371-3237-4c34-a9ed-531524866689",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "westchase-fieldservice-files"
+    }
+  ],
+
+  // Serves the built Preact SPA. Point at your client build output dir.
+  "assets": { "directory": "./dist/client", "binding": "ASSETS" },
+
+  // Phase 4: uncomment for recurring-job generation + reminders (daily 6am UTC).
+  // "triggers": { "crons": ["0 6 * * *"] },
+
+  "vars": {
+    "BETTER_AUTH_URL": "http://localhost:8787"
+  }
+
+  // Secrets (do NOT put here, set with `wrangler secret put`):
+  //   BETTER_AUTH_SECRET, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET
+}
