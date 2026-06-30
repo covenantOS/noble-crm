@@ -1,11 +1,9 @@
 import { OpenAPIHono, createRoute, z } from "@hono/zod-openapi";
-import { initDB, query, get, run } from "./db.js";
+import { and, asc, desc, eq, like, or, sql, inArray } from "drizzle-orm";
+import { getDb, schema } from "../db/index.js";
+import type { AppBindings } from "../lib/types.js";
 
-type Env = { Bindings: { DB: D1Database } };
-
-const app = new OpenAPIHono<Env>();
-
-app.use("*", async (c, next) => { initDB(c.env); await next(); });
+const app = new OpenAPIHono<AppBindings>();
 
 // ── Shared Schemas ─────────────────────────────────────────────────
 
@@ -88,20 +86,69 @@ const IdParam = z.object({ id: z.string().openapi({ description: "Resource ID" }
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-async function nextIdentifier(): Promise<string> {
-  const prefix = await get<{ value: string }>("SELECT value FROM _meta WHERE key = 'identifier_prefix'");
-  const counter = await get<{ value: string }>("SELECT value FROM _meta WHERE key = 'job_counter'");
-  const next = parseInt(counter?.value || "0", 10) + 1;
-  await run("UPDATE _meta SET value = ? WHERE key = 'job_counter'", [String(next)]);
-  return `${prefix?.value || "JOB"}-${next}`;
+// The original raw-SQL version bound :id as a TEXT param against an INTEGER
+// PRIMARY KEY column. SQLite's type-affinity comparison only coerces TEXT to
+// NUMERIC when the conversion is lossless (e.g. "5" -> 5), so a malformed id
+// like "5abc" never matched any row and every route fell through to its
+// not-found / zero-rows-affected path. `parseInt("5abc", 10)` would silently
+// truncate to 5 and match a real row instead -- this preserves the original
+// "malformed id matches nothing" behavior. -1 is a safe sentinel since every
+// id column here is an autoincrement PK starting at 1.
+const toId = (id: string): number => (/^\d+$/.test(id) ? Number(id) : -1);
+
+async function nextIdentifier(db: ReturnType<typeof getDb>): Promise<string> {
+  const prefixRow = await db.select().from(schema.meta).where(eq(schema.meta.key, "identifier_prefix")).get();
+  const counterRow = await db.select().from(schema.meta).where(eq(schema.meta.key, "job_counter")).get();
+  const next = parseInt(counterRow?.value || "0", 10) + 1;
+  await db.update(schema.meta).set({ value: String(next) }).where(eq(schema.meta.key, "job_counter"));
+  return `${prefixRow?.value || "JOB"}-${next}`;
 }
 
-async function nextInvoiceIdentifier(): Promise<string> {
-  const prefix = await get<{ value: string }>("SELECT value FROM _meta WHERE key = 'invoice_prefix'");
-  const counter = await get<{ value: string }>("SELECT value FROM _meta WHERE key = 'invoice_counter'");
-  const next = parseInt(counter?.value || "0", 10) + 1;
-  await run("UPDATE _meta SET value = ? WHERE key = 'invoice_counter'", [String(next)]);
-  return `${prefix?.value || "INV"}-${next}`;
+async function nextInvoiceIdentifier(db: ReturnType<typeof getDb>): Promise<string> {
+  const prefixRow = await db.select().from(schema.meta).where(eq(schema.meta.key, "invoice_prefix")).get();
+  const counterRow = await db.select().from(schema.meta).where(eq(schema.meta.key, "invoice_counter")).get();
+  const next = parseInt(counterRow?.value || "0", 10) + 1;
+  await db.update(schema.meta).set({ value: String(next) }).where(eq(schema.meta.key, "invoice_counter"));
+  return `${prefixRow?.value || "INV"}-${next}`;
+}
+
+// Shared "job with joined denormalized fields" select shape, matching the
+// original SQL `j.*, c.name as customer_name, c.phone as customer_phone,
+// t.name as technician_name, t.color as technician_color,
+// st.name as service_type_name, st.color as service_type_color`.
+function jobJoinedSelect(db: ReturnType<typeof getDb>) {
+  return db
+    .select({
+      id: schema.jobs.id,
+      identifier: schema.jobs.identifier,
+      customer_id: schema.jobs.customerId,
+      technician_id: schema.jobs.technicianId,
+      service_type_id: schema.jobs.serviceTypeId,
+      status: schema.jobs.status,
+      priority: schema.jobs.priority,
+      scheduled_date: schema.jobs.scheduledDate,
+      scheduled_time: sql<string>`COALESCE(${schema.jobs.scheduledTime}, '')`,
+      duration: schema.jobs.duration,
+      price: schema.jobs.price,
+      address: sql<string>`COALESCE(${schema.jobs.address}, '')`,
+      notes: sql<string>`COALESCE(${schema.jobs.notes}, '')`,
+      completion_notes: sql<string>`COALESCE(${schema.jobs.completionNotes}, '')`,
+      is_recurring: schema.jobs.isRecurring,
+      recurrence_interval: sql<string>`COALESCE(${schema.jobs.recurrenceInterval}, '')`,
+      next_recurrence_date: sql<string>`COALESCE(${schema.jobs.nextRecurrenceDate}, '')`,
+      created_at: sql<string>`COALESCE(${schema.jobs.createdAt}, '')`,
+      updated_at: sql<string>`COALESCE(${schema.jobs.updatedAt}, '')`,
+      customer_name: sql<string | undefined>`${schema.customers.name}`,
+      customer_phone: sql<string | undefined>`${schema.customers.phone}`,
+      technician_name: schema.technicians.name,
+      technician_color: schema.technicians.color,
+      service_type_name: schema.serviceTypes.name,
+      service_type_color: schema.serviceTypes.color,
+    })
+    .from(schema.jobs)
+    .leftJoin(schema.customers, eq(schema.jobs.customerId, schema.customers.id))
+    .leftJoin(schema.technicians, eq(schema.jobs.technicianId, schema.technicians.id))
+    .leftJoin(schema.serviceTypes, eq(schema.jobs.serviceTypeId, schema.serviceTypes.id));
 }
 
 // ── Stats ──────────────────────────────────────────────────────────
@@ -129,15 +176,20 @@ const getStats = createRoute({
 });
 
 app.openapi(getStats, async (c) => {
-  const jobs = await get<{ count: number }>("SELECT COUNT(*) as count FROM jobs");
-  const customers = await get<{ count: number }>("SELECT COUNT(*) as count FROM customers");
-  const technicians = await get<{ count: number }>("SELECT COUNT(*) as count FROM technicians WHERE active = 1");
-  const serviceTypes = await get<{ count: number }>("SELECT COUNT(*) as count FROM service_types");
+  const db = getDb(c.env);
+  const jobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs).get();
+  const customers = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.customers).get();
+  const technicians = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.technicians).where(eq(schema.technicians.active, 1)).get();
+  const serviceTypes = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.serviceTypes).get();
   const today = new Date().toISOString().split("T")[0];
-  const todayJobs = await get<{ count: number }>("SELECT COUNT(*) as count FROM jobs WHERE scheduled_date = ?", [today]);
-  const upcomingJobs = await get<{ count: number }>("SELECT COUNT(*) as count FROM jobs WHERE status IN ('scheduled', 'confirmed') AND scheduled_date >= ?", [today]);
-  const completedJobs = await get<{ count: number }>("SELECT COUNT(*) as count FROM jobs WHERE status = 'completed'");
-  const revenue = await get<{ total: number }>("SELECT COALESCE(SUM(price), 0) as total FROM jobs WHERE status = 'completed'");
+  const todayJobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs).where(eq(schema.jobs.scheduledDate, today)).get();
+  const upcomingJobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs)
+    .where(and(inArray(schema.jobs.status, ["scheduled", "confirmed"]), sql`${schema.jobs.scheduledDate} >= ${today}`))
+    .get();
+  const completedJobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs).where(eq(schema.jobs.status, "completed")).get();
+  const revenue = await db.select({ total: sql<number>`COALESCE(SUM(${schema.jobs.price}), 0)` }).from(schema.jobs).where(eq(schema.jobs.status, "completed")).get();
+  const invoicesOutstanding = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.invoices).where(inArray(schema.invoices.status, ["sent"])).get();
+  const invoicesOverdue = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.invoices).where(eq(schema.invoices.status, "overdue")).get();
   return c.json({
     jobs: jobs?.count || 0,
     customers: customers?.count || 0,
@@ -147,8 +199,8 @@ app.openapi(getStats, async (c) => {
     upcoming_jobs: upcomingJobs?.count || 0,
     completed_jobs: completedJobs?.count || 0,
     revenue: revenue?.total || 0,
-    invoices_outstanding: (await get<{ count: number }>("SELECT COUNT(*) as count FROM invoices WHERE status IN ('sent')"))?.count || 0,
-    invoices_overdue: (await get<{ count: number }>("SELECT COUNT(*) as count FROM invoices WHERE status = 'overdue'"))?.count || 0,
+    invoices_outstanding: invoicesOutstanding?.count || 0,
+    invoices_overdue: invoicesOverdue?.count || 0,
   }, 200);
 });
 
@@ -176,50 +228,45 @@ const listJobs = createRoute({
 });
 
 app.openapi(listJobs, async (c) => {
+  const db = getDb(c.env);
   const q = c.req.valid("query");
   const page = parseInt(q.page || "1", 10);
   const limit = parseInt(q.limit || "50", 10);
   const offset = (page - 1) * limit;
 
-  let where = "WHERE 1=1";
-  const params: unknown[] = [];
-
+  const conditions = [];
   if (q.search) {
-    where += " AND (j.identifier LIKE ? OR c.name LIKE ? OR j.address LIKE ?)";
     const s = `%${q.search}%`;
-    params.push(s, s, s);
+    conditions.push(or(
+      like(schema.jobs.identifier, s),
+      like(schema.customers.name, s),
+      like(schema.jobs.address, s),
+    ));
   }
   if (q.status) {
-    where += " AND j.status = ?";
-    params.push(q.status);
+    conditions.push(eq(schema.jobs.status, q.status));
   }
   if (q.date) {
-    where += " AND j.scheduled_date = ?";
-    params.push(q.date);
+    conditions.push(eq(schema.jobs.scheduledDate, q.date));
   }
   if (q.technician_id) {
-    where += " AND j.technician_id = ?";
-    params.push(q.technician_id);
+    conditions.push(eq(schema.jobs.technicianId, parseInt(q.technician_id, 10)));
   }
+  const where = conditions.length > 0 ? and(...conditions) : undefined;
 
-  const countRow = await get<{ count: number }>(
-    `SELECT COUNT(*) as count FROM jobs j LEFT JOIN customers c ON j.customer_id = c.id ${where}`,
-    params
-  );
+  const countRow = await db
+    .select({ count: sql<number>`COUNT(*)` })
+    .from(schema.jobs)
+    .leftJoin(schema.customers, eq(schema.jobs.customerId, schema.customers.id))
+    .where(where)
+    .get();
 
-  const jobs = await query<Record<string, unknown>>(
-    `SELECT j.*, c.name as customer_name, c.phone as customer_phone,
-       t.name as technician_name, t.color as technician_color,
-       st.name as service_type_name, st.color as service_type_color
-     FROM jobs j
-     LEFT JOIN customers c ON j.customer_id = c.id
-     LEFT JOIN technicians t ON j.technician_id = t.id
-     LEFT JOIN service_types st ON j.service_type_id = st.id
-     ${where}
-     ORDER BY j.scheduled_date ASC, j.scheduled_time ASC
-     LIMIT ? OFFSET ?`,
-    [...params, limit, offset]
-  );
+  const jobs = await jobJoinedSelect(db)
+    .where(where)
+    .orderBy(asc(schema.jobs.scheduledDate), asc(schema.jobs.scheduledTime))
+    .limit(limit)
+    .offset(offset)
+    .all();
 
   return c.json({ jobs, total: countRow?.count || 0 }, 200);
 });
@@ -235,31 +282,31 @@ const getJob = createRoute({
 });
 
 app.openapi(getJob, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  const job = await get<Record<string, unknown>>(
-    `SELECT j.*, c.name as customer_name, c.phone as customer_phone,
-       t.name as technician_name, t.color as technician_color,
-       st.name as service_type_name, st.color as service_type_color
-     FROM jobs j
-     LEFT JOIN customers c ON j.customer_id = c.id
-     LEFT JOIN technicians t ON j.technician_id = t.id
-     LEFT JOIN service_types st ON j.service_type_id = st.id
-     WHERE j.id = ?`,
-    [id]
-  );
+  const idNum = toId(id);
+  const job = await jobJoinedSelect(db).where(eq(schema.jobs.id, idNum)).get();
   if (!job) return c.json({ error: "Job not found" }, 404);
-  const notes = await query<Record<string, unknown>>(
-    "SELECT * FROM job_notes WHERE job_id = ? ORDER BY created_at DESC", [id]
-  );
-  const checklist = await query<Record<string, unknown>>(
-    "SELECT * FROM job_checklist WHERE job_id = ? ORDER BY sort_order ASC", [id]
-  );
-  const jobMaterials = await query<Record<string, unknown>>(
-    `SELECT jm.*, m.name as material_name, m.unit as material_unit
-     FROM job_materials jm LEFT JOIN materials m ON jm.material_id = m.id
-     WHERE jm.job_id = ? ORDER BY jm.id ASC`, [id]
-  );
-  return c.json({ job: { ...job, job_notes: notes, checklist, job_materials: jobMaterials } }, 200);
+  const notes = await db.select().from(schema.jobNotes).where(eq(schema.jobNotes.jobId, idNum)).orderBy(desc(schema.jobNotes.createdAt)).all();
+  const checklist = await db.select().from(schema.jobChecklist).where(eq(schema.jobChecklist.jobId, idNum)).orderBy(asc(schema.jobChecklist.sortOrder)).all();
+  const jobMaterials = await db
+    .select({
+      id: schema.jobMaterials.id,
+      job_id: schema.jobMaterials.jobId,
+      material_id: schema.jobMaterials.materialId,
+      quantity: schema.jobMaterials.quantity,
+      unit_cost: schema.jobMaterials.unitCost,
+      material_name: schema.materials.name,
+      material_unit: schema.materials.unit,
+    })
+    .from(schema.jobMaterials)
+    .leftJoin(schema.materials, eq(schema.jobMaterials.materialId, schema.materials.id))
+    .where(eq(schema.jobMaterials.jobId, idNum))
+    .orderBy(asc(schema.jobMaterials.id))
+    .all();
+  const notesOut = notes.map((n) => ({ id: n.id, job_id: n.jobId, content: n.content, created_at: n.createdAt ?? "" }));
+  const checklistOut = checklist.map((ch) => ({ id: ch.id, job_id: ch.jobId, label: ch.label, checked: ch.checked, sort_order: ch.sortOrder }));
+  return c.json({ job: { ...job, job_notes: notesOut, checklist: checklistOut, job_materials: jobMaterials } }, 200);
 });
 
 const createJob = createRoute({
@@ -290,15 +337,18 @@ const createJob = createRoute({
 });
 
 app.openapi(createJob, async (c) => {
+  const db = getDb(c.env);
   const data = c.req.valid("json");
-  const identifier = await nextIdentifier();
+  const identifier = await nextIdentifier(db);
 
   // If address is empty, use customer address
   let address = data.address || "";
   if (!address) {
-    const cust = await get<{ address: string; city: string; state: string; zip: string }>(
-      "SELECT address, city, state, zip FROM customers WHERE id = ?", [data.customer_id]
-    );
+    const cust = await db
+      .select({ address: schema.customers.address, city: schema.customers.city, state: schema.customers.state, zip: schema.customers.zip })
+      .from(schema.customers)
+      .where(eq(schema.customers.id, data.customer_id))
+      .get();
     if (cust) {
       address = [cust.address, cust.city, cust.state, cust.zip].filter(Boolean).join(", ");
     }
@@ -308,48 +358,35 @@ app.openapi(createJob, async (c) => {
   let duration = data.duration || 60;
   let price = data.price || 0;
   if (data.service_type_id && (!data.duration || !data.price)) {
-    const st = await get<{ default_duration: number; default_price: number }>(
-      "SELECT default_duration, default_price FROM service_types WHERE id = ?", [data.service_type_id]
-    );
+    const st = await db
+      .select({ default_duration: schema.serviceTypes.defaultDuration, default_price: schema.serviceTypes.defaultPrice })
+      .from(schema.serviceTypes)
+      .where(eq(schema.serviceTypes.id, data.service_type_id))
+      .get();
     if (st) {
       if (!data.duration) duration = st.default_duration;
       if (!data.price) price = st.default_price;
     }
   }
 
-  await run(
-    `INSERT INTO jobs (identifier, customer_id, technician_id, service_type_id, status, priority,
-       scheduled_date, scheduled_time, duration, price, address, notes, is_recurring, recurrence_interval)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      identifier,
-      data.customer_id,
-      data.technician_id ?? null,
-      data.service_type_id ?? null,
-      data.status || "scheduled",
-      data.priority || "normal",
-      data.scheduled_date,
-      data.scheduled_time || "09:00",
-      duration,
-      price,
-      address,
-      data.notes || "",
-      data.is_recurring || 0,
-      data.recurrence_interval || "",
-    ]
-  );
+  await db.insert(schema.jobs).values({
+    identifier,
+    customerId: data.customer_id,
+    technicianId: data.technician_id ?? null,
+    serviceTypeId: data.service_type_id ?? null,
+    status: data.status || "scheduled",
+    priority: data.priority || "normal",
+    scheduledDate: data.scheduled_date,
+    scheduledTime: data.scheduled_time || "09:00",
+    duration,
+    price,
+    address,
+    notes: data.notes || "",
+    isRecurring: data.is_recurring || 0,
+    recurrenceInterval: data.recurrence_interval || "",
+  });
 
-  const job = await get<Record<string, unknown>>(
-    `SELECT j.*, c.name as customer_name, c.phone as customer_phone,
-       t.name as technician_name, t.color as technician_color,
-       st.name as service_type_name, st.color as service_type_color
-     FROM jobs j
-     LEFT JOIN customers c ON j.customer_id = c.id
-     LEFT JOIN technicians t ON j.technician_id = t.id
-     LEFT JOIN service_types st ON j.service_type_id = st.id
-     WHERE j.identifier = ?`,
-    [identifier]
-  );
+  const job = await jobJoinedSelect(db).where(eq(schema.jobs.identifier, identifier)).get();
   return c.json(job!, 201);
 });
 
@@ -384,22 +421,32 @@ const updateJob = createRoute({
 });
 
 app.openapi(updateJob, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
+  const idNum = toId(id);
   const data = c.req.valid("json");
-  const existing = await get<Record<string, unknown>>("SELECT * FROM jobs WHERE id = ?", [id]);
+  const existing = await db.select().from(schema.jobs).where(eq(schema.jobs.id, idNum)).get();
   if (!existing) return c.json({ error: "Job not found" }, 404);
 
-  const fields: string[] = [];
-  const vals: unknown[] = [];
-  for (const [k, v] of Object.entries(data)) {
-    if (v !== undefined) {
-      fields.push(`${k} = ?`);
-      vals.push(v);
-    }
-  }
-  if (fields.length > 0) {
-    fields.push("updated_at = datetime('now')");
-    await run(`UPDATE jobs SET ${fields.join(", ")} WHERE id = ?`, [...vals, id]);
+  const updates: Record<string, unknown> = {};
+  if (data.customer_id !== undefined) updates.customerId = data.customer_id;
+  if (data.technician_id !== undefined) updates.technicianId = data.technician_id;
+  if (data.service_type_id !== undefined) updates.serviceTypeId = data.service_type_id;
+  if (data.status !== undefined) updates.status = data.status;
+  if (data.priority !== undefined) updates.priority = data.priority;
+  if (data.scheduled_date !== undefined) updates.scheduledDate = data.scheduled_date;
+  if (data.scheduled_time !== undefined) updates.scheduledTime = data.scheduled_time;
+  if (data.duration !== undefined) updates.duration = data.duration;
+  if (data.price !== undefined) updates.price = data.price;
+  if (data.address !== undefined) updates.address = data.address;
+  if (data.notes !== undefined) updates.notes = data.notes;
+  if (data.completion_notes !== undefined) updates.completionNotes = data.completion_notes;
+  if (data.is_recurring !== undefined) updates.isRecurring = data.is_recurring;
+  if (data.recurrence_interval !== undefined) updates.recurrenceInterval = data.recurrence_interval;
+
+  if (Object.keys(updates).length > 0) {
+    updates.updatedAt = sql`(datetime('now'))`;
+    await db.update(schema.jobs).set(updates).where(eq(schema.jobs.id, idNum));
   }
   return c.json({ ok: true }, 200);
 });
@@ -414,8 +461,9 @@ const deleteJob = createRoute({
 });
 
 app.openapi(deleteJob, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  await run("DELETE FROM jobs WHERE id = ?", [id]);
+  await db.delete(schema.jobs).where(eq(schema.jobs.id, toId(id)));
   return c.json({ ok: true }, 200);
 });
 
@@ -434,13 +482,13 @@ const addJobNote = createRoute({
 });
 
 app.openapi(addJobNote, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
+  const idNum = toId(id);
   const { content } = c.req.valid("json");
-  await run("INSERT INTO job_notes (job_id, content) VALUES (?, ?)", [id, content]);
-  const note = await get<Record<string, unknown>>(
-    "SELECT * FROM job_notes WHERE job_id = ? ORDER BY id DESC LIMIT 1", [id]
-  );
-  return c.json(note!, 201);
+  await db.insert(schema.jobNotes).values({ jobId: idNum, content });
+  const note = await db.select().from(schema.jobNotes).where(eq(schema.jobNotes.jobId, idNum)).orderBy(desc(schema.jobNotes.id)).limit(1).get();
+  return c.json({ id: note!.id, job_id: note!.jobId, content: note!.content, created_at: note!.createdAt! }, 201);
 });
 
 const deleteJobNote = createRoute({
@@ -453,8 +501,9 @@ const deleteJobNote = createRoute({
 });
 
 app.openapi(deleteJobNote, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  await run("DELETE FROM job_notes WHERE id = ?", [id]);
+  await db.delete(schema.jobNotes).where(eq(schema.jobNotes.id, toId(id)));
   return c.json({ ok: true }, 200);
 });
 
@@ -479,29 +528,55 @@ const listCustomers = createRoute({
 });
 
 app.openapi(listCustomers, async (c) => {
+  const db = getDb(c.env);
   const q = c.req.valid("query");
   const page = parseInt(q.page || "1", 10);
   const limit = parseInt(q.limit || "50", 10);
   const offset = (page - 1) * limit;
 
-  let where = "";
-  const params: unknown[] = [];
+  let where = undefined;
   if (q.search) {
-    where = "WHERE c.name LIKE ? OR c.email LIKE ? OR c.phone LIKE ? OR c.address LIKE ?";
     const s = `%${q.search}%`;
-    params.push(s, s, s, s);
+    where = or(
+      like(schema.customers.name, s),
+      like(schema.customers.email, s),
+      like(schema.customers.phone, s),
+      like(schema.customers.address, s),
+    );
   }
 
-  const countRow = await get<{ count: number }>(`SELECT COUNT(*) as count FROM customers c ${where}`, params);
-  const customers = await query<Record<string, unknown>>(
-    `SELECT c.*, COALESCE(jc.cnt, 0) as job_count
-     FROM customers c
-     LEFT JOIN (SELECT customer_id, COUNT(*) as cnt FROM jobs GROUP BY customer_id) jc ON jc.customer_id = c.id
-     ${where}
-     ORDER BY c.name ASC
-     LIMIT ? OFFSET ?`,
-    [...params, limit, offset]
+  const countRow = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.customers).where(where).get();
+
+  const jobCountSub = db.$with("jc").as(
+    db.select({ customerId: schema.jobs.customerId, cnt: sql<number>`COUNT(*)`.as("cnt") })
+      .from(schema.jobs)
+      .groupBy(schema.jobs.customerId)
   );
+
+  const customers = await db
+    .with(jobCountSub)
+    .select({
+      id: schema.customers.id,
+      name: schema.customers.name,
+      email: schema.customers.email,
+      phone: schema.customers.phone,
+      address: schema.customers.address,
+      city: schema.customers.city,
+      state: schema.customers.state,
+      zip: schema.customers.zip,
+      notes: schema.customers.notes,
+      created_at: sql<string>`COALESCE(${schema.customers.createdAt}, '')`,
+      updated_at: sql<string>`COALESCE(${schema.customers.updatedAt}, '')`,
+      job_count: sql<number>`COALESCE(${jobCountSub.cnt}, 0)`,
+    })
+    .from(schema.customers)
+    .leftJoin(jobCountSub, eq(jobCountSub.customerId, schema.customers.id))
+    .where(where)
+    .orderBy(asc(schema.customers.name))
+    .limit(limit)
+    .offset(offset)
+    .all();
+
   return c.json({ customers, total: countRow?.count || 0 }, 200);
 });
 
@@ -517,7 +592,12 @@ const listAllCustomers = createRoute({
 });
 
 app.openapi(listAllCustomers, async (c) => {
-  const customers = await query<Record<string, unknown>>("SELECT id, name, address FROM customers ORDER BY name ASC");
+  const db = getDb(c.env);
+  const customers = await db
+    .select({ id: schema.customers.id, name: schema.customers.name, address: schema.customers.address })
+    .from(schema.customers)
+    .orderBy(asc(schema.customers.name))
+    .all();
   return c.json({ customers }, 200);
 });
 
@@ -532,21 +612,58 @@ const getCustomer = createRoute({
 });
 
 app.openapi(getCustomer, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  const customer = await get<Record<string, unknown>>("SELECT * FROM customers WHERE id = ?", [id]);
+  const idNum = toId(id);
+  const customer = await db.select().from(schema.customers).where(eq(schema.customers.id, idNum)).get();
   if (!customer) return c.json({ error: "Customer not found" }, 404);
-  const jobs = await query<Record<string, unknown>>(
-    `SELECT j.*, t.name as technician_name, t.color as technician_color,
-       st.name as service_type_name, st.color as service_type_color
-     FROM jobs j
-     LEFT JOIN technicians t ON j.technician_id = t.id
-     LEFT JOIN service_types st ON j.service_type_id = st.id
-     WHERE j.customer_id = ?
-     ORDER BY j.scheduled_date DESC
-     LIMIT 50`,
-    [id]
-  );
-  return c.json({ customer, jobs }, 200);
+  const customerOut = {
+    id: customer.id,
+    name: customer.name,
+    email: customer.email,
+    phone: customer.phone,
+    address: customer.address,
+    city: customer.city,
+    state: customer.state,
+    zip: customer.zip,
+    notes: customer.notes,
+    created_at: customer.createdAt ?? "",
+    updated_at: customer.updatedAt ?? "",
+  };
+  const jobs = await db
+    .select({
+      id: schema.jobs.id,
+      identifier: schema.jobs.identifier,
+      customer_id: schema.jobs.customerId,
+      technician_id: schema.jobs.technicianId,
+      service_type_id: schema.jobs.serviceTypeId,
+      status: schema.jobs.status,
+      priority: schema.jobs.priority,
+      scheduled_date: schema.jobs.scheduledDate,
+      scheduled_time: sql<string>`COALESCE(${schema.jobs.scheduledTime}, '')`,
+      duration: schema.jobs.duration,
+      price: schema.jobs.price,
+      address: sql<string>`COALESCE(${schema.jobs.address}, '')`,
+      notes: sql<string>`COALESCE(${schema.jobs.notes}, '')`,
+      completion_notes: sql<string>`COALESCE(${schema.jobs.completionNotes}, '')`,
+      is_recurring: schema.jobs.isRecurring,
+      recurrence_interval: sql<string>`COALESCE(${schema.jobs.recurrenceInterval}, '')`,
+      next_recurrence_date: sql<string>`COALESCE(${schema.jobs.nextRecurrenceDate}, '')`,
+      created_at: sql<string>`COALESCE(${schema.jobs.createdAt}, '')`,
+      updated_at: sql<string>`COALESCE(${schema.jobs.updatedAt}, '')`,
+      technician_name: schema.technicians.name,
+      technician_color: schema.technicians.color,
+      service_type_name: schema.serviceTypes.name,
+      service_type_color: schema.serviceTypes.color,
+    })
+    .from(schema.jobs)
+    .leftJoin(schema.technicians, eq(schema.jobs.technicianId, schema.technicians.id))
+    .leftJoin(schema.serviceTypes, eq(schema.jobs.serviceTypeId, schema.serviceTypes.id))
+    .where(eq(schema.jobs.customerId, idNum))
+    .orderBy(desc(schema.jobs.scheduledDate))
+    .limit(50)
+    .all();
+  return c.json({ customer: customerOut, jobs }, 200);
 });
 
 const createCustomer = createRoute({
@@ -572,14 +689,33 @@ const createCustomer = createRoute({
 });
 
 app.openapi(createCustomer, async (c) => {
+  const db = getDb(c.env);
   const data = c.req.valid("json");
-  await run(
-    "INSERT INTO customers (name, email, phone, address, city, state, zip, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    [data.name, data.email || "", data.phone || "", data.address || "",
-    data.city || "", data.state || "", data.zip || "", data.notes || ""]
-  );
-  const customer = await get<Record<string, unknown>>("SELECT * FROM customers ORDER BY id DESC LIMIT 1");
-  return c.json(customer!, 201);
+  await db.insert(schema.customers).values({
+    name: data.name,
+    email: data.email || "",
+    phone: data.phone || "",
+    address: data.address || "",
+    city: data.city || "",
+    state: data.state || "",
+    zip: data.zip || "",
+    notes: data.notes || "",
+  });
+  const customer = await db.select().from(schema.customers).orderBy(desc(schema.customers.id)).limit(1).get();
+  const customerOut = {
+    id: customer!.id,
+    name: customer!.name,
+    email: customer!.email,
+    phone: customer!.phone,
+    address: customer!.address,
+    city: customer!.city,
+    state: customer!.state,
+    zip: customer!.zip,
+    notes: customer!.notes,
+    created_at: customer!.createdAt ?? "",
+    updated_at: customer!.updatedAt ?? "",
+  };
+  return c.json(customerOut, 201);
 });
 
 const updateCustomer = createRoute({
@@ -606,19 +742,21 @@ const updateCustomer = createRoute({
 });
 
 app.openapi(updateCustomer, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
   const data = c.req.valid("json");
-  const fields: string[] = [];
-  const vals: unknown[] = [];
-  for (const [k, v] of Object.entries(data)) {
-    if (v !== undefined) {
-      fields.push(`${k} = ?`);
-      vals.push(v);
-    }
-  }
-  if (fields.length > 0) {
-    fields.push("updated_at = datetime('now')");
-    await run(`UPDATE customers SET ${fields.join(", ")} WHERE id = ?`, [...vals, id]);
+  const updates: Record<string, unknown> = {};
+  if (data.name !== undefined) updates.name = data.name;
+  if (data.email !== undefined) updates.email = data.email;
+  if (data.phone !== undefined) updates.phone = data.phone;
+  if (data.address !== undefined) updates.address = data.address;
+  if (data.city !== undefined) updates.city = data.city;
+  if (data.state !== undefined) updates.state = data.state;
+  if (data.zip !== undefined) updates.zip = data.zip;
+  if (data.notes !== undefined) updates.notes = data.notes;
+  if (Object.keys(updates).length > 0) {
+    updates.updatedAt = sql`(datetime('now'))`;
+    await db.update(schema.customers).set(updates).where(eq(schema.customers.id, toId(id)));
   }
   return c.json({ ok: true }, 200);
 });
@@ -633,8 +771,9 @@ const deleteCustomer = createRoute({
 });
 
 app.openapi(deleteCustomer, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  await run("DELETE FROM customers WHERE id = ?", [id]);
+  await db.delete(schema.customers).where(eq(schema.customers.id, toId(id)));
   return c.json({ ok: true }, 200);
 });
 
@@ -652,12 +791,29 @@ const listTechnicians = createRoute({
 });
 
 app.openapi(listTechnicians, async (c) => {
-  const technicians = await query<Record<string, unknown>>(
-    `SELECT t.*, COALESCE(jc.cnt, 0) as job_count
-     FROM technicians t
-     LEFT JOIN (SELECT technician_id, COUNT(*) as cnt FROM jobs WHERE status IN ('scheduled','confirmed','in_progress') GROUP BY technician_id) jc ON jc.technician_id = t.id
-     ORDER BY t.name ASC`
+  const db = getDb(c.env);
+  const jobCountSub = db.$with("jc").as(
+    db.select({ technicianId: schema.jobs.technicianId, cnt: sql<number>`COUNT(*)`.as("cnt") })
+      .from(schema.jobs)
+      .where(inArray(schema.jobs.status, ["scheduled", "confirmed", "in_progress"]))
+      .groupBy(schema.jobs.technicianId)
   );
+  const technicians = await db
+    .with(jobCountSub)
+    .select({
+      id: schema.technicians.id,
+      name: schema.technicians.name,
+      email: schema.technicians.email,
+      phone: schema.technicians.phone,
+      color: schema.technicians.color,
+      active: schema.technicians.active,
+      created_at: sql<string>`COALESCE(${schema.technicians.createdAt}, '')`,
+      job_count: sql<number>`COALESCE(${jobCountSub.cnt}, 0)`,
+    })
+    .from(schema.technicians)
+    .leftJoin(jobCountSub, eq(jobCountSub.technicianId, schema.technicians.id))
+    .orderBy(asc(schema.technicians.name))
+    .all();
   return c.json({ technicians }, 200);
 });
 
@@ -673,9 +829,13 @@ const listAllTechnicians = createRoute({
 });
 
 app.openapi(listAllTechnicians, async (c) => {
-  const technicians = await query<Record<string, unknown>>(
-    "SELECT id, name, color FROM technicians WHERE active = 1 ORDER BY name ASC"
-  );
+  const db = getDb(c.env);
+  const technicians = await db
+    .select({ id: schema.technicians.id, name: schema.technicians.name, color: schema.technicians.color })
+    .from(schema.technicians)
+    .where(eq(schema.technicians.active, 1))
+    .orderBy(asc(schema.technicians.name))
+    .all();
   return c.json({ technicians }, 200);
 });
 
@@ -698,13 +858,25 @@ const createTechnician = createRoute({
 });
 
 app.openapi(createTechnician, async (c) => {
+  const db = getDb(c.env);
   const data = c.req.valid("json");
-  await run(
-    "INSERT INTO technicians (name, email, phone, color) VALUES (?, ?, ?, ?)",
-    [data.name, data.email || "", data.phone || "", data.color || "#16a34a"]
-  );
-  const tech = await get<Record<string, unknown>>("SELECT * FROM technicians ORDER BY id DESC LIMIT 1");
-  return c.json(tech!, 201);
+  await db.insert(schema.technicians).values({
+    name: data.name,
+    email: data.email || "",
+    phone: data.phone || "",
+    color: data.color || "#16a34a",
+  });
+  const tech = await db.select().from(schema.technicians).orderBy(desc(schema.technicians.id)).limit(1).get();
+  const techOut = {
+    id: tech!.id,
+    name: tech!.name,
+    email: tech!.email,
+    phone: tech!.phone,
+    color: tech!.color,
+    active: tech!.active,
+    created_at: tech!.createdAt ?? "",
+  };
+  return c.json(techOut, 201);
 });
 
 const updateTechnician = createRoute({
@@ -728,18 +900,17 @@ const updateTechnician = createRoute({
 });
 
 app.openapi(updateTechnician, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
   const data = c.req.valid("json");
-  const fields: string[] = [];
-  const vals: unknown[] = [];
-  for (const [k, v] of Object.entries(data)) {
-    if (v !== undefined) {
-      fields.push(`${k} = ?`);
-      vals.push(v);
-    }
-  }
-  if (fields.length > 0) {
-    await run(`UPDATE technicians SET ${fields.join(", ")} WHERE id = ?`, [...vals, id]);
+  const updates: Record<string, unknown> = {};
+  if (data.name !== undefined) updates.name = data.name;
+  if (data.email !== undefined) updates.email = data.email;
+  if (data.phone !== undefined) updates.phone = data.phone;
+  if (data.color !== undefined) updates.color = data.color;
+  if (data.active !== undefined) updates.active = data.active;
+  if (Object.keys(updates).length > 0) {
+    await db.update(schema.technicians).set(updates).where(eq(schema.technicians.id, toId(id)));
   }
   return c.json({ ok: true }, 200);
 });
@@ -754,8 +925,9 @@ const deleteTechnician = createRoute({
 });
 
 app.openapi(deleteTechnician, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  await run("DELETE FROM technicians WHERE id = ?", [id]);
+  await db.delete(schema.technicians).where(eq(schema.technicians.id, toId(id)));
   return c.json({ ok: true }, 200);
 });
 
@@ -773,7 +945,20 @@ const listServiceTypes = createRoute({
 });
 
 app.openapi(listServiceTypes, async (c) => {
-  const types = await query<Record<string, unknown>>("SELECT * FROM service_types ORDER BY name ASC");
+  const db = getDb(c.env);
+  const types = await db
+    .select({
+      id: schema.serviceTypes.id,
+      name: schema.serviceTypes.name,
+      description: schema.serviceTypes.description,
+      default_duration: schema.serviceTypes.defaultDuration,
+      default_price: schema.serviceTypes.defaultPrice,
+      color: schema.serviceTypes.color,
+      created_at: sql<string>`COALESCE(${schema.serviceTypes.createdAt}, '')`,
+    })
+    .from(schema.serviceTypes)
+    .orderBy(asc(schema.serviceTypes.name))
+    .all();
   return c.json({ service_types: types }, 200);
 });
 
@@ -797,13 +982,26 @@ const createServiceType = createRoute({
 });
 
 app.openapi(createServiceType, async (c) => {
+  const db = getDb(c.env);
   const data = c.req.valid("json");
-  await run(
-    "INSERT INTO service_types (name, description, default_duration, default_price, color) VALUES (?, ?, ?, ?, ?)",
-    [data.name, data.description || "", data.default_duration || 60, data.default_price || 0, data.color || "#6b7280"]
-  );
-  const st = await get<Record<string, unknown>>("SELECT * FROM service_types ORDER BY id DESC LIMIT 1");
-  return c.json(st!, 201);
+  await db.insert(schema.serviceTypes).values({
+    name: data.name,
+    description: data.description || "",
+    defaultDuration: data.default_duration || 60,
+    defaultPrice: data.default_price || 0,
+    color: data.color || "#6b7280",
+  });
+  const st = await db.select().from(schema.serviceTypes).orderBy(desc(schema.serviceTypes.id)).limit(1).get();
+  const stOut = {
+    id: st!.id,
+    name: st!.name,
+    description: st!.description,
+    default_duration: st!.defaultDuration,
+    default_price: st!.defaultPrice,
+    color: st!.color,
+    created_at: st!.createdAt ?? "",
+  };
+  return c.json(stOut, 201);
 });
 
 const updateServiceType = createRoute({
@@ -827,18 +1025,17 @@ const updateServiceType = createRoute({
 });
 
 app.openapi(updateServiceType, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
   const data = c.req.valid("json");
-  const fields: string[] = [];
-  const vals: unknown[] = [];
-  for (const [k, v] of Object.entries(data)) {
-    if (v !== undefined) {
-      fields.push(`${k} = ?`);
-      vals.push(v);
-    }
-  }
-  if (fields.length > 0) {
-    await run(`UPDATE service_types SET ${fields.join(", ")} WHERE id = ?`, [...vals, id]);
+  const updates: Record<string, unknown> = {};
+  if (data.name !== undefined) updates.name = data.name;
+  if (data.description !== undefined) updates.description = data.description;
+  if (data.default_duration !== undefined) updates.defaultDuration = data.default_duration;
+  if (data.default_price !== undefined) updates.defaultPrice = data.default_price;
+  if (data.color !== undefined) updates.color = data.color;
+  if (Object.keys(updates).length > 0) {
+    await db.update(schema.serviceTypes).set(updates).where(eq(schema.serviceTypes.id, toId(id)));
   }
   return c.json({ ok: true }, 200);
 });
@@ -853,8 +1050,9 @@ const deleteServiceType = createRoute({
 });
 
 app.openapi(deleteServiceType, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  await run("DELETE FROM service_types WHERE id = ?", [id]);
+  await db.delete(schema.serviceTypes).where(eq(schema.serviceTypes.id, toId(id)));
   return c.json({ ok: true }, 200);
 });
 
@@ -879,25 +1077,16 @@ const getSchedule = createRoute({
 });
 
 app.openapi(getSchedule, async (c) => {
+  const db = getDb(c.env);
   const q = c.req.valid("query");
-  let where = "WHERE j.scheduled_date >= ? AND j.scheduled_date <= ?";
-  const params: unknown[] = [q.start, q.end];
+  const conditions = [sql`${schema.jobs.scheduledDate} >= ${q.start}`, sql`${schema.jobs.scheduledDate} <= ${q.end}`];
   if (q.technician_id) {
-    where += " AND j.technician_id = ?";
-    params.push(q.technician_id);
+    conditions.push(eq(schema.jobs.technicianId, parseInt(q.technician_id, 10)));
   }
-  const jobs = await query<Record<string, unknown>>(
-    `SELECT j.*, c.name as customer_name, c.phone as customer_phone,
-       t.name as technician_name, t.color as technician_color,
-       st.name as service_type_name, st.color as service_type_color
-     FROM jobs j
-     LEFT JOIN customers c ON j.customer_id = c.id
-     LEFT JOIN technicians t ON j.technician_id = t.id
-     LEFT JOIN service_types st ON j.service_type_id = st.id
-     ${where}
-     ORDER BY j.scheduled_date ASC, j.scheduled_time ASC`,
-    params
-  );
+  const jobs = await jobJoinedSelect(db)
+    .where(and(...conditions))
+    .orderBy(asc(schema.jobs.scheduledDate), asc(schema.jobs.scheduledTime))
+    .all();
   return c.json({ jobs }, 200);
 });
 
@@ -916,10 +1105,16 @@ const addChecklistItem = createRoute({
 });
 
 app.openapi(addChecklistItem, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
+  const idNum = toId(id);
   const { label } = c.req.valid("json");
-  const maxOrder = await get<{ m: number }>("SELECT COALESCE(MAX(sort_order), 0) as m FROM job_checklist WHERE job_id = ?", [id]);
-  await run("INSERT INTO job_checklist (job_id, label, sort_order) VALUES (?, ?, ?)", [id, label, (maxOrder?.m || 0) + 1]);
+  const maxOrder = await db
+    .select({ m: sql<number>`COALESCE(MAX(${schema.jobChecklist.sortOrder}), 0)` })
+    .from(schema.jobChecklist)
+    .where(eq(schema.jobChecklist.jobId, idNum))
+    .get();
+  await db.insert(schema.jobChecklist).values({ jobId: idNum, label, sortOrder: (maxOrder?.m || 0) + 1 });
   return c.json({ ok: true }, 201);
 });
 
@@ -933,8 +1128,12 @@ const toggleChecklistItem = createRoute({
 });
 
 app.openapi(toggleChecklistItem, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  await run("UPDATE job_checklist SET checked = CASE WHEN checked = 0 THEN 1 ELSE 0 END WHERE id = ?", [id]);
+  await db
+    .update(schema.jobChecklist)
+    .set({ checked: sql`CASE WHEN ${schema.jobChecklist.checked} = 0 THEN 1 ELSE 0 END` })
+    .where(eq(schema.jobChecklist.id, toId(id)));
   return c.json({ ok: true }, 200);
 });
 
@@ -948,8 +1147,9 @@ const deleteChecklistItem = createRoute({
 });
 
 app.openapi(deleteChecklistItem, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  await run("DELETE FROM job_checklist WHERE id = ?", [id]);
+  await db.delete(schema.jobChecklist).where(eq(schema.jobChecklist.id, toId(id)));
   return c.json({ ok: true }, 200);
 });
 
@@ -974,7 +1174,19 @@ const listMaterials = createRoute({
 });
 
 app.openapi(listMaterials, async (c) => {
-  const materials = await query<Record<string, unknown>>("SELECT * FROM materials ORDER BY name ASC");
+  const db = getDb(c.env);
+  const materials = await db
+    .select({
+      id: schema.materials.id,
+      name: schema.materials.name,
+      unit: schema.materials.unit,
+      unit_cost: schema.materials.unitCost,
+      in_stock: schema.materials.inStock,
+      created_at: sql<string>`COALESCE(${schema.materials.createdAt}, '')`,
+    })
+    .from(schema.materials)
+    .orderBy(asc(schema.materials.name))
+    .all();
   return c.json({ materials }, 200);
 });
 
@@ -995,9 +1207,14 @@ const createMaterial = createRoute({
 });
 
 app.openapi(createMaterial, async (c) => {
+  const db = getDb(c.env);
   const data = c.req.valid("json");
-  await run("INSERT INTO materials (name, unit, unit_cost, in_stock) VALUES (?, ?, ?, ?)",
-    [data.name, data.unit || "ea", data.unit_cost || 0, data.in_stock || 0]);
+  await db.insert(schema.materials).values({
+    name: data.name,
+    unit: data.unit || "ea",
+    unitCost: data.unit_cost || 0,
+    inStock: data.in_stock || 0,
+  });
   return c.json({ ok: true }, 201);
 });
 
@@ -1019,14 +1236,17 @@ const updateMaterial = createRoute({
 });
 
 app.openapi(updateMaterial, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
   const data = c.req.valid("json");
-  const fields: string[] = [];
-  const vals: unknown[] = [];
-  for (const [k, v] of Object.entries(data)) {
-    if (v !== undefined) { fields.push(`${k} = ?`); vals.push(v); }
+  const updates: Record<string, unknown> = {};
+  if (data.name !== undefined) updates.name = data.name;
+  if (data.unit !== undefined) updates.unit = data.unit;
+  if (data.unit_cost !== undefined) updates.unitCost = data.unit_cost;
+  if (data.in_stock !== undefined) updates.inStock = data.in_stock;
+  if (Object.keys(updates).length > 0) {
+    await db.update(schema.materials).set(updates).where(eq(schema.materials.id, toId(id)));
   }
-  if (fields.length > 0) await run(`UPDATE materials SET ${fields.join(", ")} WHERE id = ?`, [...vals, id]);
   return c.json({ ok: true }, 200);
 });
 
@@ -1040,8 +1260,9 @@ const deleteMaterial = createRoute({
 });
 
 app.openapi(deleteMaterial, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  await run("DELETE FROM materials WHERE id = ?", [id]);
+  await db.delete(schema.materials).where(eq(schema.materials.id, toId(id)));
   return c.json({ ok: true }, 200);
 });
 
@@ -1064,15 +1285,20 @@ const addJobMaterial = createRoute({
 });
 
 app.openapi(addJobMaterial, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
   const data = c.req.valid("json");
   let cost = data.unit_cost;
   if (cost === undefined) {
-    const mat = await get<{ unit_cost: number }>("SELECT unit_cost FROM materials WHERE id = ?", [data.material_id]);
+    const mat = await db.select({ unit_cost: schema.materials.unitCost }).from(schema.materials).where(eq(schema.materials.id, data.material_id)).get();
     cost = mat?.unit_cost || 0;
   }
-  await run("INSERT INTO job_materials (job_id, material_id, quantity, unit_cost) VALUES (?, ?, ?, ?)",
-    [id, data.material_id, data.quantity, cost]);
+  await db.insert(schema.jobMaterials).values({
+    jobId: toId(id),
+    materialId: data.material_id,
+    quantity: data.quantity,
+    unitCost: cost,
+  });
   return c.json({ ok: true }, 201);
 });
 
@@ -1086,8 +1312,9 @@ const deleteJobMaterial = createRoute({
 });
 
 app.openapi(deleteJobMaterial, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  await run("DELETE FROM job_materials WHERE id = ?", [id]);
+  await db.delete(schema.jobMaterials).where(eq(schema.jobMaterials.id, toId(id)));
   return c.json({ ok: true }, 200);
 });
 
@@ -1116,33 +1343,60 @@ const listInvoices = createRoute({
 });
 
 app.openapi(listInvoices, async (c) => {
+  const db = getDb(c.env);
   const q = c.req.valid("query");
   const page = parseInt(q.page || "1", 10);
   const limit = parseInt(q.limit || "50", 10);
   const offset = (page - 1) * limit;
 
-  let where = "WHERE 1=1";
-  const params: unknown[] = [];
-  if (q.status) { where += " AND i.status = ?"; params.push(q.status); }
-  if (q.search) {
-    where += " AND (i.identifier LIKE ? OR c.name LIKE ?)";
-    const s = `%${q.search}%`;
-    params.push(s, s);
+  const conditions = [];
+  if (q.status) {
+    conditions.push(eq(schema.invoices.status, q.status));
   }
+  if (q.search) {
+    const s = `%${q.search}%`;
+    conditions.push(or(
+      like(schema.invoices.identifier, s),
+      like(schema.customers.name, s),
+    ));
+  }
+  const where = conditions.length > 0 ? and(...conditions) : undefined;
 
-  const countRow = await get<{ count: number }>(
-    `SELECT COUNT(*) as count FROM invoices i LEFT JOIN customers c ON i.customer_id = c.id ${where}`, params
-  );
-  const invoices = await query<Record<string, unknown>>(
-    `SELECT i.*, c.name as customer_name, j.identifier as job_identifier
-     FROM invoices i
-     LEFT JOIN customers c ON i.customer_id = c.id
-     LEFT JOIN jobs j ON i.job_id = j.id
-     ${where}
-     ORDER BY i.created_at DESC
-     LIMIT ? OFFSET ?`,
-    [...params, limit, offset]
-  );
+  const countRow = await db
+    .select({ count: sql<number>`COUNT(*)` })
+    .from(schema.invoices)
+    .leftJoin(schema.customers, eq(schema.invoices.customerId, schema.customers.id))
+    .where(where)
+    .get();
+
+  const invoices = await db
+    .select({
+      id: schema.invoices.id,
+      identifier: schema.invoices.identifier,
+      customer_id: schema.invoices.customerId,
+      job_id: schema.invoices.jobId,
+      status: schema.invoices.status,
+      subtotal: schema.invoices.subtotal,
+      tax_rate: schema.invoices.taxRate,
+      tax_amount: schema.invoices.taxAmount,
+      total: schema.invoices.total,
+      notes: schema.invoices.notes,
+      due_date: schema.invoices.dueDate,
+      paid_date: schema.invoices.paidDate,
+      created_at: schema.invoices.createdAt,
+      updated_at: schema.invoices.updatedAt,
+      customer_name: schema.customers.name,
+      job_identifier: schema.jobs.identifier,
+    })
+    .from(schema.invoices)
+    .leftJoin(schema.customers, eq(schema.invoices.customerId, schema.customers.id))
+    .leftJoin(schema.jobs, eq(schema.invoices.jobId, schema.jobs.id))
+    .where(where)
+    .orderBy(desc(schema.invoices.createdAt))
+    .limit(limit)
+    .offset(offset)
+    .all();
+
   return c.json({ invoices, total: countRow?.count || 0 }, 200);
 });
 
@@ -1157,19 +1411,49 @@ const getInvoice = createRoute({
 });
 
 app.openapi(getInvoice, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  const invoice = await get<Record<string, unknown>>(
-    `SELECT i.*, c.name as customer_name, j.identifier as job_identifier
-     FROM invoices i
-     LEFT JOIN customers c ON i.customer_id = c.id
-     LEFT JOIN jobs j ON i.job_id = j.id
-     WHERE i.id = ?`, [id]
-  );
+  const idNum = toId(id);
+  const invoice = await db
+    .select({
+      id: schema.invoices.id,
+      identifier: schema.invoices.identifier,
+      customer_id: schema.invoices.customerId,
+      job_id: schema.invoices.jobId,
+      status: schema.invoices.status,
+      subtotal: schema.invoices.subtotal,
+      tax_rate: schema.invoices.taxRate,
+      tax_amount: schema.invoices.taxAmount,
+      total: schema.invoices.total,
+      notes: schema.invoices.notes,
+      due_date: schema.invoices.dueDate,
+      paid_date: schema.invoices.paidDate,
+      created_at: schema.invoices.createdAt,
+      updated_at: schema.invoices.updatedAt,
+      customer_name: schema.customers.name,
+      job_identifier: schema.jobs.identifier,
+    })
+    .from(schema.invoices)
+    .leftJoin(schema.customers, eq(schema.invoices.customerId, schema.customers.id))
+    .leftJoin(schema.jobs, eq(schema.invoices.jobId, schema.jobs.id))
+    .where(eq(schema.invoices.id, idNum))
+    .get();
   if (!invoice) return c.json({ error: "Invoice not found" }, 404);
-  const lines = await query<Record<string, unknown>>(
-    "SELECT * FROM invoice_lines WHERE invoice_id = ? ORDER BY id ASC", [id]
-  );
-  return c.json({ invoice: { ...invoice, lines } }, 200);
+  const lines = await db
+    .select()
+    .from(schema.invoiceLines)
+    .where(eq(schema.invoiceLines.invoiceId, idNum))
+    .orderBy(asc(schema.invoiceLines.id))
+    .all();
+  const linesOut = lines.map((l) => ({
+    id: l.id,
+    invoice_id: l.invoiceId,
+    description: l.description,
+    quantity: l.quantity,
+    unit_price: l.unitPrice,
+    total: l.total,
+  }));
+  return c.json({ invoice: { ...invoice, lines: linesOut } }, 200);
 });
 
 const createInvoice = createRoute({
@@ -1195,8 +1479,9 @@ const createInvoice = createRoute({
 });
 
 app.openapi(createInvoice, async (c) => {
+  const db = getDb(c.env);
   const data = c.req.valid("json");
-  const identifier = await nextInvoiceIdentifier();
+  const identifier = await nextInvoiceIdentifier(db);
   const taxRate = data.tax_rate || 0;
 
   let subtotal = 0;
@@ -1206,27 +1491,53 @@ app.openapi(createInvoice, async (c) => {
   const taxAmount = subtotal * (taxRate / 100);
   const total = subtotal + taxAmount;
 
-  await run(
-    `INSERT INTO invoices (identifier, customer_id, job_id, status, subtotal, tax_rate, tax_amount, total, notes, due_date)
-     VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)`,
-    [identifier, data.customer_id, data.job_id ?? null,
-    subtotal, taxRate, taxAmount, total,
-    data.notes || "", data.due_date || ""]
-  );
+  await db.insert(schema.invoices).values({
+    identifier,
+    customerId: data.customer_id,
+    jobId: data.job_id ?? null,
+    status: "draft",
+    subtotal,
+    taxRate,
+    taxAmount,
+    total,
+    notes: data.notes || "",
+    dueDate: data.due_date || "",
+  });
 
-  const invoice = await get<{ id: number }>("SELECT id FROM invoices WHERE identifier = ?", [identifier]);
+  const invoice = await db.select({ id: schema.invoices.id }).from(schema.invoices).where(eq(schema.invoices.identifier, identifier)).get();
   for (const line of data.lines) {
     const lineTotal = line.quantity * line.unit_price;
-    await run(
-      "INSERT INTO invoice_lines (invoice_id, description, quantity, unit_price, total) VALUES (?, ?, ?, ?, ?)",
-      [invoice!.id, line.description, line.quantity, line.unit_price, lineTotal]
-    );
+    await db.insert(schema.invoiceLines).values({
+      invoiceId: invoice!.id,
+      description: line.description,
+      quantity: line.quantity,
+      unitPrice: line.unit_price,
+      total: lineTotal,
+    });
   }
 
-  const result = await get<Record<string, unknown>>(
-    `SELECT i.*, c.name as customer_name FROM invoices i
-     LEFT JOIN customers c ON i.customer_id = c.id WHERE i.id = ?`, [invoice!.id]
-  );
+  const result = await db
+    .select({
+      id: schema.invoices.id,
+      identifier: schema.invoices.identifier,
+      customer_id: schema.invoices.customerId,
+      job_id: schema.invoices.jobId,
+      status: schema.invoices.status,
+      subtotal: schema.invoices.subtotal,
+      tax_rate: schema.invoices.taxRate,
+      tax_amount: schema.invoices.taxAmount,
+      total: schema.invoices.total,
+      notes: schema.invoices.notes,
+      due_date: schema.invoices.dueDate,
+      paid_date: schema.invoices.paidDate,
+      created_at: schema.invoices.createdAt,
+      updated_at: schema.invoices.updatedAt,
+      customer_name: schema.customers.name,
+    })
+    .from(schema.invoices)
+    .leftJoin(schema.customers, eq(schema.invoices.customerId, schema.customers.id))
+    .where(eq(schema.invoices.id, invoice!.id))
+    .get();
   return c.json(result!, 201);
 });
 
@@ -1248,16 +1559,17 @@ const updateInvoice = createRoute({
 });
 
 app.openapi(updateInvoice, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
   const data = c.req.valid("json");
-  const fields: string[] = [];
-  const vals: unknown[] = [];
-  for (const [k, v] of Object.entries(data)) {
-    if (v !== undefined) { fields.push(`${k} = ?`); vals.push(v); }
-  }
-  if (fields.length > 0) {
-    fields.push("updated_at = datetime('now')");
-    await run(`UPDATE invoices SET ${fields.join(", ")} WHERE id = ?`, [...vals, id]);
+  const updates: Record<string, unknown> = {};
+  if (data.status !== undefined) updates.status = data.status;
+  if (data.notes !== undefined) updates.notes = data.notes;
+  if (data.due_date !== undefined) updates.dueDate = data.due_date;
+  if (data.paid_date !== undefined) updates.paidDate = data.paid_date;
+  if (Object.keys(updates).length > 0) {
+    updates.updatedAt = sql`(datetime('now'))`;
+    await db.update(schema.invoices).set(updates).where(eq(schema.invoices.id, toId(id)));
   }
   return c.json({ ok: true }, 200);
 });
@@ -1272,8 +1584,9 @@ const deleteInvoice = createRoute({
 });
 
 app.openapi(deleteInvoice, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  await run("DELETE FROM invoices WHERE id = ?", [id]);
+  await db.delete(schema.invoices).where(eq(schema.invoices.id, toId(id)));
   return c.json({ ok: true }, 200);
 });
 
@@ -1290,49 +1603,77 @@ const invoiceFromJob = createRoute({
 });
 
 app.openapi(invoiceFromJob, async (c) => {
+  const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  const job = await get<Record<string, unknown>>(
-    `SELECT j.*, st.name as service_type_name FROM jobs j
-     LEFT JOIN service_types st ON j.service_type_id = st.id WHERE j.id = ?`, [id]
-  );
+  const idNum = toId(id);
+  const job = await db
+    .select({
+      id: schema.jobs.id,
+      customer_id: schema.jobs.customerId,
+      price: schema.jobs.price,
+      service_type_name: schema.serviceTypes.name,
+    })
+    .from(schema.jobs)
+    .leftJoin(schema.serviceTypes, eq(schema.jobs.serviceTypeId, schema.serviceTypes.id))
+    .where(eq(schema.jobs.id, idNum))
+    .get();
   if (!job) return c.json({ error: "Job not found" }, 404);
 
-  const identifier = await nextInvoiceIdentifier();
-  const price = job.price as number;
+  const identifier = await nextInvoiceIdentifier(db);
+  const price = job.price;
 
   // Gather materials used
-  const mats = await query<Record<string, unknown>>(
-    `SELECT jm.*, m.name as material_name FROM job_materials jm
-     LEFT JOIN materials m ON jm.material_id = m.id WHERE jm.job_id = ?`, [id]
-  );
+  const mats = await db
+    .select({
+      id: schema.jobMaterials.id,
+      job_id: schema.jobMaterials.jobId,
+      material_id: schema.jobMaterials.materialId,
+      quantity: schema.jobMaterials.quantity,
+      unit_cost: schema.jobMaterials.unitCost,
+      material_name: schema.materials.name,
+    })
+    .from(schema.jobMaterials)
+    .leftJoin(schema.materials, eq(schema.jobMaterials.materialId, schema.materials.id))
+    .where(eq(schema.jobMaterials.jobId, idNum))
+    .all();
 
   let subtotal = price;
   const lines: { description: string; quantity: number; unit_price: number; total: number }[] = [
-    { description: (job.service_type_name as string) || "Service", quantity: 1, unit_price: price, total: price },
+    { description: job.service_type_name || "Service", quantity: 1, unit_price: price, total: price },
   ];
   for (const m of mats) {
-    const lineTotal = (m.quantity as number) * (m.unit_cost as number);
+    const lineTotal = m.quantity * m.unit_cost;
     lines.push({
       description: m.material_name as string,
-      quantity: m.quantity as number,
-      unit_price: m.unit_cost as number,
+      quantity: m.quantity,
+      unit_price: m.unit_cost,
       total: lineTotal,
     });
     subtotal += lineTotal;
   }
 
-  await run(
-    `INSERT INTO invoices (identifier, customer_id, job_id, status, subtotal, tax_rate, tax_amount, total, notes, due_date)
-     VALUES (?, ?, ?, 'draft', ?, 0, 0, ?, '', '')`,
-    [identifier, job.customer_id, job.id, subtotal, subtotal]
-  );
+  await db.insert(schema.invoices).values({
+    identifier,
+    customerId: job.customer_id,
+    jobId: job.id,
+    status: "draft",
+    subtotal,
+    taxRate: 0,
+    taxAmount: 0,
+    total: subtotal,
+    notes: "",
+    dueDate: "",
+  });
 
-  const inv = await get<{ id: number }>("SELECT id FROM invoices WHERE identifier = ?", [identifier]);
+  const inv = await db.select({ id: schema.invoices.id }).from(schema.invoices).where(eq(schema.invoices.identifier, identifier)).get();
   for (const line of lines) {
-    await run(
-      "INSERT INTO invoice_lines (invoice_id, description, quantity, unit_price, total) VALUES (?, ?, ?, ?, ?)",
-      [inv!.id, line.description, line.quantity, line.unit_price, line.total]
-    );
+    await db.insert(schema.invoiceLines).values({
+      invoiceId: inv!.id,
+      description: line.description,
+      quantity: line.quantity,
+      unitPrice: line.unit_price,
+      total: line.total,
+    });
   }
 
   return c.json({ ok: true, invoice_id: inv!.id }, 201);

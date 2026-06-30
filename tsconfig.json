@@ -7,6 +7,7 @@
     "lib": ["ESNext", "DOM", "DOM.Iterable"],
     "jsx": "react-jsx",
     "jsxImportSource": "preact",
+    "types": ["@cloudflare/workers-types"],
     "noEmit": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
