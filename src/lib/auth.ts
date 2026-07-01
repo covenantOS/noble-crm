@@ -23,16 +23,20 @@ import type { Env } from './types';
 // becomes 'admin') and (b) admin-created users via POST /api/users, which set
 // the chosen role directly after creation. Because `input: false` below, the
 // signup body can never set its own role -- it always starts as this default.
-export function createAuth(env: Env) {
+export function createAuth(env: Env, requestOrigin?: string) {
   const db = getDb(env);
+  // Prefer the live request's origin so ONE build works unchanged on
+  // localhost, *.workers.dev, and my.nobletampa.com (auto-deploy needs this —
+  // there's no per-environment config step). BETTER_AUTH_URL stays as the
+  // fallback for any context without a request in hand.
+  const origin = requestOrigin || env.BETTER_AUTH_URL;
   return betterAuth({
     database: drizzleAdapter(db, { provider: 'sqlite' }),
-    baseURL: env.BETTER_AUTH_URL,
+    baseURL: origin,
     secret: env.BETTER_AUTH_SECRET,
     // Accept requests from either local host spelling in dev, plus the real
-    // app URL. In production BETTER_AUTH_URL is the deployed origin; add the
-    // production domain here (or via env) when my.nobletampa.com goes live.
-    trustedOrigins: ["http://localhost:8787", "http://127.0.0.1:8787", "http://localhost:5173", env.BETTER_AUTH_URL],
+    // app URL (whatever origin this request arrived on).
+    trustedOrigins: ["http://localhost:8787", "http://127.0.0.1:8787", "http://localhost:5173", origin],
     emailAndPassword: { enabled: true },
     user: {
       additionalFields: {

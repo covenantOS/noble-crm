@@ -263,7 +263,7 @@ app.on(["GET", "POST"], "/api/auth/*", async (c) => {
     } catch {
       // If we can't parse the body, let better-auth handle/reject it normally.
     }
-    const res = await createAuth(c.env).handler(c.req.raw);
+    const res = await createAuth(c.env, new URL(c.req.url).origin).handler(c.req.raw);
     // Only promote if the signup actually succeeded and we know the email.
     if (res.ok && email) {
       await db.update(schema.user).set({ role: "admin" }).where(eq(schema.user.email, email.toLowerCase()));
@@ -271,7 +271,7 @@ app.on(["GET", "POST"], "/api/auth/*", async (c) => {
     return res;
   }
 
-  return createAuth(c.env).handler(c.req.raw);
+  return createAuth(c.env, new URL(c.req.url).origin).handler(c.req.raw);
 });
 
 // All other /api/* routes require a session. Resolves the better-auth
@@ -293,7 +293,7 @@ app.use("/api/*", async (c, next) => {
   ) {
     return next();
   }
-  const session = await createAuth(c.env).api.getSession({ headers: c.req.raw.headers });
+  const session = await createAuth(c.env, new URL(c.req.url).origin).api.getSession({ headers: c.req.raw.headers });
   if (!session) {
     return c.json({ error: "unauthorized" }, 401);
   }
@@ -1096,7 +1096,7 @@ app.openapi(createUser, async (c) => {
   // The signup lands at the "pending" default (role has input:false); we set
   // the chosen role immediately after.
   try {
-    await createAuth(c.env).api.signUpEmail({ body: { name: data.name, email, password: data.password } });
+    await createAuth(c.env, new URL(c.req.url).origin).api.signUpEmail({ body: { name: data.name, email, password: data.password } });
   } catch (err) {
     console.error("Admin createUser signUpEmail failed:", err);
     return c.json({ error: "Could not create user (email may already be in use)." }, 400);
