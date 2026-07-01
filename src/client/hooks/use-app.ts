@@ -4,6 +4,7 @@ import { authClient } from "../auth-client";
 import type {
   Job, Customer, Technician, ServiceType, Material, Invoice, Stats, PaginatedState,
   CustomerLookup, TechnicianLookup, Priority, Brand, Estimate,
+  Attachment, AttachmentEntityType, AttachmentKind, Payment, PaymentMethod,
 } from "../types";
 import type { AppContextValue, CurrentUser } from "../context";
 
@@ -46,6 +47,10 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   const [estimatesSearch, setEstimatesSearch] = useState("");
   const [estimatesStatusFilter, setEstimatesStatusFilter] = useState("");
   const [selectedEstimate, setSelectedEstimate] = useState<Estimate | null>(null);
+
+  // Attachments (photo gallery on job-detail / estimate-detail)
+  const [jobAttachments, setJobAttachments] = useState<Attachment[]>([]);
+  const [estimateAttachments, setEstimateAttachments] = useState<Attachment[]>([]);
 
   // Schedule
   const today = new Date();
@@ -446,6 +451,60 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     setSelectedInvoice(res.invoice);
   }, []);
 
+  // ── Payments ──
+
+  const recordPayment = useCallback(async (invoiceId: number, method: PaymentMethod, amount?: number) => {
+    const res = await api<{ payment: Payment; invoice_status: string }>("POST", `/api/invoices/${invoiceId}/payments`, amount !== undefined ? { method, amount } : { method });
+    // Refresh the invoice (payments list + status may have changed) and the
+    // list/stats, same refresh pattern as updateInvoice above.
+    if (selectedInvoice && selectedInvoice.id === invoiceId) {
+      const inv = await api<{ invoice: Invoice }>("GET", `/api/invoices/${invoiceId}`);
+      setSelectedInvoice(inv.invoice);
+    }
+    await fetchInvoices(invoicesPag, invoicesStatusFilter);
+    await fetchStats();
+    return res.payment;
+  }, [selectedInvoice, invoicesPag, invoicesStatusFilter, fetchInvoices, fetchStats]);
+
+  // ── Attachments ──
+
+  const fetchJobAttachments = useCallback(async (jobId: number) => {
+    const res = await api<{ attachments: Attachment[] }>("GET", `/api/attachments?entity_type=job&entity_id=${jobId}`);
+    setJobAttachments(res.attachments);
+  }, []);
+
+  const fetchEstimateAttachments = useCallback(async (estimateId: number) => {
+    const res = await api<{ attachments: Attachment[] }>("GET", `/api/attachments?entity_type=estimate&entity_id=${estimateId}`);
+    setEstimateAttachments(res.attachments);
+  }, []);
+
+  // Multipart upload -- bypasses the JSON-only api() helper, same rationale
+  // as uploadBrandLogo above (the body here is a File, not JSON).
+  const uploadAttachment = useCallback(async (entityType: AttachmentEntityType, entityId: number, file: File, kind: AttachmentKind = "doc") => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("entity_type", entityType);
+    form.append("entity_id", String(entityId));
+    form.append("kind", kind);
+    const r = await fetch("/api/attachments", { method: "POST", body: form, credentials: "include" });
+    const text = await r.text();
+    let data: unknown;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`Server error: ${r.status} ${r.statusText}`);
+    }
+    if (!r.ok) throw new Error((data as { error?: string }).error || "Upload failed");
+    if (entityType === "job") await fetchJobAttachments(entityId);
+    else if (entityType === "estimate") await fetchEstimateAttachments(entityId);
+  }, [fetchJobAttachments, fetchEstimateAttachments]);
+
+  const deleteAttachment = useCallback(async (id: number, entityType: AttachmentEntityType, entityId: number) => {
+    await api("DELETE", `/api/attachments/${id}`);
+    if (entityType === "job") await fetchJobAttachments(entityId);
+    else if (entityType === "estimate") await fetchEstimateAttachments(entityId);
+  }, [fetchJobAttachments, fetchEstimateAttachments]);
+
   // ── Estimates CRUD ──
 
   const setEstimatesPage = useCallback((page: number) => setEstimatesPag((p) => ({ ...p, page })), []);
@@ -549,6 +608,9 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     brands, addBrand, updateBrand, uploadBrandLogo,
     invoices, invoicesPag, setInvoicesPage, invoicesStatusFilter, setInvoicesStatusFilter,
     selectedInvoice, selectInvoice, addInvoice, updateInvoice, deleteInvoice,
+    recordPayment,
+    jobAttachments, estimateAttachments, fetchJobAttachments, fetchEstimateAttachments,
+    uploadAttachment, deleteAttachment,
     estimates, estimatesPag, setEstimatesPage, estimatesSearch, setEstimatesSearch,
     estimatesStatusFilter, setEstimatesStatusFilter,
     selectedEstimate, selectEstimate, addEstimate, updateEstimate, deleteEstimate,

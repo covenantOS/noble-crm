@@ -1,8 +1,8 @@
-import { useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { useApp } from "../context";
 import { StatusBadge, PriorityBadge } from "./status-badge";
-import { ArrowLeft, Trash2, Send, MapPin, Clock, DollarSign, User, Wrench, Plus, X, CheckSquare, Square, Package, FileText, Palette } from "lucide-preact";
-import type { JobStatus } from "../types";
+import { ArrowLeft, Trash2, Send, MapPin, Clock, DollarSign, User, Wrench, Plus, X, CheckSquare, Square, Package, FileText, Palette, Camera } from "lucide-preact";
+import type { AttachmentKind, JobStatus } from "../types";
 
 const ALL_STATUSES: JobStatus[] = ["scheduled", "confirmed", "in_progress", "completed", "cancelled"];
 
@@ -13,6 +13,7 @@ export function JobDetail() {
     addChecklistItem, toggleChecklistItem, deleteChecklistItem,
     addJobMaterial, deleteJobMaterial, materials, createInvoiceFromJob,
     currentUser, brands,
+    jobAttachments, fetchJobAttachments, uploadAttachment, deleteAttachment,
   } = useApp();
   // Technicians only have ownership of their own job's working fields
   // server-side -- reassignment (customer_id/technician_id), invoicing, and
@@ -24,8 +25,28 @@ export function JobDetail() {
   const [showAddMaterial, setShowAddMaterial] = useState(false);
   const [materialId, setMaterialId] = useState("");
   const [materialQty, setMaterialQty] = useState("1");
+  const beforeFileInput = useRef<HTMLInputElement>(null);
+  const afterFileInput = useRef<HTMLInputElement>(null);
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
+
+  useEffect(() => {
+    if (job) fetchJobAttachments(job.id);
+  }, [job?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!job) return null;
+
+  const handlePhotoSelected = async (kind: AttachmentKind, e: Event) => {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    setUploadingPhoto(true);
+    try {
+      await uploadAttachment("job", job.id, file, kind);
+    } finally {
+      setUploadingPhoto(false);
+      input.value = "";
+    }
+  };
 
   const handleStatusChange = (status: JobStatus) => updateJob(job.id, { status });
 
@@ -215,6 +236,38 @@ export function JobDetail() {
                 <Plus size={14} /> Add Material
               </button>
             )}
+          </div>
+
+          {/* Photos (before/after) */}
+          <div class="detail-section">
+            <h3><Camera size={16} style={{ verticalAlign: "text-bottom" }} /> Photos</h3>
+            {(["before", "after"] as const).map((kind) => {
+              const photos = jobAttachments.filter((a) => a.kind === kind);
+              return (
+                <div key={kind} style={{ marginBottom: 12 }}>
+                  <div class="detail-meta-label" style={{ marginBottom: 6, textTransform: "capitalize" }}>{kind}</div>
+                  <div class="photo-gallery">
+                    {photos.map((a) => (
+                      <div key={a.id} class="photo-thumb">
+                        <img src={`/api/r2/${a.r2_key}`} alt={a.filename || kind} />
+                        <button class="photo-thumb-remove" onClick={() => deleteAttachment(a.id, "job", job.id)}>
+                          <X size={12} />
+                        </button>
+                      </div>
+                    ))}
+                    <button
+                      class="photo-thumb-add"
+                      disabled={uploadingPhoto}
+                      onClick={() => (kind === "before" ? beforeFileInput : afterFileInput).current?.click()}
+                    >
+                      <Plus size={16} />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+            <input ref={beforeFileInput} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => handlePhotoSelected("before", e)} />
+            <input ref={afterFileInput} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => handlePhotoSelected("after", e)} />
           </div>
 
           {/* Activity / Notes */}

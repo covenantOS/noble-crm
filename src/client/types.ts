@@ -141,6 +141,7 @@ export interface Invoice {
   brand_color_primary?: string | null;
   brand_color_secondary?: string | null;
   lines?: InvoiceLine[];
+  payments?: Payment[];
   created_at: string;
   updated_at: string;
 }
@@ -152,6 +153,35 @@ export interface InvoiceLine {
   quantity: number;
   unit_price: number;
   total: number;
+}
+
+export type PaymentMethod = "cash" | "check" | "card" | "financing";
+
+export interface Payment {
+  id: number;
+  invoice_id: number;
+  method: PaymentMethod;
+  amount: number;
+  surcharge_amount: number | null;
+  processor_ref: string | null;
+  status: string;
+  paid_at: string | null;
+  created_at: string;
+}
+
+export type AttachmentEntityType = "job" | "estimate" | "customer";
+export type AttachmentKind = "before" | "after" | "doc" | "signature";
+
+export interface Attachment {
+  id: number;
+  entity_type: AttachmentEntityType;
+  entity_id: number;
+  kind: AttachmentKind;
+  r2_key: string;
+  filename: string | null;
+  content_type: string | null;
+  uploaded_by: string | null;
+  created_at: string;
 }
 
 export interface Estimate {

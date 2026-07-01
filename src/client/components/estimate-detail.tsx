@@ -1,7 +1,7 @@
-import { useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { useApp } from "../context";
 import { ACORN_FINANCE_URL } from "../constants";
-import { ArrowLeft, Trash2, Send, CheckCircle, XCircle, ArrowRightLeft, ExternalLink, Plus } from "lucide-preact";
+import { ArrowLeft, Trash2, Send, CheckCircle, XCircle, ArrowRightLeft, ExternalLink, Plus, X, Camera } from "lucide-preact";
 import type { EstimateStatus } from "../types";
 
 const STATUS_COLORS: Record<EstimateStatus, string> = {
@@ -18,6 +18,7 @@ export function EstimateDetail() {
     selectedEstimate: estimate, navigate, updateEstimate, deleteEstimate,
     sendEstimate, approveEstimate, declineEstimate, addEstimateLine, deleteEstimateLine,
     convertEstimate, brands, setError,
+    estimateAttachments, fetchEstimateAttachments, uploadAttachment, deleteAttachment,
   } = useApp();
   const [showAddLine, setShowAddLine] = useState(false);
   const [lineDesc, setLineDesc] = useState("");
@@ -25,8 +26,27 @@ export function EstimateDetail() {
   const [linePrice, setLinePrice] = useState("0");
   const [converting, setConverting] = useState(false);
   const [convertResult, setConvertResult] = useState<{ job_id: number; invoice_id: number } | null>(null);
+  const photoFileInput = useRef<HTMLInputElement>(null);
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
+
+  useEffect(() => {
+    if (estimate) fetchEstimateAttachments(estimate.id);
+  }, [estimate?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!estimate) return null;
+
+  const handlePhotoSelected = async (e: Event) => {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    setUploadingPhoto(true);
+    try {
+      await uploadAttachment("estimate", estimate.id, file, "doc");
+    } finally {
+      setUploadingPhoto(false);
+      input.value = "";
+    }
+  };
 
   const color = STATUS_COLORS[(estimate.status as EstimateStatus)] || "#6b7280";
 
@@ -197,6 +217,26 @@ export function EstimateDetail() {
                 <Plus size={14} /> Add Line
               </button>
             )}
+          </div>
+
+          {/* Photos / supporting documents -- no before/after distinction
+              for estimates, just attachments supporting the quote. */}
+          <div class="detail-section">
+            <h3><Camera size={16} style={{ verticalAlign: "text-bottom" }} /> Photos</h3>
+            <div class="photo-gallery">
+              {estimateAttachments.map((a) => (
+                <div key={a.id} class="photo-thumb">
+                  <img src={`/api/r2/${a.r2_key}`} alt={a.filename || "attachment"} />
+                  <button class="photo-thumb-remove" onClick={() => deleteAttachment(a.id, "estimate", estimate.id)}>
+                    <X size={12} />
+                  </button>
+                </div>
+              ))}
+              <button class="photo-thumb-add" disabled={uploadingPhoto} onClick={() => photoFileInput.current?.click()}>
+                <Plus size={16} />
+              </button>
+            </div>
+            <input ref={photoFileInput} type="file" accept="image/*" style={{ display: "none" }} onChange={handlePhotoSelected} />
           </div>
 
           {estimate.notes && (

@@ -109,6 +109,49 @@ function requireAdminOrOfficeOrForbid(c: Context<AppBindings>) {
   return null;
 }
 
+// ── Payment tiers ──────────────────────────────────────────────────
+// The build plan specifies an "8% / 4% / surcharge structure (cash/check vs
+// card surcharge vs financing)" but doesn't pin exact numbers beyond that.
+// Judgment call, kept here as a single tunable constant so the business can
+// adjust without hunting through the route handler:
+//   - cash / check: 8% DISCOUNT off the invoice total. Common contractor
+//     practice -- cash/check avoids card-processing fees, so some of that
+//     saving is passed back to the customer as an incentive to pay that way.
+//   - card: 4% SURCHARGE, covering processor fees (Stripe et al. typically
+//     run ~2.9%+30c; 4% leaves the business whole with a little margin).
+//   - financing: 6% SURCHARGE. ASSUMPTION (not in the build plan): financing
+//     companies (e.g. the Acorn Finance CTA already linked from invoices/
+//     estimates) typically charge merchants a higher fee than card
+//     processors, so this is set between card's 4% and something clearly
+//     "more" -- picked 6% as a round number. Revisit once a real financing
+//     partner agreement sets an actual rate.
+//
+// Sign convention: PAYMENT_TIERS values are signed percentages applied to
+// invoice total. Negative = discount (reduces amount owed), positive =
+// surcharge (increases amount owed). computePaymentAmount below returns
+// surchargeAmount using this same signed convention, so a negative
+// surcharge_amount in the payments table always means "this payment method
+// discounted the total," never "surcharge of a negative amount."
+const PAYMENT_TIERS: Record<"cash" | "check" | "card" | "financing", number> = {
+  cash: -0.08,
+  check: -0.08,
+  card: 0.04,
+  financing: 0.06,
+};
+
+// Pure function: given an invoice's current total and a payment method,
+// returns the amount actually owed under that method's tier plus the signed
+// surcharge/discount amount that produced it (surchargeAmount = amount -
+// invoiceTotal). Kept free of any DB/request access so it's trivially
+// unit-reasonable and reusable (e.g. a future test file could import it
+// directly).
+function computePaymentAmount(invoiceTotal: number, method: "cash" | "check" | "card" | "financing"): { amount: number; surchargeAmount: number } {
+  const rate = PAYMENT_TIERS[method];
+  const surchargeAmount = invoiceTotal * rate;
+  const amount = invoiceTotal + surchargeAmount;
+  return { amount, surchargeAmount };
+}
+
 // ── Shared Schemas ─────────────────────────────────────────────────
 
 const ErrorSchema = z.object({ error: z.string() }).openapi("Error");
@@ -196,6 +239,30 @@ const JobNoteSchema = z.object({
   content: z.string(),
   created_at: z.string(),
 }).openapi("JobNote");
+
+const AttachmentSchema = z.object({
+  id: z.number().int(),
+  entity_type: z.string(),
+  entity_id: z.number().int(),
+  kind: z.string(),
+  r2_key: z.string(),
+  filename: z.string().nullable(),
+  content_type: z.string().nullable(),
+  uploaded_by: z.string().nullable(),
+  created_at: z.string(),
+}).openapi("Attachment");
+
+const PaymentSchema = z.object({
+  id: z.number().int(),
+  invoice_id: z.number().int(),
+  method: z.string(),
+  amount: z.number(),
+  surcharge_amount: z.number().nullable(),
+  processor_ref: z.string().nullable(),
+  status: z.string(),
+  paid_at: z.string().nullable(),
+  created_at: z.string(),
+}).openapi("Payment");
 
 const JobSchema = z.object({
   id: z.number().int(),
@@ -719,6 +786,182 @@ app.openapi(deleteJobNote, async (c) => {
     }
   }
   await db.delete(schema.jobNotes).where(eq(schema.jobNotes.id, idNum));
+  return c.json({ ok: true }, 200);
+});
+
+// ── Attachments (photos/docs on jobs, estimates, customers) ──────────
+// Not covered by the blanket technician role-gate above (unlike
+// /api/estimates, /api/customers, /api/invoices) because authorization here
+// depends on which entity_type/entity_id the caller is targeting, which
+// only the route handler can resolve (entity_type/entity_id live in the
+// request body or query string, not the URL path). Each handler below
+// enforces:
+//   - entity_type "job": same per-job ownership rule as job notes/checklist/
+//     materials -- technician may act only on jobs they own, via
+//     requireOwnJobOrForbid.
+//   - entity_type "estimate" or "customer": technician is blocked outright
+//     (403), matching how those resource families are already fully
+//     blocked for that role elsewhere.
+//   - admin/office/estimator: full access regardless of entity_type (no
+//     extra check needed -- the technician-only checks below simply don't
+//     apply to them).
+const ATTACHMENT_ENTITY_TYPES = ["job", "estimate", "customer"] as const;
+type AttachmentEntityType = (typeof ATTACHMENT_ENTITY_TYPES)[number];
+
+function attachmentOut(row: typeof schema.attachments.$inferSelect) {
+  return {
+    id: row.id,
+    entity_type: row.entityType,
+    entity_id: row.entityId,
+    kind: row.kind,
+    r2_key: row.r2Key,
+    filename: row.filename,
+    content_type: row.contentType,
+    uploaded_by: row.uploadedBy,
+    created_at: row.createdAt ?? "",
+  };
+}
+
+// Technician authorization for an attachment operation against a given
+// entity_type/entity_id pair. Returns a Response to short-circuit with (403
+// forbidden) if the technician may not act on it, or null if they may (or
+// the caller isn't a technician, in which case this isn't even called).
+async function requireAttachmentAccessOrForbid(c: Context<AppBindings>, db: ReturnType<typeof getDb>, entityType: string, entityId: number) {
+  if (entityType === "job") {
+    return requireOwnJobOrForbid(c, db, entityId);
+  }
+  // estimate | customer -- technicians get no access at all, matching the
+  // blanket block on those resource families.
+  return c.json({ error: "forbidden" }, 403);
+}
+
+// Upload is a plain Hono route (not app.openapi/Zod), same rationale as the
+// brand logo upload route above: multipart file bodies don't fit the
+// JSON-schema request shape the rest of this file uses.
+//
+// R2 key scheme: attachments/{entity_type}/{entity_id}/{uuid}-{filename}.
+// crypto.randomUUID() (available in the Workers runtime) avoids collisions
+// between concurrent uploads to the same entity without relying on
+// Date.now()/Math.random() -- two uploads landing in the same millisecond
+// would otherwise be able to collide. The original filename is kept as a
+// suffix purely so the key stays human-readable in the R2 dashboard; it
+// plays no role in uniqueness.
+app.post("/api/attachments", async (c) => {
+  const db = getDb(c.env);
+  const body = await c.req.parseBody();
+
+  const entityType = String(body["entity_type"] || "");
+  const entityIdRaw = String(body["entity_id"] || "");
+  const kind = String(body["kind"] || "doc");
+  const file = body["file"];
+
+  if (!ATTACHMENT_ENTITY_TYPES.includes(entityType as AttachmentEntityType)) {
+    return c.json({ error: `Invalid entity_type -- must be one of: ${ATTACHMENT_ENTITY_TYPES.join(", ")}` }, 400);
+  }
+  const entityId = toId(entityIdRaw);
+  if (entityId === -1) {
+    return c.json({ error: "Invalid entity_id" }, 400);
+  }
+  if (!(file instanceof File)) {
+    return c.json({ error: "Missing file upload (multipart field \"file\")" }, 400);
+  }
+
+  const user = c.get("user");
+  if (user.role === "technician") {
+    const forbidden = await requireAttachmentAccessOrForbid(c, db, entityType, entityId);
+    if (forbidden) return forbidden;
+  }
+
+  const key = `attachments/${entityType}/${entityId}/${crypto.randomUUID()}-${file.name}`;
+  await c.env.BUCKET.put(key, await file.arrayBuffer(), {
+    httpMetadata: { contentType: file.type || "application/octet-stream" },
+  });
+
+  await db.insert(schema.attachments).values({
+    entityType,
+    entityId,
+    kind,
+    r2Key: key,
+    filename: file.name,
+    contentType: file.type || "application/octet-stream",
+    uploadedBy: user.id,
+  });
+  const row = await db.select().from(schema.attachments).where(eq(schema.attachments.r2Key, key)).orderBy(desc(schema.attachments.id)).limit(1).get();
+  return c.json(attachmentOut(row!), 201);
+});
+
+const listAttachments = createRoute({
+  method: "get",
+  path: "/api/attachments",
+  request: {
+    query: z.object({
+      entity_type: z.string(),
+      entity_id: z.string(),
+    }),
+  },
+  responses: {
+    200: { description: "Attachments for an entity", content: { "application/json": { schema: z.object({ attachments: z.array(AttachmentSchema) }) } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(listAttachments, async (c) => {
+  const db = getDb(c.env);
+  const q = c.req.valid("query");
+  if (!ATTACHMENT_ENTITY_TYPES.includes(q.entity_type as AttachmentEntityType)) {
+    return c.json({ error: `Invalid entity_type -- must be one of: ${ATTACHMENT_ENTITY_TYPES.join(", ")}` }, 400);
+  }
+  const entityId = toId(q.entity_id);
+  if (entityId === -1) {
+    return c.json({ error: "Invalid entity_id" }, 400);
+  }
+
+  const user = c.get("user");
+  if (user.role === "technician") {
+    const forbidden = await requireAttachmentAccessOrForbid(c, db, q.entity_type, entityId);
+    if (forbidden) return forbidden;
+  }
+
+  const rows = await db
+    .select()
+    .from(schema.attachments)
+    .where(and(eq(schema.attachments.entityType, q.entity_type), eq(schema.attachments.entityId, entityId)))
+    .orderBy(desc(schema.attachments.createdAt))
+    .all();
+  return c.json({ attachments: rows.map(attachmentOut) }, 200);
+});
+
+const deleteAttachment = createRoute({
+  method: "delete",
+  path: "/api/attachments/{id}",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Deleted", content: { "application/json": { schema: OkSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(deleteAttachment, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const row = await db.select().from(schema.attachments).where(eq(schema.attachments.id, idNum)).get();
+  if (!row) return c.json({ error: "Attachment not found" }, 404);
+
+  const user = c.get("user");
+  if (user.role === "technician") {
+    const forbidden = await requireAttachmentAccessOrForbid(c, db, row.entityType, row.entityId);
+    if (forbidden) return forbidden;
+  }
+
+  // Delete the R2 object first -- if this throws, the D1 row is left intact
+  // so the attachment can be retried/deleted again rather than silently
+  // leaking an orphaned row that points at a (possibly still-present, if
+  // the throw was transient) object with no DB record.
+  await c.env.BUCKET.delete(row.r2Key);
+  await db.delete(schema.attachments).where(eq(schema.attachments.id, idNum));
   return c.json({ ok: true }, 200);
 });
 
@@ -1439,13 +1682,19 @@ app.post("/api/brands/:id/logo", async (c) => {
   return c.json({ ok: true, logo_r2_key: key }, 200);
 });
 
-// General-purpose R2 read-through proxy, scoped to the "brands/" prefix so
-// it can't be used to read arbitrary bucket contents. This is what lets
-// <img src="/api/r2/brands/..."> render an uploaded logo -- R2 objects
-// aren't otherwise reachable from the browser (no public bucket domain
-// configured), and this keeps everything behind the same session-auth
-// middleware as the rest of the API rather than standing up a separate
-// public asset route.
+// General-purpose R2 read-through proxy, scoped to an allowlist of key
+// prefixes so it can't be used to read arbitrary bucket contents. This is
+// what lets <img src="/api/r2/brands/..."> (or "/api/r2/attachments/...")
+// render an uploaded logo/photo -- R2 objects aren't otherwise reachable
+// from the browser (no public bucket domain configured), and this keeps
+// everything behind the same session-auth middleware as the rest of the API
+// rather than standing up a separate public asset route.
+//
+// "attachments/" was added in the attachments feature (Part A) alongside
+// the original "brands/" prefix -- extend this array for future R2-backed
+// features rather than duplicating the route.
+const R2_PROXY_ALLOWED_PREFIXES = ["brands/", "attachments/"];
+
 const EXT_CONTENT_TYPES: Record<string, string> = {
   webp: "image/webp",
   png: "image/png",
@@ -1457,8 +1706,21 @@ const EXT_CONTENT_TYPES: Record<string, string> = {
 
 app.get("/api/r2/*", async (c) => {
   const key = c.req.path.replace(/^\/api\/r2\//, "");
-  if (!key.startsWith("brands/")) {
+  if (!R2_PROXY_ALLOWED_PREFIXES.some((prefix) => key.startsWith(prefix))) {
     return c.json({ error: "forbidden" }, 403);
+  }
+  // Attachment keys are "attachments/{entity_type}/{entity_id}/...", so a
+  // technician's per-job ownership rule can be enforced straight from the
+  // key shape without a DB lookup keyed on r2_key -- this mirrors the same
+  // rule enforced in the /api/attachments routes so a technician can't view
+  // (or leak, via the URL) a photo on a job/estimate/customer they aren't
+  // allowed to see.
+  const user = c.get("user");
+  if (user.role === "technician" && key.startsWith("attachments/")) {
+    const [, entityType, entityIdRaw] = key.split("/");
+    const db = getDb(c.env);
+    const forbidden = await requireAttachmentAccessOrForbid(c, db, entityType, toId(entityIdRaw));
+    if (forbidden) return forbidden;
   }
   const obj = await c.env.BUCKET.get(key);
   if (!obj) return c.json({ error: "Not found" }, 404);
@@ -1931,7 +2193,16 @@ app.openapi(getInvoice, async (c) => {
     unit_price: l.unitPrice,
     total: l.total,
   }));
-  return c.json({ invoice: { ...invoice, lines: linesOut } }, 200);
+  // Nested "payments" array, same pattern as "lines" above -- lets
+  // invoice-detail.tsx render the payment history without a second request.
+  const payments = await db
+    .select()
+    .from(schema.payments)
+    .where(eq(schema.payments.invoiceId, idNum))
+    .orderBy(desc(schema.payments.id))
+    .all();
+  const paymentsOut = payments.map(paymentOut);
+  return c.json({ invoice: { ...invoice, lines: linesOut, payments: paymentsOut } }, 200);
 });
 
 const createInvoice = createRoute({
@@ -2075,6 +2346,138 @@ app.openapi(deleteInvoice, async (c) => {
   const { id } = c.req.valid("param");
   await db.delete(schema.invoices).where(eq(schema.invoices.id, toId(id)));
   return c.json({ ok: true }, 200);
+});
+
+// ── Payments ───────────────────────────────────────────────────────
+// Lives under /api/invoices/{id}/payments, so it's already covered by the
+// blanket technician role-gate's `path.startsWith("/api/invoices")` check
+// above (confirmed by reading that check directly, not assumed) -- no
+// separate block needed here, same as how /api/jobs/{id}/invoice piggybacks
+// on the same prefix check via its own regex.
+
+function paymentOut(row: typeof schema.payments.$inferSelect) {
+  return {
+    id: row.id,
+    invoice_id: row.invoiceId,
+    method: row.method,
+    amount: row.amount,
+    surcharge_amount: row.surchargeAmount,
+    processor_ref: row.processorRef,
+    status: row.status,
+    paid_at: row.paidAt,
+    created_at: row.createdAt ?? "",
+  };
+}
+
+const PAYMENT_METHODS = ["cash", "check", "card", "financing"] as const;
+
+const listPayments = createRoute({
+  method: "get",
+  path: "/api/invoices/{id}/payments",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Payments for an invoice", content: { "application/json": { schema: z.object({ payments: z.array(PaymentSchema) }) } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(listPayments, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const invoice = await db.select({ id: schema.invoices.id }).from(schema.invoices).where(eq(schema.invoices.id, idNum)).get();
+  if (!invoice) return c.json({ error: "Invoice not found" }, 404);
+  const rows = await db.select().from(schema.payments).where(eq(schema.payments.invoiceId, idNum)).orderBy(desc(schema.payments.id)).all();
+  return c.json({ payments: rows.map(paymentOut) }, 200);
+});
+
+const recordPayment = createRoute({
+  method: "post",
+  path: "/api/invoices/{id}/payments",
+  request: {
+    params: IdParam,
+    body: { content: { "application/json": { schema: z.object({
+      method: z.enum(PAYMENT_METHODS),
+      amount: z.number().optional(),
+    }) } } },
+  },
+  responses: {
+    201: { description: "Payment recorded", content: { "application/json": { schema: z.object({ payment: PaymentSchema, invoice_status: z.string() }) } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(recordPayment, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const data = c.req.valid("json");
+  const invoice = await db.select().from(schema.invoices).where(eq(schema.invoices.id, idNum)).get();
+  if (!invoice) return c.json({ error: "Invoice not found" }, 404);
+
+  const invoiceTotal = invoice.total || 0;
+
+  // Track remaining balance in RAW (pre-discount/surcharge) dollars so
+  // multiple payments against one invoice never over-collect. For any
+  // payment row, (amount - surchargeAmount) always equals the raw-dollar
+  // slice of invoiceTotal that payment cleared -- true by construction for
+  // auto/tier payments (see below) and true by definition for manual ones
+  // (surchargeAmount is always 0 for those, so amount IS the raw slice).
+  const priorPayments = await db.select({ amount: schema.payments.amount, surchargeAmount: schema.payments.surchargeAmount })
+    .from(schema.payments).where(and(eq(schema.payments.invoiceId, idNum), eq(schema.payments.status, "paid"))).all();
+  const priorRawCredit = priorPayments.reduce((sum, p) => sum + ((p.amount || 0) - (p.surchargeAmount || 0)), 0);
+  const remainingRaw = Math.max(0, invoiceTotal - priorRawCredit);
+
+  // amount defaults to the tier-computed amount for what's actually still
+  // owed (not the full invoice total) -- so a second auto payment after a
+  // partial one only charges the remainder, never re-charges the full tier
+  // amount again. An explicit amount (e.g. a partial payment, or an office
+  // override) is taken as-is without re-deriving a surcharge from it --
+  // surcharge_amount only reflects the tier math, so a manually-entered
+  // amount is recorded with surcharge_amount 0 rather than a misleading
+  // inferred figure.
+  let amount: number;
+  let surchargeAmount: number;
+  if (data.amount !== undefined) {
+    amount = data.amount;
+    surchargeAmount = 0;
+  } else {
+    const computed = computePaymentAmount(remainingRaw, data.method);
+    amount = computed.amount;
+    surchargeAmount = computed.surchargeAmount;
+  }
+
+  await db.insert(schema.payments).values({
+    invoiceId: idNum,
+    method: data.method,
+    amount,
+    surchargeAmount,
+    // No real processor integration yet (Phase 5 Stripe work) -- cash/
+    // check/card/financing are all recorded as immediately "paid" with no
+    // processor_ref, matching the build plan's note that this app doesn't
+    // integrate a real processor yet.
+    status: "paid",
+    paidAt: sql`(datetime('now'))`,
+  });
+  const payment = await db.select().from(schema.payments).where(eq(schema.payments.invoiceId, idNum)).orderBy(desc(schema.payments.id)).limit(1).get();
+
+  // This payment's own raw credit (auto payments are computed to exactly
+  // clear remainingRaw, so they always zero it out in one shot; manual
+  // payments only clear as much raw balance as their dollar amount).
+  const thisRawCredit = amount - surchargeAmount;
+  const totalRawCredit = priorRawCredit + thisRawCredit;
+  // Flip to "paid" (the same 4-value status enum already used elsewhere in
+  // this file -- draft/sent/paid/overdue/cancelled -- no new "partial"
+  // status invented) once accumulated raw credit covers the invoice total.
+  // A small epsilon guards against float rounding on the tier math.
+  let invoiceStatus = invoice.status;
+  if (totalRawCredit >= invoiceTotal - 0.005) {
+    invoiceStatus = "paid";
+    await db.update(schema.invoices).set({ status: "paid", paidDate: sql`(date('now'))`, updatedAt: sql`(datetime('now'))` }).where(eq(schema.invoices.id, idNum));
+  }
+
+  return c.json({ payment: paymentOut(payment!), invoice_status: invoiceStatus }, 201);
 });
 
 // ── Create invoice from job ────────────────────────────────────────

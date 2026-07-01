@@ -3,6 +3,7 @@ import { useContext } from "preact/hooks";
 import type {
   Job, Customer, Technician, ServiceType, Material, Invoice, Stats, PaginatedState,
   CustomerLookup, TechnicianLookup, Priority, Brand, Estimate,
+  Attachment, AttachmentEntityType, AttachmentKind, Payment, PaymentMethod,
 } from "./types";
 
 export interface CurrentUser {
@@ -107,6 +108,17 @@ export interface AppContextValue {
   addInvoice: (data: { customer_id: number; job_id?: number | null; tax_rate?: number; notes?: string; due_date?: string; brand_id?: number | null; lines: { description: string; quantity: number; unit_price: number }[] }) => Promise<void>;
   updateInvoice: (id: number, data: Partial<Invoice>) => Promise<void>;
   deleteInvoice: (id: number) => Promise<void>;
+
+  // Payments
+  recordPayment: (invoiceId: number, method: PaymentMethod, amount?: number) => Promise<Payment>;
+
+  // Attachments
+  jobAttachments: Attachment[];
+  estimateAttachments: Attachment[];
+  fetchJobAttachments: (jobId: number) => Promise<void>;
+  fetchEstimateAttachments: (estimateId: number) => Promise<void>;
+  uploadAttachment: (entityType: AttachmentEntityType, entityId: number, file: File, kind?: AttachmentKind) => Promise<void>;
+  deleteAttachment: (id: number, entityType: AttachmentEntityType, entityId: number) => Promise<void>;
 
   // Estimates
   estimates: Estimate[];

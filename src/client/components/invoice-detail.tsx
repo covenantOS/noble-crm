@@ -1,7 +1,8 @@
+import { useState } from "preact/hooks";
 import { useApp } from "../context";
-import { ACORN_FINANCE_URL } from "../constants";
-import { ArrowLeft, Trash2, ExternalLink } from "lucide-preact";
-import type { InvoiceStatus } from "../types";
+import { ACORN_FINANCE_URL, PAYMENT_TIERS, computePaymentAmount } from "../constants";
+import { ArrowLeft, Trash2, ExternalLink, CreditCard } from "lucide-preact";
+import type { InvoiceStatus, PaymentMethod } from "../types";
 
 const ALL_STATUSES: InvoiceStatus[] = ["draft", "sent", "paid", "overdue", "cancelled"];
 
@@ -13,12 +14,39 @@ const STATUS_COLORS: Record<InvoiceStatus, string> = {
   cancelled: "#9ca3af",
 };
 
+const PAYMENT_METHODS: PaymentMethod[] = ["cash", "check", "card", "financing"];
+
+const PAYMENT_METHOD_LABELS: Record<PaymentMethod, string> = {
+  cash: "Cash",
+  check: "Check",
+  card: "Card",
+  financing: "Financing",
+};
+
 export function InvoiceDetail() {
-  const { selectedInvoice: invoice, navigate, updateInvoice, deleteInvoice, brands } = useApp();
+  const { selectedInvoice: invoice, navigate, updateInvoice, deleteInvoice, brands, recordPayment, setError } = useApp();
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("cash");
+  const [customAmount, setCustomAmount] = useState("");
+  const [recording, setRecording] = useState(false);
 
   if (!invoice) return null;
 
   const color = STATUS_COLORS[(invoice.status as InvoiceStatus)] || "#6b7280";
+
+  const tierAmount = computePaymentAmount(invoice.total, paymentMethod).amount;
+
+  const handleRecordPayment = async () => {
+    setRecording(true);
+    try {
+      const amount = customAmount.trim() ? parseFloat(customAmount) : undefined;
+      await recordPayment(invoice.id, paymentMethod, amount);
+      setCustomAmount("");
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setRecording(false);
+    }
+  };
 
   return (
     <div class="page">
@@ -117,6 +145,75 @@ export function InvoiceDetail() {
                   </tr>
                 </tfoot>
               </table>
+            </div>
+          </div>
+
+          {/* Payment tiers -- preview of what the customer owes under each
+              method (cash/check discount 8%, card surcharges 4%, financing
+              surcharges 6% -- see PAYMENT_TIERS in ../constants.ts, kept in
+              sync with the server's copy in src/server/index.ts). */}
+          <div class="detail-section">
+            <h3><CreditCard size={16} style={{ verticalAlign: "text-bottom" }} /> Payments</h3>
+            <div class="card">
+              <table class="table">
+                <thead>
+                  <tr><th>Method</th><th>Adjustment</th><th class="text-right">Customer Owes</th></tr>
+                </thead>
+                <tbody>
+                  {PAYMENT_METHODS.map((m) => {
+                    const { amount, surchargeAmount } = computePaymentAmount(invoice.total, m);
+                    return (
+                      <tr key={m} class="table-row">
+                        <td>{PAYMENT_METHOD_LABELS[m]}</td>
+                        <td class={surchargeAmount < 0 ? "text-muted" : ""}>
+                          {surchargeAmount === 0 ? "—" : `${surchargeAmount > 0 ? "+" : ""}${(PAYMENT_TIERS[m] * 100).toFixed(0)}% (${surchargeAmount > 0 ? "+" : ""}$${surchargeAmount.toFixed(2)})`}
+                        </td>
+                        <td class="text-right text-bold">${amount.toFixed(2)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            {(invoice.payments || []).length > 0 && (
+              <div class="card" style={{ marginTop: 10 }}>
+                <table class="table">
+                  <thead>
+                    <tr><th>Method</th><th class="text-right">Amount</th><th class="text-right">Surcharge</th><th>Paid At</th></tr>
+                  </thead>
+                  <tbody>
+                    {(invoice.payments || []).map((p) => (
+                      <tr key={p.id} class="table-row">
+                        <td>{PAYMENT_METHOD_LABELS[p.method] || p.method}</td>
+                        <td class="text-right">${p.amount.toFixed(2)}</td>
+                        <td class="text-right">{p.surcharge_amount ? `${p.surcharge_amount > 0 ? "+" : ""}$${p.surcharge_amount.toFixed(2)}` : "—"}</td>
+                        <td>{p.paid_at ? new Date(p.paid_at).toLocaleString() : "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <div class="note-input-row" style={{ marginTop: 10 }}>
+              <select value={paymentMethod} onChange={(e) => setPaymentMethod((e.target as HTMLSelectElement).value as PaymentMethod)} style={{ flex: 1 }}>
+                {PAYMENT_METHODS.map((m) => (
+                  <option key={m} value={m}>{PAYMENT_METHOD_LABELS[m]}</option>
+                ))}
+              </select>
+              <input
+                type="number"
+                step="0.01"
+                min="0"
+                placeholder={`$${tierAmount.toFixed(2)}`}
+                value={customAmount}
+                onInput={(e) => setCustomAmount((e.target as HTMLInputElement).value)}
+                style={{ width: 110 }}
+              />
+              <button class="btn btn-primary btn-sm" onClick={handleRecordPayment} disabled={recording}>
+                {recording ? "Recording..." : "Record Payment"}
+              </button>
             </div>
           </div>
 
