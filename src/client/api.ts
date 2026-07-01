@@ -1,5 +1,5 @@
 export async function api<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const opts: RequestInit = { method, headers: {} };
+  const opts: RequestInit = { method, headers: {}, credentials: "include" };
   if (body) {
     (opts.headers as Record<string, string>)["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);

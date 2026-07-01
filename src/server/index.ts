@@ -1,9 +1,95 @@
 import { OpenAPIHono, createRoute, z } from "@hono/zod-openapi";
+import type { Context } from "hono";
 import { and, asc, desc, eq, like, or, sql, inArray } from "drizzle-orm";
 import { getDb, schema } from "../db/index.js";
+import { createAuth } from "../lib/auth.js";
 import type { AppBindings } from "../lib/types.js";
 
 const app = new OpenAPIHono<AppBindings>();
+
+// ── Auth ───────────────────────────────────────────────────────────
+// better-auth owns everything under /api/auth/* (sign-up, sign-in, sign-out,
+// session, etc). Mounted before the auth-required middleware below, and the
+// middleware explicitly skips this prefix, so these routes stay public.
+app.on(["GET", "POST"], "/api/auth/*", (c) => createAuth(c.env).handler(c.req.raw));
+
+// All other /api/* routes require a session. Resolves the better-auth
+// session from the request cookie and attaches a normalized user onto
+// Hono's context for downstream handlers/authorization checks.
+app.use("/api/*", async (c, next) => {
+  if (c.req.path.startsWith("/api/auth/")) {
+    return next();
+  }
+  const session = await createAuth(c.env).api.getSession({ headers: c.req.raw.headers });
+  if (!session) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  c.set("user", {
+    id: session.user.id,
+    role: (session.user as { role?: string }).role || "office",
+    name: session.user.name,
+    email: session.user.email,
+  });
+  await next();
+});
+
+// Blanket role gate for technicians on whole resource families that are
+// off-limits to them regardless of ownership (customers, technicians,
+// invoices) and on mutating materials/service-types routes (read-only is
+// fine for the dashboard, so GET is allowed through). Per-job ownership
+// checks (jobs, notes, checklist, job-materials) are handled per-route below
+// via requireOwnJobOrForbid since they depend on which job is involved.
+app.use("/api/*", async (c, next) => {
+  const user = c.get("user");
+  if (user.role !== "technician") {
+    return next();
+  }
+  const path = c.req.path;
+  const method = c.req.method;
+  const isMutating = method === "POST" || method === "PUT" || method === "DELETE";
+
+  if (path.startsWith("/api/customers")) {
+    return c.json({ error: "forbidden" }, 403);
+  }
+  if (path.startsWith("/api/technicians")) {
+    return c.json({ error: "forbidden" }, 403);
+  }
+  if (path.startsWith("/api/invoices") || /^\/api\/jobs\/[^/]+\/invoice$/.test(path)) {
+    return c.json({ error: "forbidden" }, 403);
+  }
+  if (isMutating && (path.startsWith("/api/materials") || path.startsWith("/api/service-types"))) {
+    return c.json({ error: "forbidden" }, 403);
+  }
+  // Job creation assigns customer_id/technician_id arbitrarily -- the same
+  // class of "reassign away from myself" risk as the technician_id strip in
+  // updateJob below, just with no existing job to check ownership against.
+  // Technicians work jobs already assigned to them; dispatch/office creates.
+  if (method === "POST" && path === "/api/jobs") {
+    return c.json({ error: "forbidden" }, 403);
+  }
+  return next();
+});
+
+// ── Authorization helpers ─────────────────────────────────────────
+// Resolve the requesting user's own technician row (if any). Technicians
+// are linked to a better-auth user via technicians.userId.
+async function getOwnTechnicianId(db: ReturnType<typeof getDb>, userId: string): Promise<number | null> {
+  const tech = await db.select({ id: schema.technicians.id }).from(schema.technicians).where(eq(schema.technicians.userId, userId)).get();
+  return tech?.id ?? null;
+}
+
+// For technician-restricted mutating routes: confirms the job identified by
+// jobId belongs to the requester's own technician. Returns a Response to
+// short-circuit with (403 forbidden) if not, or null if the caller may proceed.
+async function requireOwnJobOrForbid(c: Context<AppBindings>, db: ReturnType<typeof getDb>, jobId: number) {
+  const user = c.get("user");
+  const ownTechId = await getOwnTechnicianId(db, user.id);
+  const job = await db.select({ technicianId: schema.jobs.technicianId }).from(schema.jobs).where(eq(schema.jobs.id, jobId)).get();
+  if (!job || ownTechId === null || job.technicianId !== ownTechId) {
+    return c.json({ error: "forbidden" }, 403);
+  }
+  return null;
+}
 
 // ── Shared Schemas ─────────────────────────────────────────────────
 
@@ -234,6 +320,7 @@ app.openapi(listJobs, async (c) => {
   const limit = parseInt(q.limit || "50", 10);
   const offset = (page - 1) * limit;
 
+  const user = c.get("user");
   const conditions = [];
   if (q.search) {
     const s = `%${q.search}%`;
@@ -246,11 +333,19 @@ app.openapi(listJobs, async (c) => {
   if (q.status) {
     conditions.push(eq(schema.jobs.status, q.status));
   }
+  if (user.role === "technician") {
+    // Force-filter to the requester's own technician id, overriding any
+    // technician_id query param -- a technician may only ever see their own jobs.
+    const ownTechId = await getOwnTechnicianId(db, user.id);
+    if (ownTechId === null) {
+      return c.json({ jobs: [], total: 0 }, 200);
+    }
+    conditions.push(eq(schema.jobs.technicianId, ownTechId));
+  } else if (q.technician_id) {
+    conditions.push(eq(schema.jobs.technicianId, parseInt(q.technician_id, 10)));
+  }
   if (q.date) {
     conditions.push(eq(schema.jobs.scheduledDate, q.date));
-  }
-  if (q.technician_id) {
-    conditions.push(eq(schema.jobs.technicianId, parseInt(q.technician_id, 10)));
   }
   const where = conditions.length > 0 ? and(...conditions) : undefined;
 
@@ -287,6 +382,13 @@ app.openapi(getJob, async (c) => {
   const idNum = toId(id);
   const job = await jobJoinedSelect(db).where(eq(schema.jobs.id, idNum)).get();
   if (!job) return c.json({ error: "Job not found" }, 404);
+  const user = c.get("user");
+  if (user.role === "technician") {
+    const ownTechId = await getOwnTechnicianId(db, user.id);
+    if (ownTechId === null || job.technician_id !== ownTechId) {
+      return c.json({ error: "Job not found" }, 404);
+    }
+  }
   const notes = await db.select().from(schema.jobNotes).where(eq(schema.jobNotes.jobId, idNum)).orderBy(desc(schema.jobNotes.createdAt)).all();
   const checklist = await db.select().from(schema.jobChecklist).where(eq(schema.jobChecklist.jobId, idNum)).orderBy(asc(schema.jobChecklist.sortOrder)).all();
   const jobMaterials = await db
@@ -416,6 +518,7 @@ const updateJob = createRoute({
   },
   responses: {
     200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
     404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
@@ -428,9 +531,23 @@ app.openapi(updateJob, async (c) => {
   const existing = await db.select().from(schema.jobs).where(eq(schema.jobs.id, idNum)).get();
   if (!existing) return c.json({ error: "Job not found" }, 404);
 
+  const user = c.get("user");
+  const isTechnician = user.role === "technician";
+  if (isTechnician) {
+    const forbidden = await requireOwnJobOrForbid(c, db, idNum);
+    if (forbidden) return forbidden;
+  }
+
   const updates: Record<string, unknown> = {};
-  if (data.customer_id !== undefined) updates.customerId = data.customer_id;
-  if (data.technician_id !== undefined) updates.technicianId = data.technician_id;
+  // Technicians may update their own job's working fields (status, notes,
+  // schedule, etc.) but not reassign who it belongs to -- otherwise a
+  // technician could PUT their own job to a different technician_id and
+  // immediately lock themselves out of it (requireOwnJobOrForbid only
+  // checks ownership of the pre-update state).
+  if (!isTechnician) {
+    if (data.customer_id !== undefined) updates.customerId = data.customer_id;
+    if (data.technician_id !== undefined) updates.technicianId = data.technician_id;
+  }
   if (data.service_type_id !== undefined) updates.serviceTypeId = data.service_type_id;
   if (data.status !== undefined) updates.status = data.status;
   if (data.priority !== undefined) updates.priority = data.priority;
@@ -457,10 +574,15 @@ const deleteJob = createRoute({
   request: { params: IdParam },
   responses: {
     200: { description: "Deleted", content: { "application/json": { schema: OkSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(deleteJob, async (c) => {
+  // Technicians can never delete jobs, regardless of ownership.
+  if (c.get("user").role === "technician") {
+    return c.json({ error: "forbidden" }, 403);
+  }
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
   await db.delete(schema.jobs).where(eq(schema.jobs.id, toId(id)));
@@ -478,6 +600,7 @@ const addJobNote = createRoute({
   },
   responses: {
     201: { description: "Note added", content: { "application/json": { schema: JobNoteSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -485,6 +608,10 @@ app.openapi(addJobNote, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
   const idNum = toId(id);
+  if (c.get("user").role === "technician") {
+    const forbidden = await requireOwnJobOrForbid(c, db, idNum);
+    if (forbidden) return forbidden;
+  }
   const { content } = c.req.valid("json");
   await db.insert(schema.jobNotes).values({ jobId: idNum, content });
   const note = await db.select().from(schema.jobNotes).where(eq(schema.jobNotes.jobId, idNum)).orderBy(desc(schema.jobNotes.id)).limit(1).get();
@@ -497,13 +624,22 @@ const deleteJobNote = createRoute({
   request: { params: IdParam },
   responses: {
     200: { description: "Deleted", content: { "application/json": { schema: OkSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(deleteJobNote, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  await db.delete(schema.jobNotes).where(eq(schema.jobNotes.id, toId(id)));
+  const idNum = toId(id);
+  if (c.get("user").role === "technician") {
+    const note = await db.select({ jobId: schema.jobNotes.jobId }).from(schema.jobNotes).where(eq(schema.jobNotes.id, idNum)).get();
+    if (note) {
+      const forbidden = await requireOwnJobOrForbid(c, db, note.jobId);
+      if (forbidden) return forbidden;
+    }
+  }
+  await db.delete(schema.jobNotes).where(eq(schema.jobNotes.id, idNum));
   return c.json({ ok: true }, 200);
 });
 
@@ -1079,8 +1215,17 @@ const getSchedule = createRoute({
 app.openapi(getSchedule, async (c) => {
   const db = getDb(c.env);
   const q = c.req.valid("query");
+  const user = c.get("user");
   const conditions = [sql`${schema.jobs.scheduledDate} >= ${q.start}`, sql`${schema.jobs.scheduledDate} <= ${q.end}`];
-  if (q.technician_id) {
+  if (user.role === "technician") {
+    // Force-filter to the requester's own technician id, overriding any
+    // technician_id query param.
+    const ownTechId = await getOwnTechnicianId(db, user.id);
+    if (ownTechId === null) {
+      return c.json({ jobs: [] }, 200);
+    }
+    conditions.push(eq(schema.jobs.technicianId, ownTechId));
+  } else if (q.technician_id) {
     conditions.push(eq(schema.jobs.technicianId, parseInt(q.technician_id, 10)));
   }
   const jobs = await jobJoinedSelect(db)
@@ -1101,6 +1246,7 @@ const addChecklistItem = createRoute({
   },
   responses: {
     201: { description: "Added", content: { "application/json": { schema: OkSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -1108,6 +1254,10 @@ app.openapi(addChecklistItem, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
   const idNum = toId(id);
+  if (c.get("user").role === "technician") {
+    const forbidden = await requireOwnJobOrForbid(c, db, idNum);
+    if (forbidden) return forbidden;
+  }
   const { label } = c.req.valid("json");
   const maxOrder = await db
     .select({ m: sql<number>`COALESCE(MAX(${schema.jobChecklist.sortOrder}), 0)` })
@@ -1124,16 +1274,25 @@ const toggleChecklistItem = createRoute({
   request: { params: IdParam },
   responses: {
     200: { description: "Toggled", content: { "application/json": { schema: OkSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(toggleChecklistItem, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  if (c.get("user").role === "technician") {
+    const item = await db.select({ jobId: schema.jobChecklist.jobId }).from(schema.jobChecklist).where(eq(schema.jobChecklist.id, idNum)).get();
+    if (item) {
+      const forbidden = await requireOwnJobOrForbid(c, db, item.jobId);
+      if (forbidden) return forbidden;
+    }
+  }
   await db
     .update(schema.jobChecklist)
     .set({ checked: sql`CASE WHEN ${schema.jobChecklist.checked} = 0 THEN 1 ELSE 0 END` })
-    .where(eq(schema.jobChecklist.id, toId(id)));
+    .where(eq(schema.jobChecklist.id, idNum));
   return c.json({ ok: true }, 200);
 });
 
@@ -1143,13 +1302,22 @@ const deleteChecklistItem = createRoute({
   request: { params: IdParam },
   responses: {
     200: { description: "Deleted", content: { "application/json": { schema: OkSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(deleteChecklistItem, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  await db.delete(schema.jobChecklist).where(eq(schema.jobChecklist.id, toId(id)));
+  const idNum = toId(id);
+  if (c.get("user").role === "technician") {
+    const item = await db.select({ jobId: schema.jobChecklist.jobId }).from(schema.jobChecklist).where(eq(schema.jobChecklist.id, idNum)).get();
+    if (item) {
+      const forbidden = await requireOwnJobOrForbid(c, db, item.jobId);
+      if (forbidden) return forbidden;
+    }
+  }
+  await db.delete(schema.jobChecklist).where(eq(schema.jobChecklist.id, idNum));
   return c.json({ ok: true }, 200);
 });
 
@@ -1281,12 +1449,18 @@ const addJobMaterial = createRoute({
   },
   responses: {
     201: { description: "Added", content: { "application/json": { schema: OkSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(addJobMaterial, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  if (c.get("user").role === "technician") {
+    const forbidden = await requireOwnJobOrForbid(c, db, idNum);
+    if (forbidden) return forbidden;
+  }
   const data = c.req.valid("json");
   let cost = data.unit_cost;
   if (cost === undefined) {
@@ -1294,7 +1468,7 @@ app.openapi(addJobMaterial, async (c) => {
     cost = mat?.unit_cost || 0;
   }
   await db.insert(schema.jobMaterials).values({
-    jobId: toId(id),
+    jobId: idNum,
     materialId: data.material_id,
     quantity: data.quantity,
     unitCost: cost,
@@ -1308,13 +1482,22 @@ const deleteJobMaterial = createRoute({
   request: { params: IdParam },
   responses: {
     200: { description: "Deleted", content: { "application/json": { schema: OkSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(deleteJobMaterial, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  await db.delete(schema.jobMaterials).where(eq(schema.jobMaterials.id, toId(id)));
+  const idNum = toId(id);
+  if (c.get("user").role === "technician") {
+    const jm = await db.select({ jobId: schema.jobMaterials.jobId }).from(schema.jobMaterials).where(eq(schema.jobMaterials.id, idNum)).get();
+    if (jm) {
+      const forbidden = await requireOwnJobOrForbid(c, db, jm.jobId);
+      if (forbidden) return forbidden;
+    }
+  }
+  await db.delete(schema.jobMaterials).where(eq(schema.jobMaterials.id, idNum));
   return c.json({ ok: true }, 200);
 });
 

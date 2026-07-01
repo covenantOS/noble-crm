@@ -13,5 +13,10 @@ export interface Env {
   STRIPE_WEBHOOK_SECRET?: string;
 }
 
+// Authenticated user attached to Hono's context via the auth middleware in
+// src/server/index.ts (c.set("user", ...)). role mirrors better-auth's
+// user.role additional field: 'admin' | 'office' | 'estimator' | 'technician'.
+export type AuthUser = { id: string; role: string; name: string; email: string };
+
 // Hono generic: app = new Hono<{ Bindings: Env }>()
-export type AppBindings = { Bindings: Env };
+export type AppBindings = { Bindings: Env; Variables: { user: AuthUser } };

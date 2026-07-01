@@ -1,5 +1,5 @@
 import { useApp } from "../context";
-import { CalendarClock, LayoutDashboard, Briefcase, Users, Wrench, Settings, CalendarDays, FileText, Package } from "lucide-preact";
+import { CalendarClock, LayoutDashboard, Briefcase, Users, Wrench, Settings, CalendarDays, FileText, Package, LogOut } from "lucide-preact";
 import type { View } from "../types";
 
 const navItems: { view: View; path: string; label: string; icon: typeof LayoutDashboard }[] = [
@@ -13,8 +13,21 @@ const navItems: { view: View; path: string; label: string; icon: typeof LayoutDa
   { view: "services", path: "/services", label: "Service Types", icon: Settings },
 ];
 
+// Resource families that the backend forbids technicians from (see the
+// blanket role-gate middleware in src/server/index.ts). Hidden from the nav
+// so a technician's UI never dead-ends into a 403.
+const TECHNICIAN_HIDDEN_VIEWS: View[] = ["customers", "technicians", "invoices", "materials", "services"];
+
 export function Sidebar({ currentView }: { currentView: View }) {
-  const { navigate, stats } = useApp();
+  const { navigate, stats, currentUser, logout, jobsPag } = useApp();
+  const isTechnician = currentUser?.role === "technician";
+  const visibleNavItems = isTechnician
+    ? navItems.filter((item) => !TECHNICIAN_HIDDEN_VIEWS.includes(item.view))
+    : navItems;
+  // stats.jobs is a global, unscoped count (see /api/stats -- deliberately
+  // left unrestricted for technicians). jobsPag.total, in contrast, reflects
+  // the technician-scoped list they actually see, so use that for them.
+  const jobsBadgeCount = isTechnician ? jobsPag.total : stats.jobs;
 
   return (
     <aside class="sidebar">
@@ -26,7 +39,7 @@ export function Sidebar({ currentView }: { currentView: View }) {
       </div>
       <nav class="sidebar-nav">
         <div class="sidebar-section-title">Menu</div>
-        {navItems.map((item) => (
+        {visibleNavItems.map((item) => (
           <button
             key={item.view}
             class={`sidebar-item ${currentView === item.view ? "active" : ""}`}
@@ -34,8 +47,8 @@ export function Sidebar({ currentView }: { currentView: View }) {
           >
             <item.icon size={16} />
             <span>{item.label}</span>
-            {item.view === "jobs" && stats.jobs > 0 && (
-              <span class="sidebar-badge">{stats.jobs}</span>
+            {item.view === "jobs" && jobsBadgeCount > 0 && (
+              <span class="sidebar-badge">{jobsBadgeCount}</span>
             )}
             {item.view === "customers" && stats.customers > 0 && (
               <span class="sidebar-badge">{stats.customers}</span>
@@ -45,6 +58,10 @@ export function Sidebar({ currentView }: { currentView: View }) {
             )}
           </button>
         ))}
+        <button class="sidebar-logout" onClick={() => logout()}>
+          <LogOut size={16} />
+          <span>Logout</span>
+        </button>
       </nav>
       <div class="sidebar-footer">
         <div class="sidebar-stat">

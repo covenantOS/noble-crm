@@ -18,17 +18,22 @@ const STATUSES: { value: string; label: string }[] = [
 export function JobList() {
   const {
     jobs, jobsPag, setJobsPage, jobsSearch, setJobsSearch,
-    jobsStatusFilter, setJobsStatusFilter, isAgent,
+    jobsStatusFilter, setJobsStatusFilter, isAgent, currentUser,
   } = useApp();
   const [showCreate, setShowCreate] = useState(false);
+  // Server-side, POST /api/jobs is 403 for technicians (they work jobs
+  // already assigned to them, not create/assign new ones) -- match that here.
+  const canCreate = currentUser?.role !== "technician";
 
   return (
     <div class="page">
       <div class="page-header">
         <h1>Jobs</h1>
-        <button class="btn btn-primary" onClick={() => setShowCreate(true)}>
-          <Plus size={16} /> New Job
-        </button>
+        {canCreate && (
+          <button class="btn btn-primary" onClick={() => setShowCreate(true)}>
+            <Plus size={16} /> New Job
+          </button>
+        )}
       </div>
 
       <div class="toolbar">

@@ -263,4 +263,4 @@ export const serviceAgreements = sqliteTable('service_agreements', {
  *   pnpm dlx @better-auth/cli generate --output ./src/db/auth-schema.ts
  * then uncomment the line below so drizzle-kit picks them up in migrations.
  * ========================================================================= */
-// export * from './auth-schema';
+export * from './auth-schema';

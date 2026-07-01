@@ -929,4 +929,83 @@ body {
 /* ── Agent mode overrides ────────────────────────────────────────────── */
 
 [data-agent] .btn-icon { opacity: 1 !important; }
+
+/* ── Login ───────────────────────────────────────────────────────────── */
+
+.login-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+.login-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 320px;
+  padding: 32px;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+}
+
+.login-icon {
+  margin: 0 auto;
+}
+
+.login-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+  text-align: center;
+}
+
+.login-subtitle {
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: center;
+  margin-top: -10px;
+}
+
+.login-error {
+  font-size: 12px;
+  color: var(--danger);
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+}
+
+.login-submit {
+  justify-content: center;
+  margin-top: 4px;
+}
+
+/* ── Sidebar logout ──────────────────────────────────────────────────── */
+
+.sidebar-logout {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px;
+  margin-top: 8px;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  font-family: var(--font);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: background 0.15s, color 0.15s;
+}
+
+.sidebar-logout:hover {
+  background: #fef2f2;
+  color: var(--danger);
+}
 [data-agent] .table-row .action-btns { visibility: visible !important; }

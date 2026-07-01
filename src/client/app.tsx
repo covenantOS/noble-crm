@@ -2,6 +2,7 @@ import { useEffect, useMemo } from "preact/hooks";
 import { AppContext } from "./context";
 import { useAppState } from "./hooks/use-app";
 import { useRouter } from "./hooks/use-router";
+import { useSession } from "./hooks/use-session";
 import { Sidebar } from "./components/sidebar";
 import { Dashboard } from "./components/dashboard";
 import { ScheduleView } from "./components/schedule-view";
@@ -15,6 +16,7 @@ import { MaterialList } from "./components/material-list";
 import { InvoiceList } from "./components/invoice-list";
 import { InvoiceDetail } from "./components/invoice-detail";
 import { ErrorBanner } from "./components/error-banner";
+import { Login } from "./components/login";
 
 export function App() {
   const isAgent = useMemo(() => {
@@ -28,8 +30,28 @@ export function App() {
     }
   }, [isAgent]);
 
+  const { session, isPending } = useSession();
+
+  if (isPending) {
+    return <div class="loading-text">Loading...</div>;
+  }
+
+  if (!session) {
+    return <Login />;
+  }
+
+  return <AuthenticatedApp isAgent={isAgent} session={session} />;
+}
+
+function AuthenticatedApp({ isAgent, session }: { isAgent: boolean; session: NonNullable<ReturnType<typeof useSession>["session"]> }) {
   const { view, id, navigate } = useRouter();
-  const appState = useAppState(isAgent, navigate);
+  const currentUser = useMemo(() => ({
+    id: session.user.id,
+    role: (session.user as { role?: string }).role || "office",
+    name: session.user.name,
+    email: session.user.email,
+  }), [session]);
+  const appState = useAppState(isAgent, navigate, currentUser);
 
   // Load detail when URL has an ID
   useEffect(() => {

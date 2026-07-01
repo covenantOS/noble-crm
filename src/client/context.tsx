@@ -5,10 +5,21 @@ import type {
   CustomerLookup, TechnicianLookup, Priority,
 } from "./types";
 
+export interface CurrentUser {
+  id: string;
+  role: string;
+  name: string;
+  email: string;
+}
+
 export interface AppContextValue {
   navigate: (to: string) => void;
   isAgent: boolean;
   stats: Stats;
+
+  // Auth
+  currentUser: CurrentUser | null;
+  logout: () => Promise<void>;
 
   // Jobs
   jobs: Job[];

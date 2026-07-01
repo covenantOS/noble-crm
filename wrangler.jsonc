@@ -25,7 +25,10 @@
   ],
 
   // Serves the built Preact SPA. vite.config.ts builds to ./dist (not dist/client).
-  "assets": { "directory": "./dist", "binding": "ASSETS" },
+  // not_found_handling: SPA client-side routes (e.g. /jobs/1) aren't real
+  // files, so falling back to index.html lets the app's own router (see
+  // src/client/hooks/use-router.ts) handle the path instead of a raw 404.
+  "assets": { "directory": "./dist", "binding": "ASSETS", "not_found_handling": "single-page-application" },
 
   // Phase 4: uncomment for recurring-job generation + reminders (daily 6am UTC).
   // "triggers": { "crons": ["0 6 * * *"] },

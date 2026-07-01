@@ -12,7 +12,13 @@ export function JobDetail() {
     addJobNote, deleteJobNote, technicianLookup, isAgent,
     addChecklistItem, toggleChecklistItem, deleteChecklistItem,
     addJobMaterial, deleteJobMaterial, materials, createInvoiceFromJob,
+    currentUser,
   } = useApp();
+  // Technicians only have ownership of their own job's working fields
+  // server-side -- reassignment (customer_id/technician_id), invoicing, and
+  // deletion are all blocked for that role (see src/server/index.ts), so
+  // don't show controls that imply they can do those things.
+  const canManageJob = currentUser?.role !== "technician";
   const [noteText, setNoteText] = useState("");
   const [checklistText, setChecklistText] = useState("");
   const [showAddMaterial, setShowAddMaterial] = useState(false);
@@ -50,12 +56,16 @@ export function JobDetail() {
           <ArrowLeft size={16} /> Back
         </button>
         <div class="page-header-right">
-          <button class="btn" onClick={() => createInvoiceFromJob(job.id)}>
-            <FileText size={14} /> Create Invoice
-          </button>
-          <button class="btn btn-danger" onClick={() => deleteJob(job.id)}>
-            <Trash2 size={14} /> Delete
-          </button>
+          {canManageJob && (
+            <button class="btn" onClick={() => createInvoiceFromJob(job.id)}>
+              <FileText size={14} /> Create Invoice
+            </button>
+          )}
+          {canManageJob && (
+            <button class="btn btn-danger" onClick={() => deleteJob(job.id)}>
+              <Trash2 size={14} /> Delete
+            </button>
+          )}
         </div>
       </div>
 
@@ -246,21 +256,23 @@ export function JobDetail() {
             </div>
           </div>
 
-          <div class="detail-sidebar-section">
-            <h4>Assign Technician</h4>
-            <select
-              value={job.technician_id || ""}
-              onChange={(e) => {
-                const val = (e.target as HTMLSelectElement).value;
-                updateJob(job.id, { technician_id: val ? parseInt(val, 10) : null });
-              }}
-            >
-              <option value="">Unassigned</option>
-              {technicianLookup.map((t) => (
-                <option key={t.id} value={t.id}>{t.name}</option>
-              ))}
-            </select>
-          </div>
+          {canManageJob && (
+            <div class="detail-sidebar-section">
+              <h4>Assign Technician</h4>
+              <select
+                value={job.technician_id || ""}
+                onChange={(e) => {
+                  const val = (e.target as HTMLSelectElement).value;
+                  updateJob(job.id, { technician_id: val ? parseInt(val, 10) : null });
+                }}
+              >
+                <option value="">Unassigned</option>
+                {technicianLookup.map((t) => (
+                  <option key={t.id} value={t.id}>{t.name}</option>
+                ))}
+              </select>
+            </div>
+          )}
 
           {job.is_recurring === 1 && (
             <div class="detail-sidebar-section">

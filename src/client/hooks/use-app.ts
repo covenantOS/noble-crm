@@ -1,12 +1,13 @@
 import { useState, useCallback, useEffect } from "preact/hooks";
 import { api } from "../api";
+import { authClient } from "../auth-client";
 import type {
   Job, Customer, Technician, ServiceType, Material, Invoice, Stats, PaginatedState,
   CustomerLookup, TechnicianLookup, Priority,
 } from "../types";
-import type { AppContextValue } from "../context";
+import type { AppContextValue, CurrentUser } from "../context";
 
-export function useAppState(isAgent: boolean, navigate: (to: string) => void): AppContextValue {
+export function useAppState(isAgent: boolean, navigate: (to: string) => void, currentUser: CurrentUser | null): AppContextValue {
   const [stats, setStats] = useState<Stats>({ jobs: 0, customers: 0, technicians: 0, service_types: 0, today_jobs: 0, upcoming_jobs: 0, completed_jobs: 0, revenue: 0, invoices_outstanding: 0, invoices_overdue: 0 });
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -116,23 +117,21 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void): A
   useEffect(() => {
     (async () => {
       setLoading(true);
-      try {
-        await Promise.all([
-          fetchStats(),
-          fetchJobs(jobsPag, "", ""),
-          fetchCustomers(customersPag, ""),
-          fetchTechnicians(),
-          fetchServiceTypes(),
-          fetchMaterials(),
-          fetchInvoices(invoicesPag, ""),
-          fetchSchedule(scheduleStart, scheduleEnd),
-          fetchLookups(),
-        ]);
-      } catch (err) {
-        setError((err as Error).message);
-      } finally {
-        setLoading(false);
+      // Technicians are server-side 403'd on customers/technicians/invoices
+      // (whole resource families, see src/server/index.ts's technician role
+      // gate) -- skip those fetches entirely for that role rather than
+      // firing requests we already know will fail. Promise.allSettled (not
+      // Promise.all) so one unexpected failure doesn't blank out every
+      // other widget on the page.
+      const isTechnician = currentUser?.role === "technician";
+      const tasks = [fetchStats(), fetchJobs(jobsPag, "", ""), fetchServiceTypes(), fetchMaterials(), fetchSchedule(scheduleStart, scheduleEnd)];
+      if (!isTechnician) {
+        tasks.push(fetchCustomers(customersPag, ""), fetchTechnicians(), fetchInvoices(invoicesPag, ""), fetchLookups());
       }
+      const results = await Promise.allSettled(tasks);
+      const firstFailure = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+      if (firstFailure) setError((firstFailure.reason as Error).message);
+      setLoading(false);
     })();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -140,11 +139,16 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void): A
     fetchJobs(jobsPag, jobsSearch, jobsStatusFilter).catch((err) => setError((err as Error).message));
   }, [jobsPag.page, jobsSearch, jobsStatusFilter]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // These two also run on mount (a dependency array only skips *re-runs*
+  // where nothing changed, not the first run) -- same 403-family the
+  // initial-load effect above already guards against, so guard here too.
   useEffect(() => {
+    if (currentUser?.role === "technician") return;
     fetchCustomers(customersPag, customersSearch).catch((err) => setError((err as Error).message));
   }, [customersPag.page, customersSearch]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
+    if (currentUser?.role === "technician") return;
     fetchInvoices(invoicesPag, invoicesStatusFilter).catch((err) => setError((err as Error).message));
   }, [invoicesPag.page, invoicesStatusFilter]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -387,8 +391,15 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void): A
     setScheduleEnd(end);
   }, []);
 
+  // ── Auth ──
+
+  const logout = useCallback(async () => {
+    await authClient.signOut();
+  }, []);
+
   return {
     navigate, isAgent, stats,
+    currentUser, logout,
     jobs, jobsPag, setJobsPage, jobsSearch, setJobsSearch, jobsStatusFilter, setJobsStatusFilter,
     addJob, updateJob, deleteJob,
     selectedJob, selectJob, addJobNote, deleteJobNote,
