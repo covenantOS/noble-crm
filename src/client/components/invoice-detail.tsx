@@ -4,7 +4,7 @@ import { ACORN_FINANCE_URL, PAYMENT_TIERS, computePaymentAmount } from "../const
 import { NobleMark } from "./noble-mark";
 import { StatusBadge } from "./status-badge";
 import { formatDate, formatDateTime, formatMoney } from "../format";
-import { ArrowLeft, Trash2, ExternalLink, CreditCard } from "lucide-preact";
+import { ArrowLeft, Trash2, ExternalLink, CreditCard, Plus } from "lucide-preact";
 import type { InvoiceStatus, PaymentMethod } from "../types";
 
 const ALL_STATUSES: InvoiceStatus[] = ["draft", "sent", "paid", "overdue", "cancelled"];
@@ -19,12 +19,29 @@ const PAYMENT_METHOD_LABELS: Record<PaymentMethod, string> = {
 };
 
 export function InvoiceDetail() {
-  const { selectedInvoice: invoice, navigate, updateInvoice, deleteInvoice, brands, recordPayment, setError } = useApp();
+  const { selectedInvoice: invoice, navigate, updateInvoice, deleteInvoice, addInvoiceLine, deleteInvoiceLine, brands, recordPayment, setError } = useApp();
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("cash");
   const [customAmount, setCustomAmount] = useState("");
   const [recording, setRecording] = useState(false);
+  const [showAddLine, setShowAddLine] = useState(false);
+  const [lineDesc, setLineDesc] = useState("");
+  const [lineQty, setLineQty] = useState("1");
+  const [linePrice, setLinePrice] = useState("0");
 
   if (!invoice) return null;
+
+  const handleAddLine = async () => {
+    if (!lineDesc.trim()) return;
+    await addInvoiceLine(invoice.id, {
+      description: lineDesc.trim(),
+      quantity: parseFloat(lineQty) || 0,
+      unit_price: parseFloat(linePrice) || 0,
+    });
+    setLineDesc("");
+    setLineQty("1");
+    setLinePrice("0");
+    setShowAddLine(false);
+  };
 
   const tierAmount = computePaymentAmount(invoice.total, paymentMethod).amount;
 
@@ -123,7 +140,7 @@ export function InvoiceDetail() {
             <div class="card">
               <table class="table">
                 <thead>
-                  <tr><th>Description</th><th>Qty</th><th>Unit Price</th><th class="text-right">Total</th></tr>
+                  <tr><th>Description</th><th>Qty</th><th>Unit Price</th><th class="text-right">Total</th><th></th></tr>
                 </thead>
                 <tbody>
                   {(invoice.lines || []).map((line) => (
@@ -132,6 +149,11 @@ export function InvoiceDetail() {
                       <td>{line.quantity}</td>
                       <td class="money">{formatMoney(line.unit_price)}</td>
                       <td class="text-right money">{formatMoney(line.total)}</td>
+                      <td>
+                        <button class="btn-icon danger" onClick={() => deleteInvoiceLine(line.id, invoice.id)}>
+                          <Trash2 size={12} />
+                        </button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -139,20 +161,37 @@ export function InvoiceDetail() {
                   <tr>
                     <td colSpan={3} class="text-right text-muted">Subtotal</td>
                     <td class="text-right money">{formatMoney(invoice.subtotal)}</td>
+                    <td></td>
                   </tr>
                   {invoice.tax_rate > 0 && (
                     <tr>
                       <td colSpan={3} class="text-right text-muted">Tax ({invoice.tax_rate}%)</td>
                       <td class="text-right money">{formatMoney(invoice.tax_amount)}</td>
+                      <td></td>
                     </tr>
                   )}
                   <tr>
                     <td colSpan={3} class="text-right text-bold">Total</td>
                     <td class="text-right text-bold money" style={{ fontSize: 16 }}>{formatMoney(invoice.total)}</td>
+                    <td></td>
                   </tr>
                 </tfoot>
               </table>
             </div>
+
+            {showAddLine ? (
+              <div class="note-input-row" style={{ marginTop: 12 }}>
+                <input type="text" value={lineDesc} onInput={(e) => setLineDesc((e.target as HTMLInputElement).value)} placeholder="Description" style={{ flex: 2 }} />
+                <input type="number" step="0.01" min="0" value={lineQty} onInput={(e) => setLineQty((e.target as HTMLInputElement).value)} style={{ width: 70 }} placeholder="Qty" />
+                <input type="number" step="0.01" min="0" value={linePrice} onInput={(e) => setLinePrice((e.target as HTMLInputElement).value)} style={{ width: 90 }} placeholder="Unit Price" />
+                <button class="btn btn-primary btn-sm" onClick={handleAddLine}>Add</button>
+                <button class="btn btn-sm" onClick={() => setShowAddLine(false)}>Cancel</button>
+              </div>
+            ) : (
+              <button class="btn btn-sm" onClick={() => setShowAddLine(true)} style={{ marginTop: 8 }}>
+                <Plus size={14} /> Add Line
+              </button>
+            )}
 
             {/* Financing — tasteful on-brand gold chip near the totals */}
             <div style={{ marginTop: 12 }}>
@@ -253,6 +292,18 @@ export function InvoiceDetail() {
                 </button>
               ))}
             </div>
+          </div>
+
+          <div class="detail-sidebar-section">
+            <h4>Tax Rate (%)</h4>
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              max="100"
+              value={invoice.tax_rate}
+              onChange={(e) => updateInvoice(invoice.id, { tax_rate: parseFloat((e.target as HTMLInputElement).value) || 0 })}
+            />
           </div>
 
           <div class="detail-sidebar-section">

@@ -35,6 +35,13 @@ export const customers = sqliteTable('customers', {
   state: text('state').notNull().default(''),
   zip: text('zip').notNull().default(''),
   notes: text('notes').notNull().default(''),
+  // NEW (lead pipeline): where the customer sits in the sales funnel and how
+  // they came in. status is a required text enum-in-practice (lead|active|
+  // inactive) defaulting to 'lead' so every new customer starts as a lead;
+  // source is nullable (referral|google|repeat|website|other) since it may be
+  // unknown at creation. Neither auto-transitions -- the office sets them.
+  status: text('status').notNull().default('lead'),
+  source: text('source'),
   createdAt: text('created_at').default(nowTimestamp()),
   updatedAt: text('updated_at').default(nowTimestamp()),
   // NEW (Phase 5): map to a Stripe customer once payments are live.

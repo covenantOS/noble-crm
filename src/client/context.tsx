@@ -67,12 +67,17 @@ export interface AppContextValue {
   setCustomersPage: (page: number) => void;
   customersSearch: string;
   setCustomersSearch: (s: string) => void;
+  customersStatusFilter: string;
+  setCustomersStatusFilter: (s: string) => void;
   addCustomer: (data: Partial<Customer>) => Promise<void>;
   updateCustomer: (id: number, data: Partial<Customer>) => Promise<void>;
   deleteCustomer: (id: number) => Promise<void>;
   selectedCustomer: Customer | null;
   selectedCustomerJobs: Job[];
   selectCustomer: (id: number | null) => Promise<void>;
+  selectedCustomerEstimates: Estimate[];
+  selectedCustomerInvoices: Invoice[];
+  selectedCustomerOutstanding: number;
 
   // Technicians
   technicians: Technician[];
@@ -109,6 +114,8 @@ export interface AppContextValue {
   addInvoice: (data: { customer_id: number; job_id?: number | null; tax_rate?: number; notes?: string; due_date?: string; brand_id?: number | null; lines: { description: string; quantity: number; unit_price: number }[] }) => Promise<void>;
   updateInvoice: (id: number, data: Partial<Invoice>) => Promise<void>;
   deleteInvoice: (id: number) => Promise<void>;
+  addInvoiceLine: (invoiceId: number, line: { description: string; quantity: number; unit_price: number }) => Promise<void>;
+  deleteInvoiceLine: (lineId: number, invoiceId: number) => Promise<void>;
 
   // Payments
   recordPayment: (invoiceId: number, method: PaymentMethod, amount?: number) => Promise<Payment>;

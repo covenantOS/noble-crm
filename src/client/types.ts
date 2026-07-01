@@ -40,6 +40,9 @@ export interface Job {
   updated_at: string;
 }
 
+export type CustomerStatus = "lead" | "active" | "inactive";
+export type CustomerSource = "referral" | "google" | "repeat" | "website" | "other";
+
 export interface Customer {
   id: number;
   name: string;
@@ -50,6 +53,8 @@ export interface Customer {
   state: string;
   zip: string;
   notes: string;
+  status: CustomerStatus;
+  source: CustomerSource | null;
   job_count?: number;
   created_at: string;
   updated_at: string;

@@ -307,6 +307,7 @@ input, select, textarea, button { accent-color: var(--navy); }
 .status-badge[data-status="converted"] { background: #efe9f7; color: #6a4aa0; }
 .status-badge[data-status="active"] { background: var(--success-soft); color: var(--success); }
 .status-badge[data-status="inactive"] { background: #eef0f3; color: var(--text-muted); }
+.status-badge[data-status="lead"] { background: var(--info-soft); color: var(--info); }
 
 /* A bare button wrapper for a clickable status badge (active/inactive
    toggles) -- resets the native button chrome so only the badge shows. */

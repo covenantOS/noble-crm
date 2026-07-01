@@ -25,8 +25,12 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [customersPag, setCustomersPag] = useState<PaginatedState>({ page: 1, limit: 50, total: 0 });
   const [customersSearch, setCustomersSearch] = useState("");
+  const [customersStatusFilter, setCustomersStatusFilter] = useState("");
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
   const [selectedCustomerJobs, setSelectedCustomerJobs] = useState<Job[]>([]);
+  const [selectedCustomerEstimates, setSelectedCustomerEstimates] = useState<Estimate[]>([]);
+  const [selectedCustomerInvoices, setSelectedCustomerInvoices] = useState<Invoice[]>([]);
+  const [selectedCustomerOutstanding, setSelectedCustomerOutstanding] = useState(0);
 
   // Technicians, Service Types, Materials
   const [technicians, setTechnicians] = useState<Technician[]>([]);
@@ -86,9 +90,10 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     setJobsPag((prev) => ({ ...prev, total: data.total }));
   }, []);
 
-  const fetchCustomers = useCallback(async (pag: PaginatedState, search: string) => {
+  const fetchCustomers = useCallback(async (pag: PaginatedState, search: string, status = "") => {
     const params = new URLSearchParams({ page: String(pag.page), limit: String(pag.limit) });
     if (search) params.set("search", search);
+    if (status) params.set("status", status);
     const data = await api<{ customers: Customer[]; total: number }>("GET", `/api/customers?${params}`);
     setCustomers(data.customers);
     setCustomersPag((prev) => ({ ...prev, total: data.total }));
@@ -182,8 +187,8 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   // initial-load effect above already guards against, so guard here too.
   useEffect(() => {
     if (currentUser?.role === "technician") return;
-    fetchCustomers(customersPag, customersSearch).catch((err) => setError((err as Error).message));
-  }, [customersPag.page, customersSearch]); // eslint-disable-line react-hooks/exhaustive-deps
+    fetchCustomers(customersPag, customersSearch, customersStatusFilter).catch((err) => setError((err as Error).message));
+  }, [customersPag.page, customersSearch, customersStatusFilter]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (currentUser?.role === "technician") return;
@@ -309,37 +314,50 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
 
   const addCustomer = useCallback(async (data: Partial<Customer>) => {
     await api("POST", "/api/customers", data);
-    await fetchCustomers(customersPag, customersSearch);
+    await fetchCustomers(customersPag, customersSearch, customersStatusFilter);
     await Promise.all([fetchStats(), fetchLookups()]);
-  }, [customersPag, customersSearch, fetchCustomers, fetchStats, fetchLookups]);
+  }, [customersPag, customersSearch, customersStatusFilter, fetchCustomers, fetchStats, fetchLookups]);
 
   const updateCustomer = useCallback(async (id: number, data: Partial<Customer>) => {
     await api("PUT", `/api/customers/${id}`, data);
-    await fetchCustomers(customersPag, customersSearch);
+    await fetchCustomers(customersPag, customersSearch, customersStatusFilter);
     await fetchLookups();
     if (selectedCustomer && selectedCustomer.id === id) {
-      const res = await api<{ customer: Customer; jobs: Job[] }>("GET", `/api/customers/${id}`);
+      const res = await api<{ customer: Customer; jobs: Job[]; estimates: Estimate[]; invoices: Invoice[]; outstanding_balance: number }>("GET", `/api/customers/${id}`);
       setSelectedCustomer(res.customer);
       setSelectedCustomerJobs(res.jobs);
+      setSelectedCustomerEstimates(res.estimates);
+      setSelectedCustomerInvoices(res.invoices);
+      setSelectedCustomerOutstanding(res.outstanding_balance);
     }
-  }, [customersPag, customersSearch, selectedCustomer, fetchCustomers, fetchLookups]);
+  }, [customersPag, customersSearch, customersStatusFilter, selectedCustomer, fetchCustomers, fetchLookups]);
 
   const deleteCustomer = useCallback(async (id: number) => {
     await api("DELETE", `/api/customers/${id}`);
     if (selectedCustomer && selectedCustomer.id === id) {
       setSelectedCustomer(null);
       setSelectedCustomerJobs([]);
+      setSelectedCustomerEstimates([]);
+      setSelectedCustomerInvoices([]);
+      setSelectedCustomerOutstanding(0);
       navigate("/customers");
     }
-    await fetchCustomers(customersPag, customersSearch);
+    await fetchCustomers(customersPag, customersSearch, customersStatusFilter);
     await Promise.all([fetchStats(), fetchLookups()]);
-  }, [customersPag, customersSearch, selectedCustomer, navigate, fetchCustomers, fetchStats, fetchLookups]);
+  }, [customersPag, customersSearch, customersStatusFilter, selectedCustomer, navigate, fetchCustomers, fetchStats, fetchLookups]);
 
   const selectCustomer = useCallback(async (id: number | null) => {
-    if (id === null) { setSelectedCustomer(null); setSelectedCustomerJobs([]); return; }
-    const res = await api<{ customer: Customer; jobs: Job[] }>("GET", `/api/customers/${id}`);
+    if (id === null) {
+      setSelectedCustomer(null); setSelectedCustomerJobs([]);
+      setSelectedCustomerEstimates([]); setSelectedCustomerInvoices([]); setSelectedCustomerOutstanding(0);
+      return;
+    }
+    const res = await api<{ customer: Customer; jobs: Job[]; estimates: Estimate[]; invoices: Invoice[]; outstanding_balance: number }>("GET", `/api/customers/${id}`);
     setSelectedCustomer(res.customer);
     setSelectedCustomerJobs(res.jobs);
+    setSelectedCustomerEstimates(res.estimates);
+    setSelectedCustomerInvoices(res.invoices);
+    setSelectedCustomerOutstanding(res.outstanding_balance);
   }, []);
 
   // ── Technicians CRUD ──
@@ -476,6 +494,28 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     const res = await api<{ invoice: Invoice }>("GET", `/api/invoices/${id}`);
     setSelectedInvoice(res.invoice);
   }, []);
+
+  // ── Invoice line management ──
+
+  const addInvoiceLine = useCallback(async (invoiceId: number, line: { description: string; quantity: number; unit_price: number }) => {
+    await api("POST", `/api/invoices/${invoiceId}/lines`, line);
+    if (selectedInvoice && selectedInvoice.id === invoiceId) {
+      const res = await api<{ invoice: Invoice }>("GET", `/api/invoices/${invoiceId}`);
+      setSelectedInvoice(res.invoice);
+    }
+    await fetchInvoices(invoicesPag, invoicesStatusFilter);
+    await fetchStats();
+  }, [selectedInvoice, invoicesPag, invoicesStatusFilter, fetchInvoices, fetchStats]);
+
+  const deleteInvoiceLine = useCallback(async (lineId: number, invoiceId: number) => {
+    await api("DELETE", `/api/invoice-lines/${lineId}`);
+    if (selectedInvoice && selectedInvoice.id === invoiceId) {
+      const res = await api<{ invoice: Invoice }>("GET", `/api/invoices/${invoiceId}`);
+      setSelectedInvoice(res.invoice);
+    }
+    await fetchInvoices(invoicesPag, invoicesStatusFilter);
+    await fetchStats();
+  }, [selectedInvoice, invoicesPag, invoicesStatusFilter, fetchInvoices, fetchStats]);
 
   // ── Payments ──
 
@@ -626,14 +666,17 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     addChecklistItem, toggleChecklistItem, deleteChecklistItem,
     addJobMaterial, deleteJobMaterial, createInvoiceFromJob,
     customers, customersPag, setCustomersPage, customersSearch, setCustomersSearch,
+    customersStatusFilter, setCustomersStatusFilter,
     addCustomer, updateCustomer, deleteCustomer,
     selectedCustomer, selectedCustomerJobs, selectCustomer,
+    selectedCustomerEstimates, selectedCustomerInvoices, selectedCustomerOutstanding,
     technicians, addTechnician, updateTechnician, deleteTechnician,
     serviceTypes, addServiceType, updateServiceType, deleteServiceType,
     materials, addMaterial, updateMaterial, deleteMaterial,
     brands, addBrand, updateBrand, uploadBrandLogo,
     invoices, invoicesPag, setInvoicesPage, invoicesStatusFilter, setInvoicesStatusFilter,
     selectedInvoice, selectInvoice, addInvoice, updateInvoice, deleteInvoice,
+    addInvoiceLine, deleteInvoiceLine,
     recordPayment,
     jobAttachments, estimateAttachments, fetchJobAttachments, fetchEstimateAttachments,
     uploadAttachment, deleteAttachment,

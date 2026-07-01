@@ -75,6 +75,11 @@ const JOB_STATUSES = ["scheduled", "confirmed", "in_progress", "completed", "can
 const JOB_PRIORITIES = ["low", "normal", "high", "urgent"] as const;
 const INVOICE_STATUSES = ["draft", "sent", "paid", "overdue", "cancelled"] as const;
 const RECURRENCE_INTERVALS = ["weekly", "monthly", "quarterly", "annual"] as const;
+// Lead-pipeline value sets for the customers table. status is where the
+// customer sits in the sales funnel (defaults to 'lead'); source is how they
+// came in (nullable -- may be unknown). Neither auto-transitions.
+const CUSTOMER_STATUSES = ["lead", "active", "inactive"] as const;
+const CUSTOMER_SOURCES = ["referral", "google", "repeat", "website", "other"] as const;
 
 // The roles an admin may assign. 'pending' is included so an admin can revoke
 // access by parking a user back at pending; 'admin' is included so an admin
@@ -256,7 +261,7 @@ app.use("/api/*", async (c, next) => {
   if (path.startsWith("/api/technicians")) {
     return c.json({ error: "forbidden" }, 403);
   }
-  if (path.startsWith("/api/invoices") || /^\/api\/jobs\/[^/]+\/invoice$/.test(path)) {
+  if (path.startsWith("/api/invoices") || path.startsWith("/api/invoice-lines") || /^\/api\/jobs\/[^/]+\/invoice$/.test(path)) {
     return c.json({ error: "forbidden" }, 403);
   }
   // Estimates are a sales/estimating task (admin, office, estimator) --
@@ -388,6 +393,8 @@ const CustomerSchema = z.object({
   state: z.string(),
   zip: z.string(),
   notes: z.string(),
+  status: z.string(),
+  source: z.string().nullable(),
   job_count: z.number().int().optional(),
   created_at: z.string(),
   updated_at: z.string(),
@@ -669,9 +676,21 @@ app.openapi(getStats, async (c) => {
     .where(and(inArray(schema.jobs.status, ["scheduled", "confirmed"]), sql`${schema.jobs.scheduledDate} >= ${today}`))
     .get();
   const completedJobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs).where(eq(schema.jobs.status, "completed")).get();
-  const revenue = await db.select({ total: sql<number>`COALESCE(SUM(${schema.jobs.price}), 0)` }).from(schema.jobs).where(eq(schema.jobs.status, "completed")).get();
-  const invoicesOutstanding = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.invoices).where(inArray(schema.invoices.status, ["sent"])).get();
-  const invoicesOverdue = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.invoices).where(eq(schema.invoices.status, "overdue")).get();
+  // Revenue = money ACTUALLY collected: the sum of paid payments (net of
+  // discounts/surcharges, i.e. the real cash received), NOT completed-job
+  // prices (which are pre-invoice, tax-exclusive, and ignore whether anyone
+  // actually paid).
+  const revenue = await db.select({ total: sql<number>`COALESCE(SUM(${schema.payments.amount}), 0)` }).from(schema.payments).where(eq(schema.payments.status, "paid")).get();
+  // Overdue = already flipped to "overdue" OR still "sent" but past its due
+  // date. Computed as a pure COUNT here (no write) so a dashboard load stays
+  // idempotent -- the actual status flip happens in the scheduled() cron via
+  // updateOverdueInvoices(). Outstanding excludes those now-overdue sent ones.
+  const invoicesOutstanding = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.invoices)
+    .where(and(eq(schema.invoices.status, "sent"), sql`NOT (${schema.invoices.dueDate} != '' AND ${schema.invoices.dueDate} < ${today})`))
+    .get();
+  const invoicesOverdue = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.invoices)
+    .where(sql`${schema.invoices.status} = 'overdue' OR (${schema.invoices.status} = 'sent' AND ${schema.invoices.dueDate} != '' AND ${schema.invoices.dueDate} < ${today})`)
+    .get();
   return c.json({
     jobs: jobs?.count || 0,
     customers: customers?.count || 0,
@@ -1438,6 +1457,7 @@ const listCustomers = createRoute({
       page: z.string().optional(),
       limit: z.string().optional(),
       search: z.string().optional(),
+      status: z.string().optional(),
     }),
   },
   responses: {
@@ -1455,16 +1475,20 @@ app.openapi(listCustomers, async (c) => {
   const limit = parseInt(q.limit || "50", 10);
   const offset = (page - 1) * limit;
 
-  let where = undefined;
+  const conditions = [];
   if (q.search) {
     const s = `%${q.search}%`;
-    where = or(
+    conditions.push(or(
       like(schema.customers.name, s),
       like(schema.customers.email, s),
       like(schema.customers.phone, s),
       like(schema.customers.address, s),
-    );
+    ));
   }
+  if (q.status) {
+    conditions.push(eq(schema.customers.status, q.status));
+  }
+  const where = conditions.length > 0 ? and(...conditions) : undefined;
 
   const countRow = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.customers).where(where).get();
 
@@ -1486,6 +1510,8 @@ app.openapi(listCustomers, async (c) => {
       state: schema.customers.state,
       zip: schema.customers.zip,
       notes: schema.customers.notes,
+      status: schema.customers.status,
+      source: schema.customers.source,
       created_at: sql<string>`COALESCE(${schema.customers.createdAt}, '')`,
       updated_at: sql<string>`COALESCE(${schema.customers.updatedAt}, '')`,
       job_count: sql<number>`COALESCE(${jobCountSub.cnt}, 0)`,
@@ -1527,7 +1553,13 @@ const getCustomer = createRoute({
   path: "/api/customers/{id}",
   request: { params: IdParam },
   responses: {
-    200: { description: "Customer detail", content: { "application/json": { schema: z.object({ customer: CustomerSchema, jobs: z.array(JobSchema) }) } } },
+    200: { description: "Customer detail", content: { "application/json": { schema: z.object({
+      customer: CustomerSchema,
+      jobs: z.array(JobSchema),
+      estimates: z.array(EstimateSchema),
+      invoices: z.array(z.any()),
+      outstanding_balance: z.number(),
+    }) } } },
     404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
@@ -1548,6 +1580,8 @@ app.openapi(getCustomer, async (c) => {
     state: customer.state,
     zip: customer.zip,
     notes: customer.notes,
+    status: customer.status,
+    source: customer.source,
     created_at: customer.createdAt ?? "",
     updated_at: customer.updatedAt ?? "",
   };
@@ -1589,7 +1623,64 @@ app.openapi(getCustomer, async (c) => {
     .orderBy(desc(schema.jobs.scheduledDate))
     .limit(50)
     .all();
-  return c.json({ customer: customerOut, jobs }, 200);
+
+  // ── Money rollup: this customer's estimates + invoices, plus the total
+  // outstanding balance across invoices that aren't fully paid/cancelled. ──
+  const estimates = await estimateJoinedSelect(db)
+    .where(eq(schema.estimates.customerId, idNum))
+    .orderBy(desc(schema.estimates.createdAt))
+    .all();
+
+  const invoices = await db
+    .select({
+      id: schema.invoices.id,
+      identifier: schema.invoices.identifier,
+      customer_id: schema.invoices.customerId,
+      job_id: schema.invoices.jobId,
+      status: schema.invoices.status,
+      subtotal: schema.invoices.subtotal,
+      tax_rate: schema.invoices.taxRate,
+      tax_amount: schema.invoices.taxAmount,
+      total: schema.invoices.total,
+      notes: schema.invoices.notes,
+      due_date: schema.invoices.dueDate,
+      paid_date: schema.invoices.paidDate,
+      created_at: schema.invoices.createdAt,
+      updated_at: schema.invoices.updatedAt,
+      brand_id: schema.invoices.brandId,
+      brand_name: schema.brands.name,
+      brand_color_primary: schema.brands.colorPrimary,
+      brand_color_secondary: schema.brands.colorSecondary,
+    })
+    .from(schema.invoices)
+    .leftJoin(schema.brands, eq(schema.invoices.brandId, schema.brands.id))
+    .where(eq(schema.invoices.customerId, idNum))
+    .orderBy(desc(schema.invoices.createdAt))
+    .all();
+
+  // Outstanding balance = sum of the still-owed portion of every invoice that
+  // is sent/overdue/draft (i.e. not fully paid and not cancelled). Per-invoice
+  // owed = total - raw credit already collected (amount - surcharge for each
+  // paid payment, mirroring recordPayment's raw-credit accounting), floored at 0.
+  const paidPayments = await db
+    .select({ invoiceId: schema.payments.invoiceId, amount: schema.payments.amount, surchargeAmount: schema.payments.surchargeAmount })
+    .from(schema.payments)
+    .leftJoin(schema.invoices, eq(schema.payments.invoiceId, schema.invoices.id))
+    .where(and(eq(schema.invoices.customerId, idNum), eq(schema.payments.status, "paid")))
+    .all();
+  const rawCreditByInvoice = new Map<number, number>();
+  for (const p of paidPayments) {
+    const prev = rawCreditByInvoice.get(p.invoiceId) || 0;
+    rawCreditByInvoice.set(p.invoiceId, prev + ((p.amount || 0) - (p.surchargeAmount || 0)));
+  }
+  let outstandingBalance = 0;
+  for (const inv of invoices) {
+    if (inv.status === "paid" || inv.status === "cancelled") continue;
+    const owed = (inv.total || 0) - (rawCreditByInvoice.get(inv.id) || 0);
+    if (owed > 0) outstandingBalance += owed;
+  }
+
+  return c.json({ customer: customerOut, jobs, estimates, invoices, outstanding_balance: outstandingBalance }, 200);
 });
 
 const createCustomer = createRoute({
@@ -1606,6 +1697,10 @@ const createCustomer = createRoute({
         state: z.string().optional(),
         zip: z.string().optional(),
         notes: z.string().optional(),
+        // Lead pipeline: status defaults to 'lead' when omitted; source is
+        // optional and may be explicitly null (unknown).
+        status: z.enum(CUSTOMER_STATUSES).optional(),
+        source: z.enum(CUSTOMER_SOURCES).nullable().optional(),
       }) } },
     },
   },
@@ -1626,6 +1721,8 @@ app.openapi(createCustomer, async (c) => {
     state: data.state || "",
     zip: data.zip || "",
     notes: data.notes || "",
+    status: data.status || "lead",
+    source: data.source ?? null,
   });
   const customer = await db.select().from(schema.customers).orderBy(desc(schema.customers.id)).limit(1).get();
   const customerOut = {
@@ -1638,6 +1735,8 @@ app.openapi(createCustomer, async (c) => {
     state: customer!.state,
     zip: customer!.zip,
     notes: customer!.notes,
+    status: customer!.status,
+    source: customer!.source,
     created_at: customer!.createdAt ?? "",
     updated_at: customer!.updatedAt ?? "",
   };
@@ -1661,6 +1760,8 @@ const updateCustomer = createRoute({
         state: z.string().optional(),
         zip: z.string().optional(),
         notes: z.string().optional(),
+        status: z.enum(CUSTOMER_STATUSES).optional(),
+        source: z.enum(CUSTOMER_SOURCES).nullable().optional(),
       }) } },
     },
   },
@@ -1683,6 +1784,8 @@ app.openapi(updateCustomer, async (c) => {
   if (data.state !== undefined) updates.state = data.state;
   if (data.zip !== undefined) updates.zip = data.zip;
   if (data.notes !== undefined) updates.notes = data.notes;
+  if (data.status !== undefined) updates.status = data.status;
+  if (data.source !== undefined) updates.source = data.source;
   if (Object.keys(updates).length > 0) {
     updates.updatedAt = sql`(datetime('now'))`;
     await db.update(schema.customers).set(updates).where(eq(schema.customers.id, toId(id)));
@@ -2815,6 +2918,20 @@ app.openapi(createInvoice, async (c) => {
   return c.json(result!, 201);
 });
 
+// Recomputes and persists an invoice's subtotal/tax_amount/total from its
+// current set of invoice_lines rows, mirroring recomputeEstimateTotals. Called
+// after any line add/delete so the parent invoice's totals never drift from
+// its line items.
+async function recomputeInvoiceTotals(db: ReturnType<typeof getDb>, invoiceId: number) {
+  const lines = await db.select({ total: schema.invoiceLines.total }).from(schema.invoiceLines).where(eq(schema.invoiceLines.invoiceId, invoiceId)).all();
+  const subtotal = lines.reduce((sum, l) => sum + (l.total || 0), 0);
+  const invoice = await db.select({ taxRate: schema.invoices.taxRate }).from(schema.invoices).where(eq(schema.invoices.id, invoiceId)).get();
+  const taxRate = invoice?.taxRate || 0;
+  const taxAmount = subtotal * (taxRate / 100);
+  const total = subtotal + taxAmount;
+  await db.update(schema.invoices).set({ subtotal, taxAmount, total, updatedAt: sql`(datetime('now'))` }).where(eq(schema.invoices.id, invoiceId));
+}
+
 const updateInvoice = createRoute({
   method: "put",
   path: "/api/invoices/{id}",
@@ -2827,29 +2944,53 @@ const updateInvoice = createRoute({
       // any non-empty value must be a real calendar date.
       due_date: z.union([z.literal(""), zDate]).optional(),
       paid_date: z.union([z.literal(""), zDate]).optional(),
+      // Editable tax rate (0-100). invoiceFromJob defaults tax_rate to 0; this
+      // lets the office add real tax after the invoice exists. Recomputes
+      // tax_amount/total from the current lines-derived subtotal.
+      tax_rate: zTaxRate.optional(),
       brand_id: z.number().int().nullable().optional(),
     }) } } },
   },
   responses: {
     200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
     400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Locked invoice", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(updateInvoice, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
+  const idNum = toId(id);
   const data = c.req.valid("json");
   if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
+  const existing = await db.select({ subtotal: schema.invoices.subtotal, status: schema.invoices.status }).from(schema.invoices).where(eq(schema.invoices.id, idNum)).get();
+  if (!existing) return c.json({ error: "Invoice not found" }, 404);
+  // Don't let a money-affecting edit (tax rate) silently desync a paid or
+  // cancelled invoice's total from the payment(s) already recorded against it.
+  if (data.tax_rate !== undefined && (existing.status === "paid" || existing.status === "cancelled")) {
+    return c.json({ error: `Cannot change the tax rate on a ${existing.status} invoice.` }, 409);
+  }
   const updates: Record<string, unknown> = {};
   if (data.status !== undefined) updates.status = data.status;
   if (data.notes !== undefined) updates.notes = data.notes;
   if (data.due_date !== undefined) updates.dueDate = data.due_date;
   if (data.paid_date !== undefined) updates.paidDate = data.paid_date;
   if (data.brand_id !== undefined) updates.brandId = data.brand_id;
+  // Recompute tax_amount/total if tax_rate changes -- subtotal stays derived
+  // from lines (this route never touches lines directly), so reuse the
+  // existing subtotal, exactly like updateEstimate does.
+  if (data.tax_rate !== undefined) {
+    const subtotal = existing.subtotal || 0;
+    const taxAmount = subtotal * (data.tax_rate / 100);
+    updates.taxRate = data.tax_rate;
+    updates.taxAmount = taxAmount;
+    updates.total = subtotal + taxAmount;
+  }
   if (Object.keys(updates).length > 0) {
     updates.updatedAt = sql`(datetime('now'))`;
-    await db.update(schema.invoices).set(updates).where(eq(schema.invoices.id, toId(id)));
+    await db.update(schema.invoices).set(updates).where(eq(schema.invoices.id, idNum));
   }
   return c.json({ ok: true }, 200);
 });
@@ -3105,6 +3246,80 @@ app.openapi(invoiceFromJob, async (c) => {
   }
 
   return c.json({ ok: true, invoice_id: inv!.id }, 201);
+});
+
+// ── Invoice line management ────────────────────────────────────────
+// Mirrors the estimate line routes (add/delete + recompute). Technicians are
+// already 403'd on the whole /api/invoices family by the blanket role-gate,
+// so no per-route role check is needed here.
+
+const addInvoiceLine = createRoute({
+  method: "post",
+  path: "/api/invoices/{id}/lines",
+  request: {
+    params: IdParam,
+    body: { content: { "application/json": { schema: z.object({
+      description: zName,
+      quantity: zPositive,
+      unit_price: zMoney,
+    }) } } },
+  },
+  responses: {
+    201: { description: "Line added", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Locked", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(addInvoiceLine, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const invoice = await db.select({ id: schema.invoices.id, status: schema.invoices.status }).from(schema.invoices).where(eq(schema.invoices.id, idNum)).get();
+  if (!invoice) return c.json({ error: "Invoice not found" }, 404);
+  if (invoice.status === "paid" || invoice.status === "cancelled") {
+    return c.json({ error: `Cannot add a line to a ${invoice.status} invoice.` }, 409);
+  }
+  const data = c.req.valid("json");
+  const lineTotal = data.quantity * data.unit_price;
+  await db.insert(schema.invoiceLines).values({
+    invoiceId: idNum,
+    description: data.description,
+    quantity: data.quantity,
+    unitPrice: data.unit_price,
+    total: lineTotal,
+  });
+  await recomputeInvoiceTotals(db, idNum);
+  return c.json({ ok: true }, 201);
+});
+
+const deleteInvoiceLine = createRoute({
+  method: "delete",
+  path: "/api/invoice-lines/{id}",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Deleted", content: { "application/json": { schema: OkSchema } } },
+    409: { description: "Locked invoice", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(deleteInvoiceLine, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const line = await db.select({ invoiceId: schema.invoiceLines.invoiceId }).from(schema.invoiceLines).where(eq(schema.invoiceLines.id, idNum)).get();
+  if (line) {
+    const inv = await db.select({ status: schema.invoices.status }).from(schema.invoices).where(eq(schema.invoices.id, line.invoiceId)).get();
+    if (inv && (inv.status === "paid" || inv.status === "cancelled")) {
+      return c.json({ error: `Cannot remove a line from a ${inv.status} invoice.` }, 409);
+    }
+  }
+  await db.delete(schema.invoiceLines).where(eq(schema.invoiceLines.id, idNum));
+  if (line) {
+    await recomputeInvoiceTotals(db, line.invoiceId);
+  }
+  return c.json({ ok: true }, 200);
 });
 
 // ── Estimates ──────────────────────────────────────────────────────
@@ -3482,6 +3697,7 @@ const addEstimateLine = createRoute({
     201: { description: "Line added", content: { "application/json": { schema: OkSchema } } },
     400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
     404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Locked", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -3564,6 +3780,23 @@ app.openapi(convertEstimate, async (c) => {
   const jobIdentifier = await nextIdentifier(db);
   // Default the new job to today in Tampa (America/New_York), not UTC.
   const today = todayInTampa();
+  // The job carries the PRE-TAX subtotal, never the tax-inclusive total --
+  // tax lives on the invoice, not the job (the invoice below keeps the full
+  // subtotal/tax/total breakdown). Baking tax into job.price would
+  // double-count it and inflate every job-price-based figure.
+  const jobPrice = estimate.subtotal || 0;
+  // Copy the customer's address onto the job, same address-from-customer
+  // fallback createJob uses -- an estimate has no address of its own, so
+  // without this the converted job would have a blank address.
+  let jobAddress = "";
+  const cust = await db
+    .select({ address: schema.customers.address, city: schema.customers.city, state: schema.customers.state, zip: schema.customers.zip })
+    .from(schema.customers)
+    .where(eq(schema.customers.id, estimate.customerId))
+    .get();
+  if (cust) {
+    jobAddress = [cust.address, cust.city, cust.state, cust.zip].filter(Boolean).join(", ");
+  }
   await db.insert(schema.jobs).values({
     identifier: jobIdentifier,
     customerId: estimate.customerId,
@@ -3572,7 +3805,8 @@ app.openapi(convertEstimate, async (c) => {
     scheduledDate: today,
     scheduledTime: "09:00",
     duration: 60,
-    price: estimate.total || 0,
+    price: jobPrice,
+    address: jobAddress,
     notes: estimate.notes || "",
     brandId: estimate.brandId ?? null,
   });
@@ -3817,6 +4051,27 @@ function advanceByInterval(dateStr: string, interval: (typeof SERVICE_AGREEMENT_
   return dt.toISOString().split("T")[0];
 }
 
+// Flips any invoice that is still "sent" but whose due_date is strictly before
+// today (Tampa) to "overdue". Called from the scheduled() cron so overdue
+// status is kept current without manual intervention, and reused by the stats
+// route (flip-then-count) so the dashboard's Overdue tile reflects reality
+// rather than always showing 0. A blank/missing due_date is never overdue
+// (COALESCE to '' and the `<> ''` guard skip those). Returns how many flipped.
+async function updateOverdueInvoices(env: AppBindings["Bindings"]): Promise<number> {
+  const db = getDb(env);
+  const today = todayInTampa();
+  const res = await db
+    .update(schema.invoices)
+    .set({ status: "overdue", updatedAt: sql`(datetime('now'))` })
+    .where(and(
+      eq(schema.invoices.status, "sent"),
+      sql`COALESCE(${schema.invoices.dueDate}, '') <> ''`,
+      sql`${schema.invoices.dueDate} < ${today}`,
+    ));
+  // D1's run result exposes meta.changes; fall back to 0 if unavailable.
+  return (res as unknown as { meta?: { changes?: number } })?.meta?.changes ?? 0;
+}
+
 // Shared logic used by BOTH the scheduled() cron handler and the manual
 // POST /api/service-agreements/run-due-now route below, so the two can never
 // drift out of sync and the manual route is a faithful stand-in for testing
@@ -3996,14 +4251,19 @@ export default {
 
   // Daily 6am UTC (see wrangler.jsonc's triggers.crons) -- generates jobs
   // for any active service_agreements whose next_run_date has arrived and
-  // advances each one to its next due date. Shares processDueServiceAgreements
-  // with the manual POST /api/service-agreements/run-due-now route above so
-  // both paths run identical logic.
+  // advances each one to its next due date, AND flips any now-past-due "sent"
+  // invoices to "overdue". Shares processDueServiceAgreements/
+  // updateOverdueInvoices with the manual POST /api/service-agreements/
+  // run-due-now route and the stats route respectively so all paths run
+  // identical logic.
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil(
-      processDueServiceAgreements(env).then((result) => {
+      (async () => {
+        const result = await processDueServiceAgreements(env);
         console.log(`[scheduled] processed ${result.processed} due service agreement(s), created jobs: ${result.created_job_ids.join(", ") || "none"}`);
-      })
+        const flipped = await updateOverdueInvoices(env);
+        console.log(`[scheduled] flipped ${flipped} invoice(s) to overdue`);
+      })()
     );
   },
 

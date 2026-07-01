@@ -14,6 +14,8 @@ export function CreateJob({ onClose }: { onClose: () => void }) {
   const [scheduledDate, setScheduledDate] = useState(today);
   const [scheduledTime, setScheduledTime] = useState("09:00");
   const [priority, setPriority] = useState("normal");
+  const [price, setPrice] = useState("");
+  const [duration, setDuration] = useState("");
   const [address, setAddress] = useState("");
   const [notes, setNotes] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -32,6 +34,10 @@ export function CreateJob({ onClose }: { onClose: () => void }) {
         scheduled_date: scheduledDate,
         scheduled_time: scheduledTime,
         priority: priority as "low" | "normal" | "high" | "urgent",
+        // Only send price/duration when the user entered them -- leaving them
+        // blank lets the server default from the chosen service type.
+        ...(price.trim() ? { price: parseFloat(price) } : {}),
+        ...(duration.trim() ? { duration: parseInt(duration, 10) } : {}),
         address,
         notes,
       });
@@ -104,6 +110,14 @@ export function CreateJob({ onClose }: { onClose: () => void }) {
             <div class="form-group">
               <label>Time</label>
               <input type="time" value={scheduledTime} onChange={(e) => setScheduledTime((e.target as HTMLInputElement).value)} />
+            </div>
+            <div class="form-group">
+              <label>Price (blank = service default)</label>
+              <input type="number" step="0.01" min="0" value={price} onInput={(e) => setPrice((e.target as HTMLInputElement).value)} placeholder="0.00" />
+            </div>
+            <div class="form-group">
+              <label>Duration (min, blank = service default)</label>
+              <input type="number" step="1" min="1" value={duration} onInput={(e) => setDuration((e.target as HTMLInputElement).value)} placeholder="60" />
             </div>
             <div class="form-group full-width">
               <label>Address (leave blank to use customer address)</label>

@@ -1,12 +1,14 @@
 import { useState } from "preact/hooks";
 import { useApp } from "../context";
 import { CreateCustomer } from "./create-customer";
+import { StatusBadge } from "./status-badge";
 import { Pagination } from "./pagination";
 import { Plus, Search, Trash2 } from "lucide-preact";
 
 export function CustomerList() {
   const {
     customers, customersPag, setCustomersPage, customersSearch, setCustomersSearch,
+    customersStatusFilter, setCustomersStatusFilter,
     navigate, deleteCustomer, isAgent,
   } = useApp();
   const [showCreate, setShowCreate] = useState(false);
@@ -30,6 +32,12 @@ export function CustomerList() {
             onInput={(e) => setCustomersSearch((e.target as HTMLInputElement).value)}
           />
         </div>
+        <select value={customersStatusFilter} onChange={(e) => { setCustomersStatusFilter((e.target as HTMLSelectElement).value); setCustomersPage(1); }}>
+          <option value="">All statuses</option>
+          <option value="lead">Lead</option>
+          <option value="active">Active</option>
+          <option value="inactive">Inactive</option>
+        </select>
       </div>
 
       <div class="card">
@@ -45,6 +53,7 @@ export function CustomerList() {
             <thead>
               <tr>
                 <th>Name</th>
+                <th>Status</th>
                 <th>Phone</th>
                 <th>Email</th>
                 <th>Address</th>
@@ -56,6 +65,7 @@ export function CustomerList() {
               {customers.filter((c) => c.name && c.name.trim()).map((c) => (
                 <tr key={c.id} class="table-row clickable" onClick={() => navigate(`/customers/${c.id}`)}>
                   <td class="text-bold">{c.name}</td>
+                  <td><StatusBadge status={c.status} /></td>
                   <td class="text-muted">{c.phone || "—"}</td>
                   <td class="text-muted">{c.email || "—"}</td>
                   <td class="text-muted">{[c.address, c.city, c.state].filter(Boolean).join(", ") || "—"}</td>

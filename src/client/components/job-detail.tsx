@@ -2,8 +2,10 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import { useApp } from "../context";
 import { StatusBadge, PriorityBadge } from "./status-badge";
 import { formatDate, formatTime, formatDuration, formatDateTime, formatMoney } from "../format";
-import { ArrowLeft, Trash2, Send, MapPin, Clock, DollarSign, User, Wrench, Plus, X, CheckSquare, Square, Package, FileText, Palette, Camera } from "lucide-preact";
-import type { AttachmentKind, JobStatus } from "../types";
+import { ArrowLeft, Trash2, Send, MapPin, Clock, DollarSign, User, Wrench, Plus, X, CheckSquare, Square, Package, FileText, Palette, Camera, Edit3, Save, CheckCircle } from "lucide-preact";
+import type { AttachmentKind, JobStatus, Priority } from "../types";
+
+const PRIORITIES: Priority[] = ["low", "normal", "high", "urgent"];
 
 // Internal reminder-note plumbing that should never surface to a user (the
 // notification provider isn't wired up yet, so these placeholder notes are
@@ -18,7 +20,7 @@ export function JobDetail() {
     addJobNote, deleteJobNote, technicianLookup, isAgent,
     addChecklistItem, toggleChecklistItem, deleteChecklistItem,
     addJobMaterial, deleteJobMaterial, materials, createInvoiceFromJob,
-    currentUser, brands,
+    currentUser, brands, serviceTypes,
     jobAttachments, fetchJobAttachments, uploadAttachment, deleteAttachment,
   } = useApp();
   // Technicians only have ownership of their own job's working fields
@@ -35,11 +37,59 @@ export function JobDetail() {
   const afterFileInput = useRef<HTMLInputElement>(null);
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
 
+  // Editable job-details panel (price/date/time/duration/priority/service).
+  const [editingDetails, setEditingDetails] = useState(false);
+  const [detailsForm, setDetailsForm] = useState({
+    price: "", scheduled_date: "", scheduled_time: "", duration: "", priority: "normal", service_type_id: "",
+  });
+
+  // Completion flow.
+  const [showComplete, setShowComplete] = useState(false);
+  const [completionNotesInput, setCompletionNotesInput] = useState("");
+  const [completing, setCompleting] = useState(false);
+
   useEffect(() => {
     if (job) fetchJobAttachments(job.id);
   }, [job?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!job) return null;
+
+  const startEditDetails = () => {
+    setDetailsForm({
+      price: String(job.price ?? ""),
+      scheduled_date: job.scheduled_date || "",
+      scheduled_time: job.scheduled_time || "",
+      duration: String(job.duration ?? ""),
+      priority: job.priority || "normal",
+      service_type_id: job.service_type_id != null ? String(job.service_type_id) : "",
+    });
+    setEditingDetails(true);
+  };
+
+  const saveDetails = async () => {
+    await updateJob(job.id, {
+      price: parseFloat(detailsForm.price) || 0,
+      scheduled_date: detailsForm.scheduled_date,
+      scheduled_time: detailsForm.scheduled_time,
+      duration: parseInt(detailsForm.duration, 10) || 60,
+      priority: detailsForm.priority as Priority,
+      service_type_id: detailsForm.service_type_id ? parseInt(detailsForm.service_type_id, 10) : null,
+    });
+    setEditingDetails(false);
+  };
+
+  const handleComplete = async () => {
+    setCompleting(true);
+    try {
+      await updateJob(job.id, { status: "completed", completion_notes: completionNotesInput.trim() });
+      setShowComplete(false);
+      setCompletionNotesInput("");
+    } finally {
+      setCompleting(false);
+    }
+  };
+
+  const canComplete = job.status !== "completed" && job.status !== "cancelled";
 
   const handlePhotoSelected = async (kind: AttachmentKind, e: Event) => {
     const input = e.target as HTMLInputElement;
@@ -83,6 +133,11 @@ export function JobDetail() {
           <ArrowLeft size={16} /> Back
         </button>
         <div class="page-header-right">
+          {canComplete && (
+            <button class="btn btn-primary" onClick={() => { setCompletionNotesInput(job.completion_notes || ""); setShowComplete(true); }}>
+              <CheckCircle size={14} /> Complete Job
+            </button>
+          )}
           {canManageJob && (
             <button class="btn" onClick={() => createInvoiceFromJob(job.id)}>
               <FileText size={14} /> Create Invoice
@@ -95,6 +150,26 @@ export function JobDetail() {
           )}
         </div>
       </div>
+
+      {showComplete && (
+        <div class="card" style={{ padding: 14, marginBottom: 16, borderColor: "var(--success)" }}>
+          <h3 style={{ marginTop: 0 }}><CheckCircle size={16} style={{ verticalAlign: "text-bottom" }} /> Complete Job</h3>
+          <p class="text-muted" style={{ marginTop: 0 }}>Mark this job completed and record what was done.</p>
+          <textarea
+            rows={3}
+            style={{ width: "100%" }}
+            value={completionNotesInput}
+            onInput={(e) => setCompletionNotesInput((e.target as HTMLTextAreaElement).value)}
+            placeholder="Completion notes (work performed, results, follow-ups)..."
+          />
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <button class="btn btn-primary" onClick={handleComplete} disabled={completing}>
+              {completing ? "Saving..." : "Mark Completed"}
+            </button>
+            <button class="btn" onClick={() => setShowComplete(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
 
       <div class="detail-layout">
         <div class="detail-main">
@@ -165,6 +240,13 @@ export function JobDetail() {
             <div class="detail-section">
               <h3>Notes</h3>
               <p class="detail-notes">{job.notes}</p>
+            </div>
+          )}
+
+          {job.completion_notes && (
+            <div class="detail-section">
+              <h3><CheckCircle size={16} style={{ verticalAlign: "text-bottom" }} /> Completion</h3>
+              <p class="detail-notes">{job.completion_notes}</p>
             </div>
           )}
 
@@ -312,6 +394,65 @@ export function JobDetail() {
         </div>
 
         <div class="detail-sidebar">
+          {/* Editable details -- price/schedule/duration/priority/service.
+              Available to technicians on their own job too (working fields);
+              only reassignment + brand stay office-only below. */}
+          <div class="detail-sidebar-section">
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <h4 style={{ margin: 0 }}>Details</h4>
+              {editingDetails ? (
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button class="btn btn-sm" onClick={() => setEditingDetails(false)}><X size={12} /></button>
+                  <button class="btn btn-primary btn-sm" onClick={saveDetails}><Save size={12} /></button>
+                </div>
+              ) : (
+                <button class="btn btn-sm" onClick={startEditDetails}><Edit3 size={12} /> Edit</button>
+              )}
+            </div>
+            {editingDetails ? (
+              <div class="form-grid" style={{ marginTop: 10 }}>
+                <div class="form-group full-width">
+                  <label>Price</label>
+                  <input type="number" step="0.01" min="0" value={detailsForm.price} onInput={(e) => setDetailsForm({ ...detailsForm, price: (e.target as HTMLInputElement).value })} />
+                </div>
+                <div class="form-group full-width">
+                  <label>Date</label>
+                  <input type="date" value={detailsForm.scheduled_date} onChange={(e) => setDetailsForm({ ...detailsForm, scheduled_date: (e.target as HTMLInputElement).value })} />
+                </div>
+                <div class="form-group full-width">
+                  <label>Time</label>
+                  <input type="time" value={detailsForm.scheduled_time} onChange={(e) => setDetailsForm({ ...detailsForm, scheduled_time: (e.target as HTMLInputElement).value })} />
+                </div>
+                <div class="form-group full-width">
+                  <label>Duration (min)</label>
+                  <input type="number" step="1" min="1" value={detailsForm.duration} onInput={(e) => setDetailsForm({ ...detailsForm, duration: (e.target as HTMLInputElement).value })} />
+                </div>
+                <div class="form-group full-width">
+                  <label>Priority</label>
+                  <select value={detailsForm.priority} onChange={(e) => setDetailsForm({ ...detailsForm, priority: (e.target as HTMLSelectElement).value })}>
+                    {PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
+                  </select>
+                </div>
+                <div class="form-group full-width">
+                  <label>Service Type</label>
+                  <select value={detailsForm.service_type_id} onChange={(e) => setDetailsForm({ ...detailsForm, service_type_id: (e.target as HTMLSelectElement).value })}>
+                    <option value="">None</option>
+                    {serviceTypes.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                  </select>
+                </div>
+              </div>
+            ) : (
+              <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 10 }}>
+                <div class="detail-meta-item"><span class="detail-meta-label">Price</span><span class="money">{formatMoney(job.price)}</span></div>
+                <div class="detail-meta-item"><span class="detail-meta-label">Date</span><span>{formatDate(job.scheduled_date)}</span></div>
+                <div class="detail-meta-item"><span class="detail-meta-label">Time</span><span>{formatTime(job.scheduled_time)}</span></div>
+                <div class="detail-meta-item"><span class="detail-meta-label">Duration</span><span>{formatDuration(job.duration)}</span></div>
+                <div class="detail-meta-item"><span class="detail-meta-label">Priority</span><span style={{ textTransform: "capitalize" }}>{job.priority}</span></div>
+                <div class="detail-meta-item"><span class="detail-meta-label">Service</span><span>{job.service_type_name || "—"}</span></div>
+              </div>
+            )}
+          </div>
+
           <div class="detail-sidebar-section">
             <h4>Status</h4>
             <div class="status-buttons">

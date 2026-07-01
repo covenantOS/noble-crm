@@ -1,6 +1,7 @@
 import { useState } from "preact/hooks";
 import { useApp } from "../context";
 import { X } from "lucide-preact";
+import type { Customer } from "../types";
 
 export function CreateCustomer({ onClose }: { onClose: () => void }) {
   const { addCustomer, setError } = useApp();
@@ -13,6 +14,8 @@ export function CreateCustomer({ onClose }: { onClose: () => void }) {
   const [state, setState] = useState("");
   const [zip, setZip] = useState("");
   const [notes, setNotes] = useState("");
+  const [status, setStatus] = useState("lead");
+  const [source, setSource] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
   const handleSubmit = async (e: Event) => {
@@ -20,7 +23,12 @@ export function CreateCustomer({ onClose }: { onClose: () => void }) {
     if (!name.trim()) { setError("Name is required"); return; }
     setSubmitting(true);
     try {
-      await addCustomer({ name: name.trim(), email, phone, address, city, state, zip, notes });
+      await addCustomer({
+        name: name.trim(), email, phone, address, city, state, zip, notes,
+        status: status as Customer["status"],
+        // Empty source select => null (unknown), not "".
+        source: source ? (source as Customer["source"]) : null,
+      });
       onClose();
     } catch (err) {
       setError((err as Error).message);
@@ -65,6 +73,25 @@ export function CreateCustomer({ onClose }: { onClose: () => void }) {
             <div class="form-group">
               <label>ZIP</label>
               <input type="text" value={zip} onInput={(e) => setZip((e.target as HTMLInputElement).value)} />
+            </div>
+            <div class="form-group">
+              <label>Status</label>
+              <select value={status} onChange={(e) => setStatus((e.target as HTMLSelectElement).value)}>
+                <option value="lead">Lead</option>
+                <option value="active">Active</option>
+                <option value="inactive">Inactive</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Source</label>
+              <select value={source} onChange={(e) => setSource((e.target as HTMLSelectElement).value)}>
+                <option value="">Unknown</option>
+                <option value="referral">Referral</option>
+                <option value="google">Google</option>
+                <option value="repeat">Repeat</option>
+                <option value="website">Website</option>
+                <option value="other">Other</option>
+              </select>
             </div>
             <div class="form-group full-width">
               <label>Notes</label>
