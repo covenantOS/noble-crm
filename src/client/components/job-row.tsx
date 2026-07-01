@@ -5,14 +5,17 @@ import { Trash2, CalendarRange } from "lucide-preact";
 import type { Job } from "../types";
 
 export function JobRow({ job }: { job: Job }) {
-  const { navigate, deleteJob, isAgent } = useApp();
+  const { navigate, deleteJob, isAgent, activeBrandId } = useApp();
   const isMultiDay = !!job.end_date && job.end_date !== job.scheduled_date;
+  // The account chip is only signal when browsing across accounts; under a
+  // specific account it repeats the context ribbon on every row.
+  const showBrand = activeBrandId === null && !!job.brand_name;
 
   return (
     <tr class="table-row clickable" onClick={() => navigate(`/jobs/${job.id}`)}>
-      <td>
+      <td class="fc-lead">
         <span class="identifier">{job.identifier}</span>
-        {job.brand_name && (
+        {showBrand && (
           <span class="brand-chip" style={{ marginLeft: 8 }}>
             <span class="brand-chip-dot" style={{ background: job.brand_color_primary || "#ccc" }} />
             {job.brand_name}
@@ -20,15 +23,15 @@ export function JobRow({ job }: { job: Job }) {
         )}
       </td>
       <td>
-        {formatDate(job.scheduled_date)}
+        <span class="nowrap">{formatDate(job.scheduled_date)}</span>
+        {job.scheduled_time && <>{" "}<span class="text-muted nowrap">· {formatTime(job.scheduled_time)}</span></>}
         {isMultiDay && (
-          <span class="text-muted" style={{ display: "inline-flex", alignItems: "center", gap: 3, marginLeft: 6, fontSize: 11 }} title={`Runs through ${formatDate(job.end_date)}`}>
+          <span class="text-muted" style={{ display: "flex", alignItems: "center", gap: 3, fontSize: 11 }} title={`Runs through ${formatDate(job.end_date)}`}>
             <CalendarRange size={11} /> → {formatDate(job.end_date)}
           </span>
         )}
       </td>
-      <td class="text-muted">{formatTime(job.scheduled_time)}</td>
-      <td>{job.customer_name || "—"}</td>
+      <td class="fc-full">{job.customer_name || "—"}</td>
       <td>
         {job.service_type_name ? (
           <span class="service-pill" style={{ borderColor: job.service_type_color || "#ccc" }}>
@@ -50,7 +53,7 @@ export function JobRow({ job }: { job: Job }) {
         )}
       </td>
       <td><StatusBadge status={job.status} /></td>
-      <td class="text-right money">{formatMoney(job.price)}</td>
+      <td class="text-right money fc-end text-bold">{formatMoney(job.price)}</td>
       {isAgent && (
         <td>
           <button

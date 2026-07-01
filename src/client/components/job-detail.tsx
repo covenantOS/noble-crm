@@ -226,7 +226,7 @@ export function JobDetail() {
   };
 
   return (
-    <div class="page">
+    <div class="page page-doc">
       <div class="page-header">
         <button class="btn btn-back" onClick={() => navigate("/jobs")}>
           <ArrowLeft size={16} /> Back

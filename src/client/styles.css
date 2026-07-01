@@ -274,7 +274,7 @@ input, select, textarea, button { accent-color: var(--navy); }
    is active, so page headers always carry the account name. */
 .account-context {
   display: flex; align-items: center; gap: 8px;
-  padding: 7px 34px; font-size: 12px; font-weight: 600; color: var(--text-secondary);
+  padding: 7px clamp(22px, 2.6vw, 44px); font-size: 12px; font-weight: 600; color: var(--text-secondary);
   background: var(--bg-tint); border-bottom: 1px solid var(--border);
   position: sticky; top: 0; z-index: 50;
 }
@@ -340,7 +340,12 @@ input, select, textarea, button { accent-color: var(--navy); }
    .page the containing block for every position:fixed descendant — all modal
    overlays then pin to the page box instead of the viewport (cut-off modals,
    partial backdrops). "backwards" ends identically but stops applying on finish. */
-.page { padding: 26px 34px; max-width: 1440px; margin-inline: auto; animation: rise 0.4s ease backwards; }
+/* Width tiers: working screens (dashboard, boards, lists) get a wide fluid
+   canvas; document/detail screens (.page-doc) stay narrower for readability.
+   Gutters are fluid so 1050px windows keep their room and 2560px monitors
+   read as intentional margin rather than dead paper. */
+.page { width: 100%; padding: 26px clamp(22px, 2.6vw, 44px) 34px; max-width: 1720px; margin-inline: auto; animation: rise 0.4s ease backwards; }
+.page-doc { max-width: 1300px; }
 @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
 .page-header {
@@ -355,9 +360,11 @@ input, select, textarea, button { accent-color: var(--navy); }
 
 /* ── Toolbar ─────────────────────────────────────────────────────────── */
 
-.toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+.toolbar { display: flex; align-items: center; gap: 10px 12px; margin-bottom: 16px; flex-wrap: wrap; }
 
-.search-box { position: relative; flex: 1; max-width: 340px; }
+/* Search yields before the filter row wraps: it can shrink to ~180px so a
+   1050px window keeps search + filters on one intentional line. */
+.search-box { position: relative; flex: 1 1 200px; min-width: 0; max-width: 340px; }
 .search-box input {
   width: 100%; padding: 9px 12px 9px 34px;
   border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
@@ -366,6 +373,13 @@ input, select, textarea, button { accent-color: var(--navy); }
 }
 .search-box input:focus { border-color: var(--navy-500); box-shadow: 0 0 0 3px var(--primary-light); }
 .search-icon { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); color: var(--text-muted); }
+
+/* Bare selects dropped into a toolbar pick up the design system */
+.toolbar select {
+  padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  font-size: 13px; font-family: var(--font); background: var(--card-bg); color: var(--text); outline: none;
+}
+.toolbar select:focus { border-color: var(--navy-500); box-shadow: 0 0 0 3px var(--primary-light); }
 
 .filter-group { display: flex; gap: 2px; background: var(--bg-tint); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 3px; }
 .filter-btn {
@@ -390,7 +404,7 @@ input, select, textarea, button { accent-color: var(--navy); }
   text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-muted);
   border-bottom: 1px solid var(--border); white-space: nowrap; background: var(--card-bg);
 }
-.table td { padding: 12px 14px; border-bottom: 1px solid var(--border-subtle); vertical-align: middle; }
+.table td { padding: 9px 14px; border-bottom: 1px solid var(--border-subtle); vertical-align: middle; }
 .table-row:last-child td { border-bottom: none; }
 .table-row.clickable { cursor: pointer; transition: background 0.12s; }
 .table-row.clickable:hover td { background: var(--row-hover); }
@@ -399,8 +413,9 @@ input, select, textarea, button { accent-color: var(--navy); }
 .text-muted { color: var(--text-muted); }
 .text-right { text-align: right; }
 .money { font-variant-numeric: tabular-nums; }
+.nowrap { white-space: nowrap; }
 
-.identifier { font-family: var(--font-mono); font-size: 12px; color: var(--navy); font-weight: 600; letter-spacing: -0.02em; }
+.identifier { font-family: var(--font-mono); font-size: 12px; color: var(--navy); font-weight: 600; letter-spacing: -0.02em; white-space: nowrap; }
 .identifier-lg { font-family: var(--font-mono); font-size: 16px; color: var(--navy-deep); font-weight: 600; letter-spacing: -0.02em; }
 
 /* ── Status & Badges ─────────────────────────────────────────────────── */
@@ -453,32 +468,85 @@ input, select, textarea, button { accent-color: var(--navy); }
 
 .color-swatch { display: inline-block; width: 18px; height: 18px; border-radius: 5px; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.08); }
 
-/* ── Dashboard KPIs ──────────────────────────────────────────────────── */
+/* ── Dashboard KPIs — one designed strip, not a field of tiles ───────────
+   A single hairline-divided band of figures: small-caps label over a
+   Fraunces tabular numeral. The dashboard strip always holds 8 figures, so
+   the grid is tiered explicitly (8-across on wide monitors, 4×2 on working
+   windows, 2-up on phones) — never an orphan cell. The 1px rules between
+   cells come from a -1px top/left shadow on every cell; the strip's own
+   border + overflow:hidden crop the outer edges. */
 
-.stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 14px; margin-bottom: 26px; }
-
-.stat-card {
-  background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius);
-  padding: 18px; display: flex; align-items: flex-start; gap: 14px; cursor: pointer;
-  font-family: var(--font); text-align: left; box-shadow: var(--shadow-xs);
-  transition: box-shadow 0.16s, transform 0.16s, border-color 0.16s; position: relative; overflow: hidden;
+.kpi-strip {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  background: var(--card-bg); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow-xs);
+  overflow: hidden; margin-bottom: 22px;
 }
-.stat-card:hover { box-shadow: var(--shadow-md); transform: translateY(-2px); border-color: var(--border-strong); }
-.stat-icon {
-  width: 42px; height: 42px; border-radius: 11px; display: flex; align-items: center; justify-content: center;
-  flex-shrink: 0; background: var(--primary-light); color: var(--navy);
+@media (min-width: 1600px) {
+  .kpi-strip { grid-template-columns: 1.4fr repeat(7, minmax(0, 1fr)); }
 }
-.stat-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.stat-value { font-family: var(--font-display); font-size: 26px; font-weight: 600; color: var(--navy-deep); line-height: 1.05; font-variant-numeric: tabular-nums; }
-.stat-label { font-size: 12px; color: var(--text-secondary); font-weight: 500; }
-.stat-card.accent .stat-icon { background: var(--gold-soft); color: var(--gold-deep); }
+/* Variant for ad-hoc figure counts (detail rollups): cells flow and fill */
+.kpi-strip-auto { display: flex; flex-wrap: wrap; }
+.kpi-strip-auto .kpi { flex: 1 1 170px; }
+.kpi {
+  min-width: 0;
+  display: flex; flex-direction: column; gap: 1px; justify-content: flex-end;
+  padding: 13px 18px 11px;
+  background: var(--card-bg); border: none; text-align: left;
+  font-family: var(--font);
+  box-shadow: -1px -1px 0 0 var(--border);
+  transition: background 0.14s;
+}
+button.kpi { cursor: pointer; }
+button.kpi:hover { background: var(--row-hover); }
+.kpi-label {
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.09em; text-transform: uppercase;
+  color: var(--text-muted); white-space: nowrap; order: -1;
+}
+.kpi-value {
+  font-family: var(--font-display); font-size: 26px; font-weight: 600;
+  color: var(--navy-deep); line-height: 1.2; font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.kpi-value.danger { color: var(--danger); }
+.kpi-value.quiet { color: var(--text-muted); }
+/* Revenue carries the weight: gold-washed cell, larger figure */
+.kpi-revenue { background: linear-gradient(180deg, rgba(201, 162, 39, 0.11), rgba(201, 162, 39, 0.05)); }
+.kpi-revenue .kpi-label { color: var(--gold-deep); }
+.kpi-revenue .kpi-value { font-size: 30px; }
+button.kpi-revenue:hover { background: rgba(201, 162, 39, 0.17); }
 
-/* Dashboard module cards for the lower canvas */
-.dash-grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 18px; }
+/* Dashboard module cards for the lower canvas.
+   ≥1600px: three columns across the wide canvas.
+   1161–1599px: schedule left, invoices/estimates stacked right.
+   ≤1160px: single column. Panels align to their own height — no stretched
+   empty bodies. */
+.dash-grid {
+  display: grid; gap: 16px; align-items: start;
+  grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
+  grid-template-areas: "schedule invoices" "schedule estimates";
+}
+.dash-schedule { grid-area: schedule; }
+.dash-invoices { grid-area: invoices; }
+.dash-estimates { grid-area: estimates; }
+@media (min-width: 1600px) {
+  .dash-grid {
+    grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas: "schedule invoices estimates";
+  }
+}
+@media (max-width: 1160px) {
+  .dash-grid { grid-template-columns: minmax(0, 1fr); grid-template-areas: "schedule" "invoices" "estimates"; }
+}
+
 .panel { background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-xs); overflow: hidden; }
-.panel-header { display: flex; align-items: center; justify-content: space-between; padding: 15px 18px; border-bottom: 1px solid var(--border-subtle); }
+.panel-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--border-subtle); }
 .panel-title { font-size: 14px; font-weight: 600; color: var(--navy-deep); }
-.panel-body { padding: 6px 18px 14px; }
+.panel-body { padding: 6px 16px 14px; }
+/* Denser rows inside dashboard modules (36–40px), no intra-card scrollbars */
+.panel .table th { padding: 8px 16px; }
+.panel .table td { padding: 8px 16px; }
+.panel .empty-state { padding: 22px 18px; gap: 8px; font-size: 13px; }
+.panel .empty-state svg { width: 20px; height: 20px; }
 
 /* ── Sections ────────────────────────────────────────────────────────── */
 
@@ -628,11 +696,12 @@ input, select, textarea, button { accent-color: var(--navy); }
 
 /* ── Empty State ─────────────────────────────────────────────────────── */
 
+/* Compact and directive: one line + one action, never a dead zone */
 .empty-state {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
-  padding: 56px 24px; gap: 12px; color: var(--text-muted); font-size: 14px; text-align: center;
+  padding: 30px 24px; gap: 10px; color: var(--text-muted); font-size: 13.5px; text-align: center;
 }
-.empty-state svg { color: var(--border-strong); }
+.empty-state svg { color: var(--border-strong); width: 24px; height: 24px; }
 
 /* ── Pagination ──────────────────────────────────────────────────────── */
 
@@ -660,7 +729,7 @@ input, select, textarea, button { accent-color: var(--navy); }
 /* ── Weekly schedule grid (List view) ────────────────────────────────── */
 
 .schedule-grid {
-  display: grid; grid-template-columns: repeat(7, 1fr); gap: 1px;
+  display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 1px;
   background: var(--border); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
 }
 .schedule-day { background: var(--card-bg); min-height: 170px; display: flex; flex-direction: column; }
@@ -836,8 +905,14 @@ input, select, textarea, button { accent-color: var(--navy); }
 
 /* ── Responsive: tablet / phone ──────────────────────────────────────── */
 
+/* Mid-size working windows (the owner's ~1050px case): tables trade a
+   little cell air for fitting every column without an intra-card scrollbar. */
+@media (max-width: 1280px) {
+  .table th { padding-inline: 10px; }
+  .table td { padding-inline: 10px; }
+}
+
 @media (max-width: 1024px) {
-  .dash-grid { grid-template-columns: 1fr; }
   .detail-sidebar { width: 240px; }
 }
 
@@ -885,8 +960,50 @@ input, select, textarea, button { accent-color: var(--navy); }
 
   /* Dense tables scroll horizontally rather than clip */
   .table-wrap { overflow-x: auto; }
-  .stats-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
-  .stat-value { font-size: 22px; }
+
+  /* Toolbar: search takes the full line, filter chips wrap intentionally */
+  .search-box { max-width: none; flex-basis: 100%; }
+  .filter-group { flex-wrap: wrap; }
+
+  /* ── Mobile card reflow (.table-flow) ─────────────────────────────────
+     List tables and the dashboard schedule re-stack as cards on phones:
+     no thead, no sideways scrolling, no clipped columns. Cell roles:
+       .fc-lead  — first line, left (doc number / name)
+       .fc-end   — first line, right (money / status)
+       .fc-full  — its own full-width line (customer, address)
+     Unclassed cells flow after, wrapping as chips. data-label paints a
+     small-caps prefix for bare values (counts, dates). */
+  .table-flow { display: block; }
+  .table-flow thead { display: none; }
+  .table-flow tbody { display: block; width: 100%; }
+  .table-flow tr {
+    display: flex; flex-wrap: wrap; align-items: center;
+    gap: 6px 12px; padding: 12px 14px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .table-flow tr:last-child { border-bottom: none; }
+  .table-flow td,
+  .panel .table-flow td {
+    display: flex; align-items: center; gap: 6px;
+    padding: 0; border: none; min-width: 0; order: 5;
+  }
+  .table-flow td:empty { display: none; }
+  .table-flow td.fc-lead, .panel .table-flow td.fc-lead { order: 1; }
+  .table-flow td.fc-end, .panel .table-flow td.fc-end { order: 2; margin-left: auto; text-align: right; }
+  .table-flow td.fc-full, .panel .table-flow td.fc-full { order: 3; flex-basis: 100%; }
+  .table-flow td[data-label]::before {
+    content: attr(data-label);
+    font-size: 9.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--text-muted); flex-shrink: 0;
+  }
+
+  /* KPI strip: two-up cells, slightly smaller figures */
+  .kpi-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .kpi { padding: 11px 14px 9px; }
+  .kpi-strip-auto .kpi { flex-basis: 136px; }
+  .kpi-value { font-size: 22px; }
+  .kpi-revenue .kpi-value { font-size: 24px; }
+  .kpi-label { white-space: normal; line-height: 1.25; }
 
   /* Weekly grid → vertical stack of days on phones */
   .schedule-grid { grid-template-columns: 1fr; }

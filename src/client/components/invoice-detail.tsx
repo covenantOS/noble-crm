@@ -88,7 +88,7 @@ export function InvoiceDetail() {
   };
 
   return (
-    <div class="page">
+    <div class="page page-doc">
       <div class="page-header">
         <button class="btn btn-back" onClick={() => navigate("/invoices")}>
           <ArrowLeft size={16} /> Back

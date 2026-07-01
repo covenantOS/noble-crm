@@ -47,7 +47,7 @@ export function CustomerDetail() {
   const lifetimeBilled = invoices.reduce((sum, inv) => sum + (inv.total || 0), 0);
 
   return (
-    <div class="page">
+    <div class="page page-doc">
       <div class="page-header">
         <button class="btn btn-back" onClick={() => navigate("/customers")}>
           <ArrowLeft size={16} /> Back
@@ -158,24 +158,18 @@ export function CustomerDetail() {
 
           {/* Money summary rollup */}
           <div class="detail-section">
-            <div class="stats-grid">
-              <div class="stat-card">
-                <div class="stat-body">
-                  <div class="stat-value money">{formatMoney(lifetimeBilled)}</div>
-                  <div class="stat-label">Lifetime Billed</div>
-                </div>
+            <div class="kpi-strip kpi-strip-auto">
+              <div class="kpi">
+                <span class="kpi-label">Lifetime Billed</span>
+                <span class="kpi-value money">{formatMoney(lifetimeBilled)}</span>
               </div>
-              <div class="stat-card">
-                <div class="stat-body">
-                  <div class="stat-value money">{formatMoney(outstanding)}</div>
-                  <div class="stat-label">Outstanding Balance</div>
-                </div>
+              <div class="kpi">
+                <span class="kpi-label">Outstanding Balance</span>
+                <span class="kpi-value money">{formatMoney(outstanding)}</span>
               </div>
-              <div class="stat-card">
-                <div class="stat-body">
-                  <div class="stat-value">{jobs.length}</div>
-                  <div class="stat-label">Jobs</div>
-                </div>
+              <div class="kpi">
+                <span class="kpi-label">Jobs</span>
+                <span class="kpi-value">{jobs.length}</span>
               </div>
             </div>
           </div>

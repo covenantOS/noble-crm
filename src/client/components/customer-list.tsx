@@ -49,7 +49,7 @@ export function CustomerList() {
             </button>
           </div>
         ) : (
-          <table class="table">
+          <table class="table table-flow">
             <thead>
               <tr>
                 <th>Name</th>
@@ -64,12 +64,12 @@ export function CustomerList() {
             <tbody>
               {customers.filter((c) => c.name && c.name.trim()).map((c) => (
                 <tr key={c.id} class="table-row clickable" onClick={() => navigate(`/customers/${c.id}`)}>
-                  <td class="text-bold">{c.name}</td>
-                  <td><StatusBadge status={c.status} /></td>
-                  <td class="text-muted">{c.phone || "—"}</td>
+                  <td class="text-bold fc-lead">{c.name}</td>
+                  <td class="fc-end"><StatusBadge status={c.status} /></td>
+                  <td class="text-muted nowrap">{c.phone || "—"}</td>
                   <td class="text-muted">{c.email || "—"}</td>
-                  <td class="text-muted">{[c.address, c.city, c.state].filter(Boolean).join(", ") || "—"}</td>
-                  <td>{c.job_count || 0}</td>
+                  <td class="text-muted fc-full">{[c.address, c.city, c.state].filter(Boolean).join(", ") || "—"}</td>
+                  <td data-label="Jobs">{c.job_count || 0}</td>
                   {isAgent && (
                     <td>
                       <button

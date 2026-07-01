@@ -20,6 +20,7 @@ export function EstimateList() {
   const {
     estimates, estimatesPag, setEstimatesPage, estimatesSearch, setEstimatesSearch,
     estimatesStatusFilter, setEstimatesStatusFilter, navigate, deleteEstimate, isAgent,
+    activeBrandId,
   } = useApp();
   const [showCreate, setShowCreate] = useState(false);
 
@@ -64,7 +65,7 @@ export function EstimateList() {
             </button>
           </div>
         ) : (
-          <table class="table">
+          <table class="table table-flow">
             <thead>
               <tr>
                 <th>Estimate</th>
@@ -78,19 +79,19 @@ export function EstimateList() {
             <tbody>
               {estimates.map((est) => (
                 <tr key={est.id} class="table-row clickable" onClick={() => navigate(`/estimates/${est.id}`)}>
-                  <td>
+                  <td class="fc-lead">
                     <span class="identifier">{est.identifier}</span>
-                    {est.brand_name && (
+                    {activeBrandId === null && est.brand_name && (
                       <span class="brand-chip" style={{ marginLeft: 8 }}>
                         <span class="brand-chip-dot" style={{ background: est.brand_color_primary || "#ccc" }} />
                         {est.brand_name}
                       </span>
                     )}
                   </td>
-                  <td>{est.customer_name || "—"}</td>
+                  <td class="fc-full">{est.customer_name || "—"}</td>
                   <td><StatusBadge status={est.status} /></td>
-                  <td class="text-muted">{formatDate(est.valid_until)}</td>
-                  <td class="text-bold text-right money">{formatMoney(est.total)}</td>
+                  <td class="text-muted" data-label="Valid">{formatDate(est.valid_until)}</td>
+                  <td class="text-bold text-right money fc-end">{formatMoney(est.total)}</td>
                   {isAgent && (
                     <td>
                       <button class="btn-icon danger" onClick={(e) => { e.stopPropagation(); deleteEstimate(est.id); }}>

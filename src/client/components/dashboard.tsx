@@ -1,7 +1,7 @@
 import { useApp } from "../context";
 import { StatusBadge } from "./status-badge";
 import { formatMoney, formatTime, formatDate } from "../format";
-import { Briefcase, Users, CalendarCheck, DollarSign, Clock, CheckCircle, FileText, AlertCircle, CalendarDays, Receipt } from "lucide-preact";
+import { CalendarDays, CheckCircle, Receipt } from "lucide-preact";
 
 export function Dashboard() {
   const { stats, navigate, jobs, invoices, estimates } = useApp();
@@ -25,70 +25,45 @@ export function Dashboard() {
         <h1>Dashboard</h1>
       </div>
 
-      <div class="stats-grid">
-        <button class="stat-card" onClick={() => navigate("/jobs")}>
-          <div class="stat-icon"><Briefcase size={20} /></div>
-          <div class="stat-body">
-            <div class="stat-value">{stats.jobs}</div>
-            <div class="stat-label">Total Jobs</div>
-          </div>
+      {/* One designed strip of figures — revenue carries the visual weight */}
+      <div class="kpi-strip">
+        <button class="kpi kpi-revenue" onClick={() => navigate("/invoices")}>
+          <span class="kpi-label">Revenue</span>
+          <span class="kpi-value">{formatMoney(stats.revenue)}</span>
         </button>
-        <button class="stat-card" onClick={() => navigate("/customers")}>
-          <div class="stat-icon"><Users size={20} /></div>
-          <div class="stat-body">
-            <div class="stat-value">{stats.customers}</div>
-            <div class="stat-label">Customers</div>
-          </div>
+        <button class="kpi" onClick={() => navigate("/invoices")}>
+          <span class="kpi-label">Open Invoices</span>
+          <span class="kpi-value">{stats.invoices_outstanding}</span>
         </button>
-        <button class="stat-card" onClick={() => navigate("/jobs")}>
-          <div class="stat-icon"><Clock size={20} /></div>
-          <div class="stat-body">
-            <div class="stat-value">{stats.today_jobs}</div>
-            <div class="stat-label">Today's Jobs</div>
-          </div>
+        <button class="kpi" onClick={() => navigate("/invoices")}>
+          <span class="kpi-label">Overdue</span>
+          <span class={`kpi-value ${stats.invoices_overdue > 0 ? "danger" : "quiet"}`}>{stats.invoices_overdue}</span>
         </button>
-        <button class="stat-card" onClick={() => navigate("/jobs")}>
-          <div class="stat-icon"><CalendarCheck size={20} /></div>
-          <div class="stat-body">
-            <div class="stat-value">{stats.upcoming_jobs}</div>
-            <div class="stat-label">Upcoming</div>
-          </div>
+        <button class="kpi" onClick={() => navigate("/jobs")}>
+          <span class="kpi-label">Today's Jobs</span>
+          <span class="kpi-value">{stats.today_jobs}</span>
         </button>
-        <button class="stat-card" onClick={() => navigate("/jobs")}>
-          <div class="stat-icon"><CheckCircle size={20} /></div>
-          <div class="stat-body">
-            <div class="stat-value">{stats.completed_jobs}</div>
-            <div class="stat-label">Completed</div>
-          </div>
+        <button class="kpi" onClick={() => navigate("/jobs")}>
+          <span class="kpi-label">Upcoming</span>
+          <span class="kpi-value">{stats.upcoming_jobs}</span>
         </button>
-        <button class="stat-card accent" onClick={() => navigate("/invoices")}>
-          <div class="stat-icon"><DollarSign size={20} /></div>
-          <div class="stat-body">
-            <div class="stat-value">{formatMoney(stats.revenue)}</div>
-            <div class="stat-label">Revenue</div>
-          </div>
+        <button class="kpi" onClick={() => navigate("/jobs")}>
+          <span class="kpi-label">Completed</span>
+          <span class="kpi-value">{stats.completed_jobs}</span>
         </button>
-        <button class="stat-card" onClick={() => navigate("/invoices")}>
-          <div class="stat-icon"><FileText size={20} /></div>
-          <div class="stat-body">
-            <div class="stat-value">{stats.invoices_outstanding}</div>
-            <div class="stat-label">Outstanding Invoices</div>
-          </div>
+        <button class="kpi" onClick={() => navigate("/jobs")}>
+          <span class="kpi-label">Total Jobs</span>
+          <span class="kpi-value">{stats.jobs}</span>
         </button>
-        {stats.invoices_overdue > 0 && (
-          <button class="stat-card" onClick={() => navigate("/invoices")}>
-            <div class="stat-icon"><AlertCircle size={20} /></div>
-            <div class="stat-body">
-              <div class="stat-value">{stats.invoices_overdue}</div>
-              <div class="stat-label">Overdue</div>
-            </div>
-          </button>
-        )}
+        <button class="kpi" onClick={() => navigate("/customers")}>
+          <span class="kpi-label">Customers</span>
+          <span class="kpi-value">{stats.customers}</span>
+        </button>
       </div>
 
       <div class="dash-grid">
-        {/* Wide left: today's schedule */}
-        <div class="panel">
+        {/* Today's schedule */}
+        <div class="panel dash-schedule">
           <div class="panel-header">
             <span class="panel-title">Today's Schedule</span>
             <button class="btn btn-sm" onClick={() => navigate("/schedule")}>View schedule</button>
@@ -102,7 +77,7 @@ export function Dashboard() {
               </div>
             ) : (
               <div class="table-wrap">
-                <table class="table">
+                <table class="table table-flow">
                   <thead>
                     <tr>
                       <th>Time</th>
@@ -115,9 +90,9 @@ export function Dashboard() {
                   <tbody>
                     {todayJobs.map((job) => (
                       <tr key={job.id} class="table-row clickable" onClick={() => navigate(`/jobs/${job.id}`)}>
-                        <td class="text-muted">{formatTime(job.scheduled_time)}</td>
-                        <td><span class="identifier">{job.identifier}</span></td>
-                        <td>{job.customer_name || "—"}</td>
+                        <td class="text-muted nowrap fc-lead">{formatTime(job.scheduled_time)}</td>
+                        <td class="fc-lead"><span class="identifier">{job.identifier}</span></td>
+                        <td class="fc-full">{job.customer_name || "—"}</td>
                         <td>
                           {job.technician_name ? (
                             <span class="tech-pill" style={{ borderColor: job.technician_color || "#ccc" }}>
@@ -128,7 +103,7 @@ export function Dashboard() {
                             <span class="text-muted">Unassigned</span>
                           )}
                         </td>
-                        <td><StatusBadge status={job.status} /></td>
+                        <td class="fc-end"><StatusBadge status={job.status} /></td>
                       </tr>
                     ))}
                   </tbody>
@@ -138,70 +113,67 @@ export function Dashboard() {
           </div>
         </div>
 
-        {/* Right column: outstanding invoices + recent estimates */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-          <div class="panel">
-            <div class="panel-header">
-              <span class="panel-title">Outstanding Invoices</span>
-              <button class="btn btn-sm" onClick={() => navigate("/invoices")}>All</button>
-            </div>
-            <div class="panel-body" style={{ padding: 0 }}>
-              {outstandingInvoices.length === 0 ? (
-                <div class="empty-state" style={{ padding: "34px 24px" }}>
-                  <CheckCircle size={28} />
-                  <p>All caught up</p>
-                </div>
-              ) : (
-                <div class="table-wrap">
-                  <table class="table">
-                    <tbody>
-                      {outstandingInvoices.map((inv) => (
-                        <tr key={inv.id} class="table-row clickable" onClick={() => navigate(`/invoices/${inv.id}`)}>
-                          <td>
-                            <span class="identifier">{inv.identifier}</span>
-                            <div class="text-muted" style={{ fontSize: 12 }}>{inv.customer_name || "—"}</div>
-                          </td>
-                          <td><StatusBadge status={inv.status} /></td>
-                          <td class="text-right text-bold money">{formatMoney(inv.total)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
+        <div class="panel dash-invoices">
+          <div class="panel-header">
+            <span class="panel-title">Outstanding Invoices</span>
+            <button class="btn btn-sm" onClick={() => navigate("/invoices")}>All</button>
           </div>
+          <div class="panel-body" style={{ padding: 0 }}>
+            {outstandingInvoices.length === 0 ? (
+              <div class="empty-state">
+                <CheckCircle size={28} />
+                <p>All caught up</p>
+              </div>
+            ) : (
+              <div class="table-wrap">
+                <table class="table">
+                  <tbody>
+                    {outstandingInvoices.map((inv) => (
+                      <tr key={inv.id} class="table-row clickable" onClick={() => navigate(`/invoices/${inv.id}`)}>
+                        <td>
+                          <span class="identifier">{inv.identifier}</span>
+                          <div class="text-muted" style={{ fontSize: 12 }}>{inv.customer_name || "—"}</div>
+                        </td>
+                        <td><StatusBadge status={inv.status} /></td>
+                        <td class="text-right text-bold money">{formatMoney(inv.total)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
 
-          <div class="panel">
-            <div class="panel-header">
-              <span class="panel-title">Recent Estimates</span>
-              <button class="btn btn-sm" onClick={() => navigate("/estimates")}>All</button>
-            </div>
-            <div class="panel-body" style={{ padding: 0 }}>
-              {recentEstimates.length === 0 ? (
-                <div class="empty-state" style={{ padding: "34px 24px" }}>
-                  <Receipt size={28} />
-                  <p>No estimates yet</p>
-                </div>
-              ) : (
-                <div class="table-wrap">
-                  <table class="table">
-                    <tbody>
-                      {recentEstimates.map((est) => (
-                        <tr key={est.id} class="table-row clickable" onClick={() => navigate(`/estimates/${est.id}`)}>
-                          <td>
-                            <span class="identifier">{est.identifier || "Draft"}</span>
-                            <div class="text-muted" style={{ fontSize: 12 }}>{est.customer_name || "—"} · {formatDate(est.created_at)}</div>
-                          </td>
-                          <td><StatusBadge status={est.status} /></td>
-                          <td class="text-right text-bold money">{formatMoney(est.total)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
+        <div class="panel dash-estimates">
+          <div class="panel-header">
+            <span class="panel-title">Recent Estimates</span>
+            <button class="btn btn-sm" onClick={() => navigate("/estimates")}>All</button>
+          </div>
+          <div class="panel-body" style={{ padding: 0 }}>
+            {recentEstimates.length === 0 ? (
+              <div class="empty-state">
+                <Receipt size={28} />
+                <p>No estimates yet</p>
+              </div>
+            ) : (
+              <div class="table-wrap">
+                <table class="table">
+                  <tbody>
+                    {recentEstimates.map((est) => (
+                      <tr key={est.id} class="table-row clickable" onClick={() => navigate(`/estimates/${est.id}`)}>
+                        <td>
+                          <span class="identifier">{est.identifier || "Draft"}</span>
+                          <div class="text-muted" style={{ fontSize: 12 }}>{est.customer_name || "—"} · {formatDate(est.created_at)}</div>
+                        </td>
+                        <td><StatusBadge status={est.status} /></td>
+                        <td class="text-right text-bold money">{formatMoney(est.total)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         </div>
       </div>

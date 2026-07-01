@@ -68,12 +68,11 @@ export function JobList() {
             </button>
           </div>
         ) : (
-          <table class="table">
+          <table class="table table-flow">
             <thead>
               <tr>
                 <th>ID</th>
-                <th>Date</th>
-                <th>Time</th>
+                <th>Scheduled</th>
                 <th>Customer</th>
                 <th>Service</th>
                 <th>Technician</th>

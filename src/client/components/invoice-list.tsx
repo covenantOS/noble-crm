@@ -16,7 +16,7 @@ const STATUSES: { value: string; label: string }[] = [
 export function InvoiceList() {
   const {
     invoices, invoicesPag, setInvoicesPage, invoicesStatusFilter, setInvoicesStatusFilter,
-    navigate, deleteInvoice, isAgent,
+    navigate, deleteInvoice, isAgent, activeBrandId,
   } = useApp();
 
   return (
@@ -46,7 +46,7 @@ export function InvoiceList() {
             <p class="text-muted">Create invoices from completed jobs</p>
           </div>
         ) : (
-          <table class="table">
+          <table class="table table-flow">
             <thead>
               <tr>
                 <th>Invoice</th>
@@ -61,20 +61,20 @@ export function InvoiceList() {
             <tbody>
               {invoices.map((inv) => (
                 <tr key={inv.id} class="table-row clickable" onClick={() => navigate(`/invoices/${inv.id}`)}>
-                  <td>
+                  <td class="fc-lead">
                     <span class="identifier">{inv.identifier}</span>
-                    {inv.brand_name && (
+                    {activeBrandId === null && inv.brand_name && (
                       <span class="brand-chip" style={{ marginLeft: 8 }}>
                         <span class="brand-chip-dot" style={{ background: inv.brand_color_primary || "#ccc" }} />
                         {inv.brand_name}
                       </span>
                     )}
                   </td>
-                  <td>{inv.customer_name || "—"}</td>
-                  <td class="text-muted">{inv.job_identifier || "—"}</td>
+                  <td class="fc-full">{inv.customer_name || "—"}</td>
+                  <td class="text-muted" data-label="Job">{inv.job_identifier || "—"}</td>
                   <td><StatusBadge status={inv.status} /></td>
-                  <td class="text-muted">{formatDate(inv.due_date)}</td>
-                  <td class="text-bold text-right money">{formatMoney(inv.total)}</td>
+                  <td class="text-muted" data-label="Due">{formatDate(inv.due_date)}</td>
+                  <td class="text-bold text-right money fc-end">{formatMoney(inv.total)}</td>
                   {isAgent && (
                     <td>
                       <button class="btn-icon danger" onClick={(e) => { e.stopPropagation(); deleteInvoice(inv.id); }}>

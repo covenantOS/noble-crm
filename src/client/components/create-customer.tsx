@@ -102,7 +102,7 @@ export function CreateCustomer({ onClose }: { onClose: () => void }) {
               <select value={brandId} onChange={(e) => setBrandId((e.target as HTMLSelectElement).value)}>
                 <option value="">Unassigned</option>
                 {brands.filter((b) => b.active === 1).map((b) => (
-                  <option key={b.id} value={b.id}>{b.name}{b.is_demo === 1 ? " (Demo)" : ""}</option>
+                  <option key={b.id} value={b.id}>{b.name}{b.is_demo === 1 && !/\(demo\)\s*$/i.test(b.name) ? " (Demo)" : ""}</option>
                 ))}
               </select>
             </div>

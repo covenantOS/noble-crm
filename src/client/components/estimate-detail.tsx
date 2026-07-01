@@ -180,7 +180,7 @@ export function EstimateDetail() {
   const downloadPdf = () => window.open(`/api/estimates/${estimate.id}/pdf`, "_blank", "noopener");
 
   return (
-    <div class="page">
+    <div class="page page-doc">
       <div class="page-header">
         <button class="btn btn-back" onClick={() => navigate("/estimates")}>
           <ArrowLeft size={16} /> Back
