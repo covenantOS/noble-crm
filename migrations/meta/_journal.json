@@ -36,6 +36,13 @@
       "when": 1782918776233,
       "tag": "0004_low_warlock",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1782921170897,
+      "tag": "0005_absurd_silver_centurion",
+      "breakpoints": true
     }
   ]
 }

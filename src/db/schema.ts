@@ -225,6 +225,12 @@ export const estimates = sqliteTable('estimates', {
   signedAt: text('signed_at'),
   signedName: text('signed_name'),
   signedIp: text('signed_ip'),
+  // NEW (painting-realism pass): optional deposit amount, set by office/
+  // admin/estimator while the estimate is draft/sent/approved. Validated
+  // server-side to never exceed the estimate total. When set (> 0) AND the
+  // estimate is converted to a job, a second "Deposit" invoice is minted
+  // alongside the normal full-value invoice (see /api/estimates/{id}/convert).
+  depositAmount: real('deposit_amount'),
 });
 
 export const estimateLines = sqliteTable('estimate_lines', {
@@ -235,6 +241,68 @@ export const estimateLines = sqliteTable('estimate_lines', {
   unitPrice: real('unit_price').default(0),
   total: real('total').default(0),
 });
+
+// NEW (painting-realism pass): structured estimate builder. A room groups
+// one or more surfaces; each surface carries the painting-specific spec
+// (prep/coats/paint product) plus its own labor/material cost split. Only
+// editable while the parent estimate is 'draft' (mirrors the existing
+// edit-lock pattern for paid/cancelled invoices) -- once sent/approved/
+// converted the breakdown is frozen, read-only. Every room/surface mutation
+// auto-syncs a matching row in estimate_lines (one generated line per
+// surface) so subtotal/tax/total, PDF generation, and the convert-to-job
+// pipeline keep working unmodified against estimate_lines as the source of
+// truth for totals -- see syncEstimateLinesFromBuilder in index.ts.
+export const estimateRooms = sqliteTable('estimate_rooms', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  estimateId: integer('estimate_id').notNull().references(() => estimates.id, { onDelete: 'cascade' }),
+  name: text('name').notNull(),
+  sortOrder: integer('sort_order').notNull().default(0),
+}, (table) => [
+  index('idx_estimate_rooms_estimate').on(table.estimateId),
+]);
+
+export const estimateSurfaces = sqliteTable('estimate_surfaces', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  roomId: integer('room_id').notNull().references(() => estimateRooms.id, { onDelete: 'cascade' }),
+  // Free text, not a rigid enum -- this is a painting/cabinet business and
+  // surface types vary (wall/ceiling/trim/doors/cabinets/exterior siding/...).
+  surfaceType: text('surface_type').notNull(),
+  // sqft or linear ft depending on surface_type -- the unit itself isn't
+  // stored, it's implied by surface_type/context (same free-text approach).
+  measurement: real('measurement').notNull().default(0),
+  prepNotes: text('prep_notes'),
+  coats: integer('coats').notNull().default(2),
+  paintProduct: text('paint_product'),
+  laborCost: real('labor_cost').notNull().default(0),
+  materialCost: real('material_cost').notNull().default(0),
+  sortOrder: integer('sort_order').notNull().default(0),
+  // The estimate_lines row generated FROM this surface (see
+  // syncEstimateLinesFromBuilder) -- lets an edit/delete find and update/
+  // remove its own generated line directly instead of doing a fragile
+  // description-text match. Nullable because it's set right after the
+  // line insert, not atomically in the same statement.
+  generatedLineId: integer('generated_line_id'),
+}, (table) => [
+  index('idx_estimate_surfaces_room').on(table.roomId),
+]);
+
+// NEW (painting-realism pass): change orders against an in-flight job.
+// Money-adjacent like invoices/estimates -- technicians get zero access
+// (blocked by the blanket role-gate in index.ts, same as /api/invoices and
+// /api/estimates). On approval the change-order amount is added as a new
+// line to the job's most recent non-paid/non-cancelled invoice (draft/sent),
+// or a new invoice is created for just that amount if none qualifies.
+export const changeOrders = sqliteTable('change_orders', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  jobId: integer('job_id').notNull().references(() => jobs.id, { onDelete: 'cascade' }),
+  description: text('description').notNull(),
+  amount: real('amount').notNull().default(0),
+  // pending | approved | rejected
+  status: text('status').notNull().default('pending'),
+  createdAt: text('created_at').default(nowTimestamp()).notNull(),
+}, (table) => [
+  index('idx_change_orders_job').on(table.jobId),
+]);
 
 export const attachments = sqliteTable('attachments', {
   id: integer('id').primaryKey({ autoIncrement: true }),

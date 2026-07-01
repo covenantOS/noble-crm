@@ -212,6 +212,8 @@ export interface Estimate {
   brand_name?: string | null;
   brand_color_primary?: string | null;
   brand_color_secondary?: string | null;
+  // NEW: optional deposit amount (<= total), set while draft/sent/approved.
+  deposit_amount?: number | null;
   lines?: EstimateLine[];
   created_at: string;
 }
@@ -223,6 +225,41 @@ export interface EstimateLine {
   quantity: number;
   unit_price: number;
   total: number;
+}
+
+// NEW (structured estimate builder): rooms -> surfaces. Only editable while
+// the parent estimate is 'draft' -- see /api/estimates/{id}/rooms.
+export interface EstimateSurface {
+  id: number;
+  room_id: number;
+  surface_type: string;
+  measurement: number;
+  prep_notes: string | null;
+  coats: number;
+  paint_product: string | null;
+  labor_cost: number;
+  material_cost: number;
+  sort_order: number;
+  generated_line_id: number | null;
+}
+
+export interface EstimateRoom {
+  id: number;
+  estimate_id: number;
+  name: string;
+  sort_order: number;
+  surfaces?: EstimateSurface[];
+}
+
+export type ChangeOrderStatus = "pending" | "approved" | "rejected";
+
+export interface ChangeOrder {
+  id: number;
+  job_id: number;
+  description: string;
+  amount: number;
+  status: ChangeOrderStatus;
+  created_at: string;
 }
 
 export type ServiceAgreementInterval = "weekly" | "monthly" | "quarterly" | "annual";

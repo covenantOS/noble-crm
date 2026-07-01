@@ -4,7 +4,7 @@ import { ACORN_FINANCE_URL } from "../constants";
 import { NobleMark } from "./noble-mark";
 import { StatusBadge } from "./status-badge";
 import { formatDate, formatDateTime, formatMoney } from "../format";
-import { ArrowLeft, Trash2, Send, CheckCircle, XCircle, ArrowRightLeft, ExternalLink, Plus, X, Camera, FileDown, Link2, Copy, RefreshCw } from "lucide-preact";
+import { ArrowLeft, Trash2, Send, CheckCircle, XCircle, ArrowRightLeft, ExternalLink, Plus, X, Camera, FileDown, Link2, Copy, RefreshCw, Hammer, ChevronDown, ChevronRight, DollarSign } from "lucide-preact";
 
 export function EstimateDetail() {
   const {
@@ -12,25 +12,76 @@ export function EstimateDetail() {
     sendEstimate, approveEstimate, declineEstimate, addEstimateLine, deleteEstimateLine,
     convertEstimate, brands, setError,
     estimateAttachments, fetchEstimateAttachments, uploadAttachment, deleteAttachment,
+    setEstimateDeposit,
+    estimateRooms, fetchEstimateRooms, addEstimateRoom, updateEstimateRoom, deleteEstimateRoom,
+    addEstimateSurface, updateEstimateSurface, deleteEstimateSurface,
   } = useApp();
   const [showAddLine, setShowAddLine] = useState(false);
   const [lineDesc, setLineDesc] = useState("");
   const [lineQty, setLineQty] = useState("1");
   const [linePrice, setLinePrice] = useState("0");
   const [converting, setConverting] = useState(false);
-  const [convertResult, setConvertResult] = useState<{ job_id: number; invoice_id: number } | null>(null);
+  const [convertResult, setConvertResult] = useState<{ job_id: number; invoice_id: number; deposit_invoice_id: number | null } | null>(null);
   const photoFileInput = useRef<HTMLInputElement>(null);
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
   // Send/resend delivery feedback + copy-link confirmation.
   const [sendNotice, setSendNotice] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [sending, setSending] = useState(false);
+  const [depositInput, setDepositInput] = useState("");
+
+  // Structured builder UI state.
+  const [showBuilder, setShowBuilder] = useState(false);
+  const [expandedRooms, setExpandedRooms] = useState<Record<number, boolean>>({});
+  const [newRoomName, setNewRoomName] = useState("");
+  const [surfaceForms, setSurfaceForms] = useState<Record<number, { surface_type: string; measurement: string; prep_notes: string; coats: string; paint_product: string; labor_cost: string; material_cost: string }>>({});
 
   useEffect(() => {
     if (estimate) fetchEstimateAttachments(estimate.id);
   }, [estimate?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  useEffect(() => {
+    if (estimate) fetchEstimateRooms(estimate.id);
+  }, [estimate?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    setDepositInput(estimate?.deposit_amount != null ? String(estimate.deposit_amount) : "");
+  }, [estimate?.id, estimate?.deposit_amount]);
+
   if (!estimate) return null;
+
+  const isDraft = estimate.status === "draft";
+  const canSetDeposit = estimate.status === "draft" || estimate.status === "sent" || estimate.status === "approved";
+
+  const toggleRoom = (roomId: number) => setExpandedRooms((prev) => ({ ...prev, [roomId]: !prev[roomId] }));
+
+  const handleAddRoom = async () => {
+    if (!newRoomName.trim()) return;
+    await addEstimateRoom(estimate.id, newRoomName.trim());
+    setNewRoomName("");
+  };
+
+  const defaultSurfaceForm = { surface_type: "", measurement: "", prep_notes: "", coats: "2", paint_product: "", labor_cost: "0", material_cost: "0" };
+
+  const handleAddSurface = async (roomId: number) => {
+    const form = surfaceForms[roomId] || defaultSurfaceForm;
+    if (!form.surface_type.trim()) return;
+    await addEstimateSurface(roomId, estimate.id, {
+      surface_type: form.surface_type.trim(),
+      measurement: parseFloat(form.measurement) || 0,
+      prep_notes: form.prep_notes.trim() || undefined,
+      coats: parseInt(form.coats, 10) || 2,
+      paint_product: form.paint_product.trim() || undefined,
+      labor_cost: parseFloat(form.labor_cost) || 0,
+      material_cost: parseFloat(form.material_cost) || 0,
+    });
+    setSurfaceForms((prev) => ({ ...prev, [roomId]: defaultSurfaceForm }));
+  };
+
+  const handleSaveDeposit = async () => {
+    const val = depositInput.trim();
+    await setEstimateDeposit(estimate.id, val ? parseFloat(val) || 0 : null);
+  };
 
   const handlePhotoSelected = async (e: Event) => {
     const input = e.target as HTMLInputElement;
@@ -159,6 +210,12 @@ export function EstimateDetail() {
           <a href={`/jobs/${convertResult.job_id}`} onClick={(e) => { e.preventDefault(); navigate(`/jobs/${convertResult.job_id}`); }}>View Job</a>
           {" · "}
           <a href={`/invoices/${convertResult.invoice_id}`} onClick={(e) => { e.preventDefault(); navigate(`/invoices/${convertResult.invoice_id}`); }}>View Invoice</a>
+          {convertResult.deposit_invoice_id && (
+            <>
+              {" · "}
+              <a href={`/invoices/${convertResult.deposit_invoice_id}`} onClick={(e) => { e.preventDefault(); navigate(`/invoices/${convertResult.deposit_invoice_id}`); }}>View Deposit Invoice</a>
+            </>
+          )}
         </div>
       )}
 
@@ -317,6 +374,124 @@ export function EstimateDetail() {
             )}
           </div>
 
+          {/* Structured builder -- rooms -> surfaces -> coats/prep/paint spec,
+              labor vs materials. Optional: an estimate can still use plain
+              flat lines above without ever touching this. Only editable
+              while the estimate is draft (frozen/read-only after send). */}
+          <div class="detail-section">
+            <h3 style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <span><Hammer size={16} style={{ verticalAlign: "text-bottom" }} /> Builder{estimateRooms.length > 0 ? ` (${estimateRooms.length} room${estimateRooms.length === 1 ? "" : "s"})` : ""}</span>
+              <button class="btn btn-sm" onClick={() => setShowBuilder((v) => !v)}>
+                {showBuilder ? "Hide" : estimateRooms.length > 0 ? "Show" : "Add Rooms & Surfaces"}
+              </button>
+            </h3>
+            {showBuilder && (
+              <div class="card" style={{ padding: 14 }}>
+                {!isDraft && (
+                  <p class="text-muted" style={{ marginTop: 0, fontSize: 12.5 }}>
+                    This estimate is {estimate.status} -- the structured breakdown is frozen and read-only.
+                  </p>
+                )}
+                {estimateRooms.map((room) => {
+                  const form = surfaceForms[room.id] || defaultSurfaceForm;
+                  const expanded = !!expandedRooms[room.id];
+                  return (
+                    <div key={room.id} style={{ marginBottom: 14, paddingBottom: 14, borderBottom: "1px solid var(--border)" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <button class="btn-icon" onClick={() => toggleRoom(room.id)}>
+                          {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                        </button>
+                        <strong style={{ flex: 1 }}>{room.name}</strong>
+                        <span class="text-muted" style={{ fontSize: 12 }}>{(room.surfaces || []).length} surface{(room.surfaces || []).length === 1 ? "" : "s"}</span>
+                        {isDraft && (
+                          <button class="btn-icon danger" onClick={() => deleteEstimateRoom(room.id, estimate.id)}>
+                            <Trash2 size={12} />
+                          </button>
+                        )}
+                      </div>
+                      {expanded && (
+                        <div style={{ marginTop: 10, marginLeft: 22 }}>
+                          {(room.surfaces || []).map((s) => (
+                            <div key={s.id} class="card" style={{ padding: 10, marginBottom: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+                              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                <strong style={{ textTransform: "capitalize" }}>{s.surface_type}</strong>
+                                {isDraft && (
+                                  <button class="btn-icon danger" onClick={() => deleteEstimateSurface(s.id, estimate.id)}>
+                                    <Trash2 size={12} />
+                                  </button>
+                                )}
+                              </div>
+                              <div class="text-muted" style={{ fontSize: 12.5 }}>
+                                {s.measurement} {s.measurement === 1 ? "unit" : "units"} · {s.coats} coat{s.coats === 1 ? "" : "s"}
+                                {s.paint_product ? ` · ${s.paint_product}` : ""}
+                              </div>
+                              {s.prep_notes && <div class="text-muted" style={{ fontSize: 12.5 }}>Prep: {s.prep_notes}</div>}
+                              <div style={{ display: "flex", gap: 14, fontSize: 13 }}>
+                                <span>Labor: <span class="money">{formatMoney(s.labor_cost)}</span></span>
+                                <span>Materials: <span class="money">{formatMoney(s.material_cost)}</span></span>
+                                <span class="text-bold">Total: <span class="money">{formatMoney(s.labor_cost + s.material_cost)}</span></span>
+                              </div>
+                            </div>
+                          ))}
+                          {isDraft && (
+                            <div class="card" style={{ padding: 10, background: "var(--row-hover)" }}>
+                              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 6 }}>
+                                <input type="text" placeholder="Surface (e.g. Walls, Trim, Cabinets)" value={form.surface_type}
+                                  onInput={(e) => setSurfaceForms((prev) => ({ ...prev, [room.id]: { ...form, surface_type: (e.target as HTMLInputElement).value } }))}
+                                  style={{ flex: 2, minWidth: 140 }} />
+                                <input type="number" step="0.01" min="0" placeholder="Sqft/Linear ft" value={form.measurement}
+                                  onInput={(e) => setSurfaceForms((prev) => ({ ...prev, [room.id]: { ...form, measurement: (e.target as HTMLInputElement).value } }))}
+                                  style={{ width: 110 }} />
+                                <input type="number" step="1" min="1" placeholder="Coats" value={form.coats}
+                                  onInput={(e) => setSurfaceForms((prev) => ({ ...prev, [room.id]: { ...form, coats: (e.target as HTMLInputElement).value } }))}
+                                  style={{ width: 70 }} />
+                              </div>
+                              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 6 }}>
+                                <input type="text" placeholder="Paint product (e.g. SW Duration, Eggshell, Dover White)" value={form.paint_product}
+                                  onInput={(e) => setSurfaceForms((prev) => ({ ...prev, [room.id]: { ...form, paint_product: (e.target as HTMLInputElement).value } }))}
+                                  style={{ flex: 1, minWidth: 180 }} />
+                                <input type="text" placeholder="Prep notes" value={form.prep_notes}
+                                  onInput={(e) => setSurfaceForms((prev) => ({ ...prev, [room.id]: { ...form, prep_notes: (e.target as HTMLInputElement).value } }))}
+                                  style={{ flex: 1, minWidth: 180 }} />
+                              </div>
+                              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                                <input type="number" step="0.01" min="0" placeholder="Labor $" value={form.labor_cost}
+                                  onInput={(e) => setSurfaceForms((prev) => ({ ...prev, [room.id]: { ...form, labor_cost: (e.target as HTMLInputElement).value } }))}
+                                  style={{ width: 100 }} />
+                                <input type="number" step="0.01" min="0" placeholder="Material $" value={form.material_cost}
+                                  onInput={(e) => setSurfaceForms((prev) => ({ ...prev, [room.id]: { ...form, material_cost: (e.target as HTMLInputElement).value } }))}
+                                  style={{ width: 100 }} />
+                                <button class="btn btn-primary btn-sm" onClick={() => handleAddSurface(room.id)}>
+                                  <Plus size={14} /> Add Surface
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+                {isDraft && (
+                  <div class="note-input-row" style={{ marginTop: 4 }}>
+                    <input type="text" placeholder="Room name (e.g. Living Room, Exterior - North Wall)" value={newRoomName}
+                      onInput={(e) => setNewRoomName((e.target as HTMLInputElement).value)}
+                      onKeyDown={(e) => e.key === "Enter" && handleAddRoom()} />
+                    <button class="btn btn-primary btn-sm" onClick={handleAddRoom}>
+                      <Plus size={14} /> Add Room
+                    </button>
+                  </div>
+                )}
+                {estimateRooms.length === 0 && !isDraft && (
+                  <p class="text-muted" style={{ margin: 0 }}>No structured rooms/surfaces on this estimate -- it uses plain line items.</p>
+                )}
+                <p class="text-muted" style={{ fontSize: 12, marginTop: 10, marginBottom: 0 }}>
+                  Each surface auto-generates a matching line item above (labor + materials = line total) -- the Line Items table and totals stay in sync automatically.
+                </p>
+              </div>
+            )}
+          </div>
+
           {/* Photos / supporting documents -- no before/after distinction
               for estimates, just attachments supporting the quote. */}
           <div class="detail-section">
@@ -364,6 +539,29 @@ export function EstimateDetail() {
               value={estimate.tax_rate}
               onChange={(e) => updateEstimate(estimate.id, { tax_rate: parseFloat((e.target as HTMLInputElement).value) || 0 })}
             />
+          </div>
+
+          <div class="detail-sidebar-section">
+            <h4><DollarSign size={13} style={{ verticalAlign: "text-bottom" }} /> Deposit</h4>
+            {canSetDeposit ? (
+              <>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  max={estimate.total || undefined}
+                  placeholder="No deposit"
+                  value={depositInput}
+                  onInput={(e) => setDepositInput((e.target as HTMLInputElement).value)}
+                  onBlur={handleSaveDeposit}
+                />
+                <p class="text-muted" style={{ fontSize: 12, marginTop: 6, marginBottom: 0 }}>
+                  If set, converting this estimate mints a second "Deposit" invoice (due immediately) alongside the full-value invoice.
+                </p>
+              </>
+            ) : (
+              <span>{estimate.deposit_amount ? formatMoney(estimate.deposit_amount) : "—"}</span>
+            )}
           </div>
 
           <div class="detail-sidebar-section">

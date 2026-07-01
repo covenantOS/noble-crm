@@ -4,7 +4,7 @@ import type {
   Job, Customer, Technician, ServiceType, Material, Invoice, Stats, PaginatedState,
   CustomerLookup, TechnicianLookup, Priority, Brand, Estimate,
   Attachment, AttachmentEntityType, AttachmentKind, Payment, PaymentMethod,
-  ServiceAgreement,
+  ServiceAgreement, EstimateRoom, ChangeOrder,
 } from "./types";
 
 export interface CurrentUser {
@@ -60,6 +60,19 @@ export interface AppContextValue {
   addJobMaterial: (jobId: number, materialId: number, quantity: number) => Promise<void>;
   deleteJobMaterial: (id: number) => Promise<void>;
   createInvoiceFromJob: (jobId: number) => Promise<void>;
+
+  // Job invoice history (progress billing) -- every invoice for a job, not
+  // just the one selectedJob-adjacent create flow above.
+  jobInvoices: Invoice[];
+  fetchJobInvoices: (jobId: number) => Promise<void>;
+  addJobProgressInvoice: (jobId: number, data: { description: string; amount: number; tax_rate?: number }) => Promise<void>;
+
+  // Change orders (job-scoped, technician-blocked)
+  jobChangeOrders: ChangeOrder[];
+  fetchJobChangeOrders: (jobId: number) => Promise<void>;
+  addChangeOrder: (jobId: number, data: { description: string; amount: number }) => Promise<void>;
+  approveChangeOrder: (id: number, jobId: number) => Promise<void>;
+  rejectChangeOrder: (id: number, jobId: number) => Promise<void>;
 
   // Customers
   customers: Customer[];
@@ -153,7 +166,19 @@ export interface AppContextValue {
   declineEstimate: (id: number) => Promise<void>;
   addEstimateLine: (estimateId: number, line: { description: string; quantity: number; unit_price: number }) => Promise<void>;
   deleteEstimateLine: (lineId: number) => Promise<void>;
-  convertEstimate: (id: number) => Promise<{ job_id: number; invoice_id: number }>;
+  convertEstimate: (id: number) => Promise<{ job_id: number; invoice_id: number; deposit_invoice_id: number | null }>;
+  setEstimateDeposit: (id: number, depositAmount: number | null) => Promise<void>;
+
+  // Structured estimate builder (rooms -> surfaces). Optional layer on top
+  // of plain estimate_lines -- only editable while the estimate is draft.
+  estimateRooms: EstimateRoom[];
+  fetchEstimateRooms: (estimateId: number) => Promise<void>;
+  addEstimateRoom: (estimateId: number, name: string) => Promise<void>;
+  updateEstimateRoom: (roomId: number, estimateId: number, data: { name?: string; sort_order?: number }) => Promise<void>;
+  deleteEstimateRoom: (roomId: number, estimateId: number) => Promise<void>;
+  addEstimateSurface: (roomId: number, estimateId: number, data: { surface_type: string; measurement?: number; prep_notes?: string; coats?: number; paint_product?: string; labor_cost?: number; material_cost?: number }) => Promise<void>;
+  updateEstimateSurface: (surfaceId: number, estimateId: number, data: Partial<{ surface_type: string; measurement: number; prep_notes: string; coats: number; paint_product: string; labor_cost: number; material_cost: number }>) => Promise<void>;
+  deleteEstimateSurface: (surfaceId: number, estimateId: number) => Promise<void>;
 
   // Schedule
   scheduleJobs: Job[];

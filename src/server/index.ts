@@ -90,6 +90,8 @@ const RECURRENCE_INTERVALS = ["weekly", "monthly", "quarterly", "annual"] as con
 // came in (nullable -- may be unknown). Neither auto-transitions.
 const CUSTOMER_STATUSES = ["lead", "active", "inactive"] as const;
 const CUSTOMER_SOURCES = ["referral", "google", "repeat", "website", "other"] as const;
+// Change-order lifecycle -- see /api/change-orders/{id}/approve|reject.
+const CHANGE_ORDER_STATUSES = ["pending", "approved", "rejected"] as const;
 
 // The roles an admin may assign. 'pending' is included so an admin can revoke
 // access by parking a user back at pending; 'admin' is included so an admin
@@ -293,12 +295,27 @@ app.use("/api/*", async (c, next) => {
   if (path.startsWith("/api/technicians")) {
     return c.json({ error: "forbidden" }, 403);
   }
-  if (path.startsWith("/api/invoices") || path.startsWith("/api/invoice-lines") || /^\/api\/jobs\/[^/]+\/invoice$/.test(path)) {
+  // /^\/api\/jobs\/[^/]+\/invoice$/ covers the original singular
+  // invoice-from-job route; /invoices (plural, progress billing) and
+  // /change-orders are the same class of money-adjacent job sub-resource, so
+  // they get the same blanket block here rather than a per-route check.
+  if (
+    path.startsWith("/api/invoices") || path.startsWith("/api/invoice-lines") ||
+    /^\/api\/jobs\/[^/]+\/invoice$/.test(path) ||
+    /^\/api\/jobs\/[^/]+\/invoices$/.test(path) ||
+    /^\/api\/jobs\/[^/]+\/change-orders$/.test(path) ||
+    path.startsWith("/api/change-orders")
+  ) {
     return c.json({ error: "forbidden" }, 403);
   }
   // Estimates are a sales/estimating task (admin, office, estimator) --
   // technicians get no access at all, matching the invoices block above.
-  if (path.startsWith("/api/estimates") || path.startsWith("/api/estimate-lines")) {
+  // estimate-rooms/estimate-surfaces (the structured builder) are the same
+  // sales/estimating surface, so they're blocked the same way.
+  if (
+    path.startsWith("/api/estimates") || path.startsWith("/api/estimate-lines") ||
+    path.startsWith("/api/estimate-rooms") || path.startsWith("/api/estimate-surfaces")
+  ) {
     return c.json({ error: "forbidden" }, 403);
   }
   // Service agreements (recurring-job templates) are an office/admin/
@@ -484,6 +501,9 @@ const EstimateSchema = z.object({
   brand_name: z.string().nullable().optional(),
   brand_color_primary: z.string().nullable().optional(),
   brand_color_secondary: z.string().nullable().optional(),
+  // NEW: optional deposit amount (<= estimate total), set while the estimate
+  // is draft/sent/approved. See /api/estimates/{id}/deposit.
+  deposit_amount: z.number().nullable().optional(),
   created_at: z.string(),
 }).openapi("Estimate");
 
@@ -495,6 +515,39 @@ const EstimateLineSchema = z.object({
   unit_price: z.number().nullable(),
   total: z.number().nullable(),
 }).openapi("EstimateLine");
+
+// NEW (structured estimate builder): rooms -> surfaces.
+const EstimateSurfaceSchema = z.object({
+  id: z.number().int(),
+  room_id: z.number().int(),
+  surface_type: z.string(),
+  measurement: z.number(),
+  prep_notes: z.string().nullable(),
+  coats: z.number().int(),
+  paint_product: z.string().nullable(),
+  labor_cost: z.number(),
+  material_cost: z.number(),
+  sort_order: z.number().int(),
+  generated_line_id: z.number().int().nullable(),
+}).openapi("EstimateSurface");
+
+const EstimateRoomSchema = z.object({
+  id: z.number().int(),
+  estimate_id: z.number().int(),
+  name: z.string(),
+  sort_order: z.number().int(),
+  surfaces: z.array(EstimateSurfaceSchema).optional(),
+}).openapi("EstimateRoom");
+
+// NEW (change orders): job-scoped, technician-blocked money adjustment.
+const ChangeOrderSchema = z.object({
+  id: z.number().int(),
+  job_id: z.number().int(),
+  description: z.string(),
+  amount: z.number(),
+  status: z.string(),
+  created_at: z.string(),
+}).openapi("ChangeOrder");
 
 const JobNoteSchema = z.object({
   id: z.number().int(),
@@ -2857,6 +2910,62 @@ app.openapi(getInvoice, async (c) => {
   return c.json({ invoice: { ...invoice, lines: linesOut, payments: paymentsOut } }, 200);
 });
 
+// Shared invoice-line shape used by createInvoice, invoiceFromJob's progress-
+// billing sibling, and change-order approval -- kept in one place so the
+// subtotal/tax/total math (and the invoice-row insert shape) is never
+// duplicated across those call sites.
+const invoiceLineInput = z.object({
+  description: zName,
+  quantity: zPositive,
+  unit_price: zMoney,
+});
+
+// Inserts a new invoice + its lines, computing subtotal/tax_amount/total from
+// the lines exactly like createInvoice's route handler does. Returns the new
+// invoice's id. Does NOT do referential-sanity checks on customer_id/job_id/
+// brand_id (callers that accept those as raw client input, like createInvoice,
+// still do their own checks before calling this -- callers that derive
+// customer_id/job_id from an already-loaded job/estimate row, like the
+// progress-billing and change-order routes, don't need to re-check).
+async function createInvoiceWithLines(
+  db: ReturnType<typeof getDb>,
+  input: { customerId: number; jobId: number | null; taxRate: number; notes: string; dueDate: string; brandId: number | null; status?: string; lines: { description: string; quantity: number; unit_price: number }[] },
+): Promise<number> {
+  const identifier = await nextInvoiceIdentifier(db);
+  let subtotal = 0;
+  for (const line of input.lines) {
+    subtotal += line.quantity * line.unit_price;
+  }
+  const taxAmount = subtotal * (input.taxRate / 100);
+  const total = subtotal + taxAmount;
+
+  await db.insert(schema.invoices).values({
+    identifier,
+    customerId: input.customerId,
+    jobId: input.jobId,
+    status: input.status || "draft",
+    subtotal,
+    taxRate: input.taxRate,
+    taxAmount,
+    total,
+    notes: input.notes,
+    dueDate: input.dueDate,
+    brandId: input.brandId,
+  });
+  const invoice = await db.select({ id: schema.invoices.id }).from(schema.invoices).where(eq(schema.invoices.identifier, identifier)).get();
+  for (const line of input.lines) {
+    const lineTotal = line.quantity * line.unit_price;
+    await db.insert(schema.invoiceLines).values({
+      invoiceId: invoice!.id,
+      description: line.description,
+      quantity: line.quantity,
+      unitPrice: line.unit_price,
+      total: lineTotal,
+    });
+  }
+  return invoice!.id;
+}
+
 const createInvoice = createRoute({
   method: "post",
   path: "/api/invoices",
@@ -2885,53 +2994,12 @@ const createInvoice = createRoute({
   },
 });
 
-app.openapi(createInvoice, async (c) => {
-  const db = getDb(c.env);
-  const data = c.req.valid("json");
-  // Referential sanity before we mint an identifier / insert.
-  if (!(await customerExists(db, data.customer_id))) return c.json({ error: "Customer not found" }, 400);
-  if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
-  if (data.job_id !== null && data.job_id !== undefined) {
-    const jobRow = await db.select({ id: schema.jobs.id }).from(schema.jobs).where(eq(schema.jobs.id, data.job_id)).get();
-    if (!jobRow) return c.json({ error: "Job not found" }, 400);
-  }
-  const identifier = await nextInvoiceIdentifier(db);
-  const taxRate = data.tax_rate || 0;
-
-  let subtotal = 0;
-  for (const line of data.lines) {
-    subtotal += line.quantity * line.unit_price;
-  }
-  const taxAmount = subtotal * (taxRate / 100);
-  const total = subtotal + taxAmount;
-
-  await db.insert(schema.invoices).values({
-    identifier,
-    customerId: data.customer_id,
-    jobId: data.job_id ?? null,
-    status: "draft",
-    subtotal,
-    taxRate,
-    taxAmount,
-    total,
-    notes: data.notes || "",
-    dueDate: data.due_date || "",
-    brandId: data.brand_id ?? null,
-  });
-
-  const invoice = await db.select({ id: schema.invoices.id }).from(schema.invoices).where(eq(schema.invoices.identifier, identifier)).get();
-  for (const line of data.lines) {
-    const lineTotal = line.quantity * line.unit_price;
-    await db.insert(schema.invoiceLines).values({
-      invoiceId: invoice!.id,
-      description: line.description,
-      quantity: line.quantity,
-      unitPrice: line.unit_price,
-      total: lineTotal,
-    });
-  }
-
-  const result = await db
+// Single-invoice "joined with denormalized fields" lookup by id -- the same
+// shape createInvoice/invoiceFromJob's siblings return, factored out so it's
+// not retyped at every call site that needs to return a freshly created or
+// updated invoice.
+async function getInvoiceJoinedById(db: ReturnType<typeof getDb>, invoiceId: number) {
+  return db
     .select({
       id: schema.invoices.id,
       identifier: schema.invoices.identifier,
@@ -2956,8 +3024,30 @@ app.openapi(createInvoice, async (c) => {
     .from(schema.invoices)
     .leftJoin(schema.customers, eq(schema.invoices.customerId, schema.customers.id))
     .leftJoin(schema.brands, eq(schema.invoices.brandId, schema.brands.id))
-    .where(eq(schema.invoices.id, invoice!.id))
+    .where(eq(schema.invoices.id, invoiceId))
     .get();
+}
+
+app.openapi(createInvoice, async (c) => {
+  const db = getDb(c.env);
+  const data = c.req.valid("json");
+  // Referential sanity before we mint an identifier / insert.
+  if (!(await customerExists(db, data.customer_id))) return c.json({ error: "Customer not found" }, 400);
+  if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
+  if (data.job_id !== null && data.job_id !== undefined) {
+    const jobRow = await db.select({ id: schema.jobs.id }).from(schema.jobs).where(eq(schema.jobs.id, data.job_id)).get();
+    if (!jobRow) return c.json({ error: "Job not found" }, 400);
+  }
+  const invoiceId = await createInvoiceWithLines(db, {
+    customerId: data.customer_id,
+    jobId: data.job_id ?? null,
+    taxRate: data.tax_rate || 0,
+    notes: data.notes || "",
+    dueDate: data.due_date || "",
+    brandId: data.brand_id ?? null,
+    lines: data.lines,
+  });
+  const result = await getInvoiceJoinedById(db, invoiceId);
   return c.json(result!, 201);
 });
 
@@ -3291,6 +3381,110 @@ app.openapi(invoiceFromJob, async (c) => {
   return c.json({ ok: true, invoice_id: inv!.id }, 201);
 });
 
+// ── Progress billing (additional invoices on a job) ────────────────
+// A job may already have one or more invoices (the initial invoiceFromJob
+// above, a deposit invoice from convertEstimate, prior progress invoices) --
+// this route adds ANOTHER one for a progress payment, reusing
+// createInvoiceWithLines rather than duplicating the total-computation
+// logic. Accepts either a single { description, amount, tax_rate } shape or
+// a full lines array (matching the existing invoice-lines shape) so the
+// caller can bill either a lump-sum progress payment or an itemized one.
+
+// GET a job's full invoice history (every invoice with job_id = this job,
+// not just the most recent) -- lets job-detail.tsx show deposit + final +
+// any progress invoices together instead of just one.
+const listJobInvoices = createRoute({
+  method: "get",
+  path: "/api/jobs/{id}/invoices",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Invoices for a job", content: { "application/json": { schema: z.any() } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(listJobInvoices, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const job = await db.select({ id: schema.jobs.id }).from(schema.jobs).where(eq(schema.jobs.id, idNum)).get();
+  if (!job) return c.json({ error: "Job not found" }, 404);
+  const rows = await db
+    .select({
+      id: schema.invoices.id,
+      identifier: schema.invoices.identifier,
+      customer_id: schema.invoices.customerId,
+      job_id: schema.invoices.jobId,
+      status: schema.invoices.status,
+      subtotal: schema.invoices.subtotal,
+      tax_rate: schema.invoices.taxRate,
+      tax_amount: schema.invoices.taxAmount,
+      total: schema.invoices.total,
+      notes: schema.invoices.notes,
+      due_date: schema.invoices.dueDate,
+      paid_date: schema.invoices.paidDate,
+      created_at: schema.invoices.createdAt,
+      updated_at: schema.invoices.updatedAt,
+      brand_id: schema.invoices.brandId,
+    })
+    .from(schema.invoices)
+    .where(eq(schema.invoices.jobId, idNum))
+    .orderBy(asc(schema.invoices.createdAt))
+    .all();
+  return c.json({ invoices: rows }, 200);
+});
+
+const jobProgressInvoice = createRoute({
+  method: "post",
+  path: "/api/jobs/{id}/invoices",
+  request: {
+    params: IdParam,
+    body: { content: { "application/json": { schema: z.union([
+      z.object({
+        description: zName,
+        // zPositive (not zMoney) -- a $0 progress invoice is pointless
+        // invoice-history clutter, not a legitimate zero-value bill.
+        amount: zPositive,
+        tax_rate: zTaxRate.optional(),
+        due_date: zDate.optional(),
+      }),
+      z.object({
+        lines: z.array(invoiceLineInput).min(1, { message: "An invoice must have at least one line item" }),
+        tax_rate: zTaxRate.optional(),
+        due_date: zDate.optional(),
+      }),
+    ]) } } },
+  },
+  responses: {
+    201: { description: "Progress invoice created", content: { "application/json": { schema: z.any() } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(jobProgressInvoice, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const job = await db.select({ id: schema.jobs.id, customerId: schema.jobs.customerId, brandId: schema.jobs.brandId }).from(schema.jobs).where(eq(schema.jobs.id, idNum)).get();
+  if (!job) return c.json({ error: "Job not found" }, 404);
+
+  const data = c.req.valid("json");
+  const lines = "lines" in data ? data.lines : [{ description: data.description, quantity: 1, unit_price: data.amount }];
+
+  const invoiceId = await createInvoiceWithLines(db, {
+    customerId: job.customerId,
+    jobId: job.id,
+    taxRate: data.tax_rate || 0,
+    notes: "",
+    dueDate: data.due_date || "",
+    brandId: job.brandId ?? null,
+    lines,
+  });
+  const result = await getInvoiceJoinedById(db, invoiceId);
+  return c.json(result!, 201);
+});
+
 // ── Invoice line management ────────────────────────────────────────
 // Mirrors the estimate line routes (add/delete + recompute). Technicians are
 // already 403'd on the whole /api/invoices family by the blanket role-gate,
@@ -3392,6 +3586,7 @@ function estimateJoinedSelect(db: ReturnType<typeof getDb>) {
       public_token: schema.estimates.publicToken,
       signed_name: schema.estimates.signedName,
       signed_at: schema.estimates.signedAt,
+      deposit_amount: schema.estimates.depositAmount,
       created_at: schema.estimates.createdAt,
       customer_name: schema.customers.name,
       brand_name: schema.brands.name,
@@ -3847,6 +4042,426 @@ app.openapi(deleteEstimateLine, async (c) => {
   return c.json({ ok: true }, 200);
 });
 
+// ── Structured estimate builder (rooms -> surfaces) ────────────────
+// Optional, additive layer on top of the plain estimate_lines model: an
+// estimate can still use flat lines directly (the ~10 seeded estimates keep
+// their existing lines untouched -- nothing here ever runs against an
+// estimate that has no rooms). Only editable while the parent estimate is
+// 'draft', mirroring the existing edit-lock pattern used for paid/cancelled
+// invoices elsewhere in this file. Every mutation here auto-syncs a matching
+// estimate_lines row so the existing subtotal/tax/total, PDF, and convert
+// pipelines keep working unmodified.
+
+// Builds the human-readable generated-line description for a surface, e.g.
+// "Living Room -- Walls (2 coats, Sherwin Williams Duration)".
+function surfaceLineDescription(roomName: string, surfaceType: string, coats: number, paintProduct: string | null | undefined): string {
+  const coatsPart = `${coats} coat${coats === 1 ? "" : "s"}`;
+  const productPart = paintProduct && paintProduct.trim() ? `, ${paintProduct.trim()}` : "";
+  return `${roomName} -- ${surfaceType} (${coatsPart}${productPart})`;
+}
+
+// Inserts/updates/removes the single estimate_lines row generated from a
+// surface, keeping estimate_surfaces.generated_line_id pointed at it, then
+// recomputes the parent estimate's totals. Called after every surface
+// create/update/delete so estimate_lines never drifts from the builder.
+// Deliberately does everything needed for one surface in one place so every
+// call site (create/update/delete surface, delete room) stays a single call.
+async function syncEstimateLineForSurface(
+  db: ReturnType<typeof getDb>,
+  estimateId: number,
+  roomName: string,
+  surface: { id: number; surfaceType: string; coats: number; paintProduct: string | null; laborCost: number; materialCost: number; generatedLineId: number | null },
+): Promise<void> {
+  const description = surfaceLineDescription(roomName, surface.surfaceType, surface.coats, surface.paintProduct);
+  const total = (surface.laborCost || 0) + (surface.materialCost || 0);
+  if (surface.generatedLineId) {
+    const existingLine = await db.select({ id: schema.estimateLines.id }).from(schema.estimateLines).where(eq(schema.estimateLines.id, surface.generatedLineId)).get();
+    if (existingLine) {
+      await db.update(schema.estimateLines).set({ description, quantity: 1, unitPrice: total, total }).where(eq(schema.estimateLines.id, surface.generatedLineId));
+      return;
+    }
+  }
+  await db.insert(schema.estimateLines).values({ estimateId, description, quantity: 1, unitPrice: total, total });
+  const inserted = await db.select({ id: schema.estimateLines.id }).from(schema.estimateLines).where(eq(schema.estimateLines.estimateId, estimateId)).orderBy(desc(schema.estimateLines.id)).limit(1).get();
+  await db.update(schema.estimateSurfaces).set({ generatedLineId: inserted!.id }).where(eq(schema.estimateSurfaces.id, surface.id));
+}
+
+// Removes a surface's generated estimate_lines row (used when the surface or
+// its parent room is deleted).
+async function removeGeneratedLine(db: ReturnType<typeof getDb>, generatedLineId: number | null): Promise<void> {
+  if (!generatedLineId) return;
+  await db.delete(schema.estimateLines).where(eq(schema.estimateLines.id, generatedLineId));
+}
+
+function estimateSurfaceOut(row: typeof schema.estimateSurfaces.$inferSelect) {
+  return {
+    id: row.id,
+    room_id: row.roomId,
+    surface_type: row.surfaceType,
+    measurement: row.measurement,
+    prep_notes: row.prepNotes,
+    coats: row.coats,
+    paint_product: row.paintProduct,
+    labor_cost: row.laborCost,
+    material_cost: row.materialCost,
+    sort_order: row.sortOrder,
+    generated_line_id: row.generatedLineId,
+  };
+}
+
+function estimateRoomOut(row: typeof schema.estimateRooms.$inferSelect) {
+  return { id: row.id, estimate_id: row.estimateId, name: row.name, sort_order: row.sortOrder };
+}
+
+// GET /api/estimates/{id}/rooms -- rooms with their nested surfaces. Viewable
+// regardless of estimate status (read-only once frozen); only the write
+// routes below enforce the draft-only edit lock.
+const listEstimateRooms = createRoute({
+  method: "get",
+  path: "/api/estimates/{id}/rooms",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Rooms with surfaces", content: { "application/json": { schema: z.object({ rooms: z.array(EstimateRoomSchema) }) } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(listEstimateRooms, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const estimate = await db.select({ id: schema.estimates.id }).from(schema.estimates).where(eq(schema.estimates.id, idNum)).get();
+  if (!estimate) return c.json({ error: "Estimate not found" }, 404);
+  const rooms = await db.select().from(schema.estimateRooms).where(eq(schema.estimateRooms.estimateId, idNum)).orderBy(asc(schema.estimateRooms.sortOrder), asc(schema.estimateRooms.id)).all();
+  const surfaces = await db
+    .select()
+    .from(schema.estimateSurfaces)
+    .innerJoin(schema.estimateRooms, eq(schema.estimateSurfaces.roomId, schema.estimateRooms.id))
+    .where(eq(schema.estimateRooms.estimateId, idNum))
+    .orderBy(asc(schema.estimateSurfaces.sortOrder), asc(schema.estimateSurfaces.id))
+    .all();
+  const byRoom = new Map<number, ReturnType<typeof estimateSurfaceOut>[]>();
+  for (const row of surfaces) {
+    const s = row.estimate_surfaces;
+    const list = byRoom.get(s.roomId) || [];
+    list.push(estimateSurfaceOut(s));
+    byRoom.set(s.roomId, list);
+  }
+  const roomsOut = rooms.map((r) => ({ ...estimateRoomOut(r), surfaces: byRoom.get(r.id) || [] }));
+  return c.json({ rooms: roomsOut }, 200);
+});
+
+const addEstimateRoom = createRoute({
+  method: "post",
+  path: "/api/estimates/{id}/rooms",
+  request: {
+    params: IdParam,
+    body: { content: { "application/json": { schema: z.object({ name: zName, sort_order: z.number().int().optional() }) } } },
+  },
+  responses: {
+    201: { description: "Room created", content: { "application/json": { schema: EstimateRoomSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Locked", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(addEstimateRoom, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const estimate = await db.select({ id: schema.estimates.id, status: schema.estimates.status }).from(schema.estimates).where(eq(schema.estimates.id, idNum)).get();
+  if (!estimate) return c.json({ error: "Estimate not found" }, 404);
+  if (estimate.status !== "draft") {
+    return c.json({ error: `Cannot edit the structured builder on a ${estimate.status} estimate -- only draft estimates can be edited.` }, 409);
+  }
+  const data = c.req.valid("json");
+  await db.insert(schema.estimateRooms).values({ estimateId: idNum, name: data.name, sortOrder: data.sort_order ?? 0 });
+  const room = await db.select().from(schema.estimateRooms).where(eq(schema.estimateRooms.estimateId, idNum)).orderBy(desc(schema.estimateRooms.id)).limit(1).get();
+  return c.json(estimateRoomOut(room!), 201);
+});
+
+const updateEstimateRoom = createRoute({
+  method: "put",
+  path: "/api/estimate-rooms/{id}",
+  request: {
+    params: IdParam,
+    body: { content: { "application/json": { schema: z.object({ name: zName.optional(), sort_order: z.number().int().optional() }) } } },
+  },
+  responses: {
+    200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Locked", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(updateEstimateRoom, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const room = await db.select().from(schema.estimateRooms).where(eq(schema.estimateRooms.id, idNum)).get();
+  if (!room) return c.json({ error: "Room not found" }, 404);
+  const estimate = await db.select({ status: schema.estimates.status }).from(schema.estimates).where(eq(schema.estimates.id, room.estimateId)).get();
+  if (!estimate) return c.json({ error: "Estimate not found" }, 404);
+  if (estimate.status !== "draft") {
+    return c.json({ error: `Cannot edit the structured builder on a ${estimate.status} estimate -- only draft estimates can be edited.` }, 409);
+  }
+  const data = c.req.valid("json");
+  const updates: Record<string, unknown> = {};
+  if (data.name !== undefined) updates.name = data.name;
+  if (data.sort_order !== undefined) updates.sortOrder = data.sort_order;
+  if (Object.keys(updates).length > 0) {
+    await db.update(schema.estimateRooms).set(updates).where(eq(schema.estimateRooms.id, idNum));
+  }
+  // Renaming a room changes every surface's generated line description
+  // (the room name is baked into it) -- re-sync all of them so the lines
+  // stay accurate.
+  if (data.name !== undefined) {
+    const surfaces = await db.select().from(schema.estimateSurfaces).where(eq(schema.estimateSurfaces.roomId, idNum)).all();
+    for (const s of surfaces) {
+      await syncEstimateLineForSurface(db, room.estimateId, data.name, {
+        id: s.id, surfaceType: s.surfaceType, coats: s.coats, paintProduct: s.paintProduct,
+        laborCost: s.laborCost, materialCost: s.materialCost, generatedLineId: s.generatedLineId,
+      });
+    }
+    await recomputeEstimateTotals(db, room.estimateId);
+  }
+  return c.json({ ok: true }, 200);
+});
+
+const deleteEstimateRoom = createRoute({
+  method: "delete",
+  path: "/api/estimate-rooms/{id}",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Deleted", content: { "application/json": { schema: OkSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Locked", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(deleteEstimateRoom, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const room = await db.select().from(schema.estimateRooms).where(eq(schema.estimateRooms.id, idNum)).get();
+  if (!room) return c.json({ error: "Room not found" }, 404);
+  const estimate = await db.select({ status: schema.estimates.status }).from(schema.estimates).where(eq(schema.estimates.id, room.estimateId)).get();
+  if (!estimate) return c.json({ error: "Estimate not found" }, 404);
+  if (estimate.status !== "draft") {
+    return c.json({ error: `Cannot edit the structured builder on a ${estimate.status} estimate -- only draft estimates can be edited.` }, 409);
+  }
+  // Remove every surface's generated line before the cascade delete removes
+  // the surfaces themselves (estimate_surfaces has ON DELETE CASCADE off
+  // estimate_rooms, but estimate_lines has no FK back to estimate_surfaces,
+  // so those generated lines would otherwise be orphaned).
+  const surfaces = await db.select({ generatedLineId: schema.estimateSurfaces.generatedLineId }).from(schema.estimateSurfaces).where(eq(schema.estimateSurfaces.roomId, idNum)).all();
+  for (const s of surfaces) {
+    await removeGeneratedLine(db, s.generatedLineId);
+  }
+  await db.delete(schema.estimateRooms).where(eq(schema.estimateRooms.id, idNum));
+  await recomputeEstimateTotals(db, room.estimateId);
+  return c.json({ ok: true }, 200);
+});
+
+const addEstimateSurface = createRoute({
+  method: "post",
+  path: "/api/estimate-rooms/{id}/surfaces",
+  request: {
+    params: IdParam,
+    body: { content: { "application/json": { schema: z.object({
+      surface_type: zName,
+      measurement: zMoney.optional(),
+      prep_notes: z.string().optional(),
+      coats: z.number().int().positive().optional(),
+      paint_product: z.string().optional(),
+      labor_cost: zMoney.optional(),
+      material_cost: zMoney.optional(),
+      sort_order: z.number().int().optional(),
+    }) } } },
+  },
+  responses: {
+    201: { description: "Surface created", content: { "application/json": { schema: EstimateSurfaceSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Locked", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(addEstimateSurface, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const room = await db.select().from(schema.estimateRooms).where(eq(schema.estimateRooms.id, idNum)).get();
+  if (!room) return c.json({ error: "Room not found" }, 404);
+  const estimate = await db.select({ status: schema.estimates.status }).from(schema.estimates).where(eq(schema.estimates.id, room.estimateId)).get();
+  if (!estimate) return c.json({ error: "Estimate not found" }, 404);
+  if (estimate.status !== "draft") {
+    return c.json({ error: `Cannot edit the structured builder on a ${estimate.status} estimate -- only draft estimates can be edited.` }, 409);
+  }
+  const data = c.req.valid("json");
+  await db.insert(schema.estimateSurfaces).values({
+    roomId: idNum,
+    surfaceType: data.surface_type,
+    measurement: data.measurement ?? 0,
+    prepNotes: data.prep_notes || null,
+    coats: data.coats ?? 2,
+    paintProduct: data.paint_product || null,
+    laborCost: data.labor_cost ?? 0,
+    materialCost: data.material_cost ?? 0,
+    sortOrder: data.sort_order ?? 0,
+  });
+  const surface = await db.select().from(schema.estimateSurfaces).where(eq(schema.estimateSurfaces.roomId, idNum)).orderBy(desc(schema.estimateSurfaces.id)).limit(1).get();
+  // Atomic-with-the-mutation sync: the generated estimate_lines row is
+  // created (and totals recomputed) as part of this same request, before the
+  // response is returned -- there's no window where estimate_lines reflects
+  // a stale/missing state relative to the surfaces that exist.
+  await syncEstimateLineForSurface(db, room.estimateId, room.name, {
+    id: surface!.id, surfaceType: surface!.surfaceType, coats: surface!.coats, paintProduct: surface!.paintProduct,
+    laborCost: surface!.laborCost, materialCost: surface!.materialCost, generatedLineId: surface!.generatedLineId,
+  });
+  await recomputeEstimateTotals(db, room.estimateId);
+  const fresh = await db.select().from(schema.estimateSurfaces).where(eq(schema.estimateSurfaces.id, surface!.id)).get();
+  return c.json(estimateSurfaceOut(fresh!), 201);
+});
+
+const updateEstimateSurface = createRoute({
+  method: "put",
+  path: "/api/estimate-surfaces/{id}",
+  request: {
+    params: IdParam,
+    body: { content: { "application/json": { schema: z.object({
+      surface_type: zName.optional(),
+      measurement: zMoney.optional(),
+      prep_notes: z.string().optional(),
+      coats: z.number().int().positive().optional(),
+      paint_product: z.string().optional(),
+      labor_cost: zMoney.optional(),
+      material_cost: zMoney.optional(),
+      sort_order: z.number().int().optional(),
+    }) } } },
+  },
+  responses: {
+    200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Locked", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(updateEstimateSurface, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const surface = await db.select().from(schema.estimateSurfaces).where(eq(schema.estimateSurfaces.id, idNum)).get();
+  if (!surface) return c.json({ error: "Surface not found" }, 404);
+  const room = await db.select().from(schema.estimateRooms).where(eq(schema.estimateRooms.id, surface.roomId)).get();
+  if (!room) return c.json({ error: "Room not found" }, 404);
+  const estimate = await db.select({ status: schema.estimates.status }).from(schema.estimates).where(eq(schema.estimates.id, room.estimateId)).get();
+  if (!estimate) return c.json({ error: "Estimate not found" }, 404);
+  if (estimate.status !== "draft") {
+    return c.json({ error: `Cannot edit the structured builder on a ${estimate.status} estimate -- only draft estimates can be edited.` }, 409);
+  }
+  const data = c.req.valid("json");
+  const updates: Record<string, unknown> = {};
+  if (data.surface_type !== undefined) updates.surfaceType = data.surface_type;
+  if (data.measurement !== undefined) updates.measurement = data.measurement;
+  if (data.prep_notes !== undefined) updates.prepNotes = data.prep_notes || null;
+  if (data.coats !== undefined) updates.coats = data.coats;
+  if (data.paint_product !== undefined) updates.paintProduct = data.paint_product || null;
+  if (data.labor_cost !== undefined) updates.laborCost = data.labor_cost;
+  if (data.material_cost !== undefined) updates.materialCost = data.material_cost;
+  if (data.sort_order !== undefined) updates.sortOrder = data.sort_order;
+  if (Object.keys(updates).length > 0) {
+    await db.update(schema.estimateSurfaces).set(updates).where(eq(schema.estimateSurfaces.id, idNum));
+  }
+  const fresh = await db.select().from(schema.estimateSurfaces).where(eq(schema.estimateSurfaces.id, idNum)).get();
+  await syncEstimateLineForSurface(db, room.estimateId, room.name, {
+    id: fresh!.id, surfaceType: fresh!.surfaceType, coats: fresh!.coats, paintProduct: fresh!.paintProduct,
+    laborCost: fresh!.laborCost, materialCost: fresh!.materialCost, generatedLineId: fresh!.generatedLineId,
+  });
+  await recomputeEstimateTotals(db, room.estimateId);
+  return c.json({ ok: true }, 200);
+});
+
+const deleteEstimateSurface = createRoute({
+  method: "delete",
+  path: "/api/estimate-surfaces/{id}",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Deleted", content: { "application/json": { schema: OkSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Locked", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(deleteEstimateSurface, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const surface = await db.select().from(schema.estimateSurfaces).where(eq(schema.estimateSurfaces.id, idNum)).get();
+  if (!surface) return c.json({ error: "Surface not found" }, 404);
+  const room = await db.select().from(schema.estimateRooms).where(eq(schema.estimateRooms.id, surface.roomId)).get();
+  if (!room) return c.json({ error: "Room not found" }, 404);
+  const estimate = await db.select({ status: schema.estimates.status }).from(schema.estimates).where(eq(schema.estimates.id, room.estimateId)).get();
+  if (!estimate) return c.json({ error: "Estimate not found" }, 404);
+  if (estimate.status !== "draft") {
+    return c.json({ error: `Cannot edit the structured builder on a ${estimate.status} estimate -- only draft estimates can be edited.` }, 409);
+  }
+  await removeGeneratedLine(db, surface.generatedLineId);
+  await db.delete(schema.estimateSurfaces).where(eq(schema.estimateSurfaces.id, idNum));
+  await recomputeEstimateTotals(db, room.estimateId);
+  return c.json({ ok: true }, 200);
+});
+
+// ── Estimate deposit ────────────────────────────────────────────────
+
+const setEstimateDeposit = createRoute({
+  method: "put",
+  path: "/api/estimates/{id}/deposit",
+  request: {
+    params: IdParam,
+    body: { content: { "application/json": { schema: z.object({
+      // null/0 clears the deposit.
+      deposit_amount: zMoney.nullable(),
+    }) } } },
+  },
+  responses: {
+    200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Invalid state", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(setEstimateDeposit, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const estimate = await db.select({ status: schema.estimates.status, total: schema.estimates.total }).from(schema.estimates).where(eq(schema.estimates.id, idNum)).get();
+  if (!estimate) return c.json({ error: "Estimate not found" }, 404);
+  // Settable while the estimate is still "live" -- draft/sent/approved.
+  // Once converted/declined/expired the deposit either already moved money
+  // (converted) or is moot (declined/expired), so it's frozen like the rest
+  // of the document at that point.
+  if (!["draft", "sent", "approved"].includes(estimate.status)) {
+    return c.json({ error: `Cannot set a deposit on a ${estimate.status} estimate.` }, 409);
+  }
+  const data = c.req.valid("json");
+  const depositAmount = data.deposit_amount;
+  if (depositAmount !== null && depositAmount > (estimate.total || 0) + 0.005) {
+    return c.json({ error: `Deposit cannot exceed the estimate total (${(estimate.total || 0).toFixed(2)}).` }, 400);
+  }
+  // Store 0 the same as null -- both mean "no deposit" (convertEstimate's
+  // `depositAmount && depositAmount > 0` guard already treats them the same,
+  // but normalizing here too keeps the stored value matching the "null/0
+  // clears the deposit" contract above instead of leaving a stray literal 0).
+  const storedDeposit = depositAmount === null || depositAmount === 0 ? null : depositAmount;
+  await db.update(schema.estimates).set({ depositAmount: storedDeposit }).where(eq(schema.estimates.id, idNum));
+  return c.json({ ok: true }, 200);
+});
+
 // ── Convert estimate to job + invoice ──────────────────────────────
 // Only valid when status is "approved". Creates a new scheduled job priced
 // at the estimate's total, plus a new draft invoice whose lines are a 1:1
@@ -3859,7 +4474,7 @@ const convertEstimate = createRoute({
   path: "/api/estimates/{id}/convert",
   request: { params: IdParam },
   responses: {
-    201: { description: "Converted", content: { "application/json": { schema: z.object({ ok: z.boolean(), job_id: z.number().int(), invoice_id: z.number().int() }) } } },
+    201: { description: "Converted", content: { "application/json": { schema: z.object({ ok: z.boolean(), job_id: z.number().int(), invoice_id: z.number().int(), deposit_invoice_id: z.number().int().nullable() }) } } },
     404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
     409: { description: "Invalid state transition", content: { "application/json": { schema: ErrorSchema } } },
   },
@@ -3947,13 +4562,218 @@ app.openapi(convertEstimate, async (c) => {
     });
   }
 
+  // ── Deposit invoice ──
+  // If the estimate has a deposit_amount set (> 0), mint a SECOND invoice for
+  // just that amount: status "sent" (due immediately -- a deposit is
+  // typically collected right away, not left in draft), a single "Deposit"
+  // line, linked to the same job_id. invoices.job_id has no uniqueness
+  // constraint (confirmed against migrations/meta/0003_snapshot.json's
+  // invoices table indexes -- idx_invoices_job is non-unique), so two
+  // invoices on one job is already schema-legal.
+  //
+  // The deposit is a credit toward the job total, not an addition to it: the
+  // "final" invoice gets an offsetting negative "Less: Deposit paid" line
+  // (via the same recomputeInvoiceTotals() every other line-mutating route
+  // uses) so the two invoices always sum to exactly the estimate's total --
+  // never an over-collection. An earlier version of this left the final
+  // invoice at full value, which double-billed the deposit; adversarial
+  // review caught it live (estimate total $110 + $40 deposit produced $150 of
+  // invoices) before this shipped.
+  let depositInvoiceId: number | null = null;
+  const depositAmount = estimate.depositAmount;
+  if (depositAmount && depositAmount > 0) {
+    const depositIdentifier = await nextInvoiceIdentifier(db);
+    await db.insert(schema.invoices).values({
+      identifier: depositIdentifier,
+      customerId: estimate.customerId,
+      jobId,
+      status: "sent",
+      subtotal: depositAmount,
+      taxRate: 0,
+      taxAmount: 0,
+      total: depositAmount,
+      notes: `Deposit for estimate ${estimate.identifier || ""}`.trim(),
+      dueDate: today,
+      brandId: estimate.brandId ?? null,
+    });
+    const depositInvoice = await db.select({ id: schema.invoices.id }).from(schema.invoices).where(eq(schema.invoices.identifier, depositIdentifier)).get();
+    depositInvoiceId = depositInvoice!.id;
+    await db.insert(schema.invoiceLines).values({
+      invoiceId: depositInvoiceId,
+      description: "Deposit",
+      quantity: 1,
+      unitPrice: depositAmount,
+      total: depositAmount,
+    });
+
+    // Credit the deposit against the final invoice so the two never sum to
+    // more than the estimate's total.
+    await db.insert(schema.invoiceLines).values({
+      invoiceId,
+      description: "Less: Deposit paid",
+      quantity: 1,
+      unitPrice: -depositAmount,
+      total: -depositAmount,
+    });
+    await recomputeInvoiceTotals(db, invoiceId);
+  }
+
   // Mark converted so a second call 409s (the `status !== "approved"` check
   // above) instead of silently minting a duplicate job+invoice. Without
   // this, clicking Convert twice -- or retrying after a slow response --
   // creates a second real job and invoice for the same estimate.
   await db.update(schema.estimates).set({ status: "converted" }).where(eq(schema.estimates.id, idNum));
 
-  return c.json({ ok: true, job_id: jobId, invoice_id: invoiceId }, 201);
+  return c.json({ ok: true, job_id: jobId, invoice_id: invoiceId, deposit_invoice_id: depositInvoiceId }, 201);
+});
+
+// ── Change Orders ───────────────────────────────────────────────────
+// Job-scoped money adjustments. Technicians get zero access (blocked by the
+// blanket role-gate middleware above, matching the /api/invoices and
+// /api/estimates blanket blocks). Approving a change order moves money onto
+// an invoice; rejecting one does not.
+
+function changeOrderOut(row: typeof schema.changeOrders.$inferSelect) {
+  return { id: row.id, job_id: row.jobId, description: row.description, amount: row.amount, status: row.status, created_at: row.createdAt ?? "" };
+}
+
+const listJobChangeOrders = createRoute({
+  method: "get",
+  path: "/api/jobs/{id}/change-orders",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Change orders for a job", content: { "application/json": { schema: z.object({ change_orders: z.array(ChangeOrderSchema) }) } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(listJobChangeOrders, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const job = await db.select({ id: schema.jobs.id }).from(schema.jobs).where(eq(schema.jobs.id, idNum)).get();
+  if (!job) return c.json({ error: "Job not found" }, 404);
+  const rows = await db.select().from(schema.changeOrders).where(eq(schema.changeOrders.jobId, idNum)).orderBy(desc(schema.changeOrders.id)).all();
+  return c.json({ change_orders: rows.map(changeOrderOut) }, 200);
+});
+
+const createChangeOrder = createRoute({
+  method: "post",
+  path: "/api/jobs/{id}/change-orders",
+  request: {
+    params: IdParam,
+    body: { content: { "application/json": { schema: z.object({
+      description: zName,
+      amount: zPositive,
+    }) } } },
+  },
+  responses: {
+    201: { description: "Created", content: { "application/json": { schema: ChangeOrderSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(createChangeOrder, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const job = await db.select({ id: schema.jobs.id }).from(schema.jobs).where(eq(schema.jobs.id, idNum)).get();
+  if (!job) return c.json({ error: "Job not found" }, 404);
+  const data = c.req.valid("json");
+  await db.insert(schema.changeOrders).values({ jobId: idNum, description: data.description, amount: data.amount, status: "pending" });
+  const row = await db.select().from(schema.changeOrders).where(eq(schema.changeOrders.jobId, idNum)).orderBy(desc(schema.changeOrders.id)).limit(1).get();
+  return c.json(changeOrderOut(row!), 201);
+});
+
+const approveChangeOrder = createRoute({
+  method: "put",
+  path: "/api/change-orders/{id}/approve",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Approved", content: { "application/json": { schema: z.object({ ok: z.boolean(), invoice_id: z.number().int() }) } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Invalid state transition", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(approveChangeOrder, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const changeOrder = await db.select().from(schema.changeOrders).where(eq(schema.changeOrders.id, idNum)).get();
+  if (!changeOrder) return c.json({ error: "Change order not found" }, 404);
+  if (changeOrder.status !== "pending") {
+    return c.json({ error: `Cannot approve a change order with status "${changeOrder.status}" -- only pending change orders can be approved` }, 409);
+  }
+
+  // Find the job's most recent invoice still in draft/sent (i.e. not paid/
+  // cancelled) to add the change-order amount onto as a new line. "Most
+  // recent" = highest id, matching created_at order without a second sort key.
+  const targetInvoice = await db
+    .select({ id: schema.invoices.id })
+    .from(schema.invoices)
+    .where(and(eq(schema.invoices.jobId, changeOrder.jobId), inArray(schema.invoices.status, ["draft", "sent"])))
+    .orderBy(desc(schema.invoices.id))
+    .limit(1)
+    .get();
+
+  let invoiceId: number;
+  if (targetInvoice) {
+    invoiceId = targetInvoice.id;
+    const lineTotal = changeOrder.amount;
+    await db.insert(schema.invoiceLines).values({
+      invoiceId,
+      description: `Change Order: ${changeOrder.description}`,
+      quantity: 1,
+      unitPrice: lineTotal,
+      total: lineTotal,
+    });
+    await recomputeInvoiceTotals(db, invoiceId);
+  } else {
+    // No draft/sent invoice exists on this job (e.g. it's brand new, or every
+    // existing invoice is already paid/cancelled) -- create a new invoice for
+    // just the change-order amount, reusing the same createInvoiceWithLines
+    // path progress billing uses.
+    const job = await db.select({ customerId: schema.jobs.customerId, brandId: schema.jobs.brandId }).from(schema.jobs).where(eq(schema.jobs.id, changeOrder.jobId)).get();
+    invoiceId = await createInvoiceWithLines(db, {
+      customerId: job!.customerId,
+      jobId: changeOrder.jobId,
+      taxRate: 0,
+      notes: "",
+      dueDate: "",
+      brandId: job!.brandId ?? null,
+      status: "sent",
+      lines: [{ description: `Change Order: ${changeOrder.description}`, quantity: 1, unit_price: changeOrder.amount }],
+    });
+  }
+
+  await db.update(schema.changeOrders).set({ status: "approved" }).where(eq(schema.changeOrders.id, idNum));
+  return c.json({ ok: true, invoice_id: invoiceId }, 200);
+});
+
+const rejectChangeOrder = createRoute({
+  method: "put",
+  path: "/api/change-orders/{id}/reject",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Rejected", content: { "application/json": { schema: OkSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Invalid state transition", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(rejectChangeOrder, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const changeOrder = await db.select({ status: schema.changeOrders.status }).from(schema.changeOrders).where(eq(schema.changeOrders.id, idNum)).get();
+  if (!changeOrder) return c.json({ error: "Change order not found" }, 404);
+  if (changeOrder.status !== "pending") {
+    return c.json({ error: `Cannot reject a change order with status "${changeOrder.status}" -- only pending change orders can be rejected` }, 409);
+  }
+  await db.update(schema.changeOrders).set({ status: "rejected" }).where(eq(schema.changeOrders.id, idNum));
+  return c.json({ ok: true }, 200);
 });
 
 // ── Service Agreements (recurring-job templates) ──────────────────

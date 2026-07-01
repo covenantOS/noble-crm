@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import { useApp } from "../context";
 import { StatusBadge, PriorityBadge } from "./status-badge";
 import { formatDate, formatTime, formatDuration, formatDateTime, formatMoney } from "../format";
-import { ArrowLeft, Trash2, Send, MapPin, Clock, DollarSign, User, Wrench, Plus, X, CheckSquare, Square, Package, FileText, Palette, Camera, Edit3, Save, CheckCircle } from "lucide-preact";
+import { ArrowLeft, Trash2, Send, MapPin, Clock, DollarSign, User, Wrench, Plus, X, CheckSquare, Square, Package, FileText, Palette, Camera, Edit3, Save, CheckCircle, Receipt, GitPullRequestArrow, Check, Ban } from "lucide-preact";
 import type { AttachmentKind, JobStatus, Priority } from "../types";
 
 const PRIORITIES: Priority[] = ["low", "normal", "high", "urgent"];
@@ -22,6 +22,8 @@ export function JobDetail() {
     addJobMaterial, deleteJobMaterial, materials, createInvoiceFromJob,
     currentUser, brands, serviceTypes,
     jobAttachments, fetchJobAttachments, uploadAttachment, deleteAttachment,
+    jobInvoices, fetchJobInvoices, addJobProgressInvoice,
+    jobChangeOrders, fetchJobChangeOrders, addChangeOrder, approveChangeOrder, rejectChangeOrder,
   } = useApp();
   // Technicians only have ownership of their own job's working fields
   // server-side -- reassignment (customer_id/technician_id), invoicing, and
@@ -48,8 +50,27 @@ export function JobDetail() {
   const [completionNotesInput, setCompletionNotesInput] = useState("");
   const [completing, setCompleting] = useState(false);
 
+  // Progress billing (additional invoices).
+  const [showAddProgressInvoice, setShowAddProgressInvoice] = useState(false);
+  const [progressDesc, setProgressDesc] = useState("");
+  const [progressAmount, setProgressAmount] = useState("");
+  const [addingProgress, setAddingProgress] = useState(false);
+
+  // Change orders.
+  const [showAddChangeOrder, setShowAddChangeOrder] = useState(false);
+  const [coDesc, setCoDesc] = useState("");
+  const [coAmount, setCoAmount] = useState("");
+  const [addingChangeOrder, setAddingChangeOrder] = useState(false);
+
   useEffect(() => {
     if (job) fetchJobAttachments(job.id);
+  }, [job?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (job && canManageJob) {
+      fetchJobInvoices(job.id);
+      fetchJobChangeOrders(job.id);
+    }
   }, [job?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!job) return null;
@@ -124,6 +145,32 @@ export function JobDetail() {
     setMaterialId("");
     setMaterialQty("1");
     setShowAddMaterial(false);
+  };
+
+  const handleAddProgressInvoice = async () => {
+    if (!progressDesc.trim() || !progressAmount.trim()) return;
+    setAddingProgress(true);
+    try {
+      await addJobProgressInvoice(job.id, { description: progressDesc.trim(), amount: parseFloat(progressAmount) || 0 });
+      setProgressDesc("");
+      setProgressAmount("");
+      setShowAddProgressInvoice(false);
+    } finally {
+      setAddingProgress(false);
+    }
+  };
+
+  const handleAddChangeOrder = async () => {
+    if (!coDesc.trim() || !coAmount.trim()) return;
+    setAddingChangeOrder(true);
+    try {
+      await addChangeOrder(job.id, { description: coDesc.trim(), amount: parseFloat(coAmount) || 0 });
+      setCoDesc("");
+      setCoAmount("");
+      setShowAddChangeOrder(false);
+    } finally {
+      setAddingChangeOrder(false);
+    }
   };
 
   return (
@@ -325,6 +372,105 @@ export function JobDetail() {
               </button>
             )}
           </div>
+
+          {/* Invoice history (progress billing) -- every invoice tied to
+              this job, not just the one create-invoice-from-job flow.
+              Money-adjacent: hidden entirely from technicians, mirroring the
+              server-side block on /api/jobs/{id}/invoices for that role. */}
+          {canManageJob && (
+            <div class="detail-section">
+              <h3><Receipt size={16} style={{ verticalAlign: "text-bottom" }} /> Invoices</h3>
+              {jobInvoices.length > 0 ? (
+                <div class="card" style={{ marginBottom: 12 }}>
+                  <table class="table">
+                    <thead>
+                      <tr><th>Invoice</th><th>Status</th><th class="text-right">Total</th><th></th></tr>
+                    </thead>
+                    <tbody>
+                      {jobInvoices.map((inv) => (
+                        <tr key={inv.id} class="table-row">
+                          <td class="identifier">{inv.identifier}</td>
+                          <td><StatusBadge status={inv.status} /></td>
+                          <td class="text-right text-bold money">{formatMoney(inv.total)}</td>
+                          <td>
+                            <a href={`/invoices/${inv.id}`} onClick={(e) => { e.preventDefault(); navigate(`/invoices/${inv.id}`); }} class="btn btn-sm">View</a>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p class="text-muted" style={{ marginTop: 0 }}>No invoices yet.</p>
+              )}
+              {showAddProgressInvoice ? (
+                <div class="note-input-row">
+                  <input type="text" value={progressDesc} onInput={(e) => setProgressDesc((e.target as HTMLInputElement).value)} placeholder="Description (e.g. Progress payment - Phase 2)" style={{ flex: 2 }} />
+                  <input type="number" step="0.01" min="0" value={progressAmount} onInput={(e) => setProgressAmount((e.target as HTMLInputElement).value)} style={{ width: 100 }} placeholder="Amount" />
+                  <button class="btn btn-primary btn-sm" onClick={handleAddProgressInvoice} disabled={addingProgress}>{addingProgress ? "Adding..." : "Add"}</button>
+                  <button class="btn btn-sm" onClick={() => setShowAddProgressInvoice(false)}>Cancel</button>
+                </div>
+              ) : (
+                <button class="btn btn-sm" onClick={() => setShowAddProgressInvoice(true)}>
+                  <Plus size={14} /> Add Progress Invoice
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Change orders -- money-adjacent, hidden from technicians. */}
+          {canManageJob && (
+            <div class="detail-section">
+              <h3><GitPullRequestArrow size={16} style={{ verticalAlign: "text-bottom" }} /> Change Orders</h3>
+              {jobChangeOrders.length > 0 ? (
+                <div class="card" style={{ marginBottom: 12 }}>
+                  <table class="table">
+                    <thead>
+                      <tr><th>Description</th><th class="text-right">Amount</th><th>Status</th><th></th></tr>
+                    </thead>
+                    <tbody>
+                      {jobChangeOrders.map((co) => (
+                        <tr key={co.id} class="table-row">
+                          <td>{co.description}</td>
+                          <td class="text-right money">{formatMoney(co.amount)}</td>
+                          <td><StatusBadge status={co.status} /></td>
+                          <td>
+                            {co.status === "pending" && (
+                              <div style={{ display: "flex", gap: 4 }}>
+                                <button class="btn-icon" title="Approve" onClick={() => approveChangeOrder(co.id, job.id)}>
+                                  <Check size={13} color="var(--success)" />
+                                </button>
+                                <button class="btn-icon danger" title="Reject" onClick={() => rejectChangeOrder(co.id, job.id)}>
+                                  <Ban size={13} />
+                                </button>
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p class="text-muted" style={{ marginTop: 0 }}>No change orders yet.</p>
+              )}
+              {showAddChangeOrder ? (
+                <div class="note-input-row">
+                  <input type="text" value={coDesc} onInput={(e) => setCoDesc((e.target as HTMLInputElement).value)} placeholder="Description (e.g. Add ceiling repaint)" style={{ flex: 2 }} />
+                  <input type="number" step="0.01" min="0" value={coAmount} onInput={(e) => setCoAmount((e.target as HTMLInputElement).value)} style={{ width: 100 }} placeholder="Amount" />
+                  <button class="btn btn-primary btn-sm" onClick={handleAddChangeOrder} disabled={addingChangeOrder}>{addingChangeOrder ? "Adding..." : "Add"}</button>
+                  <button class="btn btn-sm" onClick={() => setShowAddChangeOrder(false)}>Cancel</button>
+                </div>
+              ) : (
+                <button class="btn btn-sm" onClick={() => setShowAddChangeOrder(true)}>
+                  <Plus size={14} /> Add Change Order
+                </button>
+              )}
+              <p class="text-muted" style={{ fontSize: 12, marginTop: 8, marginBottom: 0 }}>
+                Approving adds the amount to the job's most recent draft/sent invoice (or creates a new one if none qualifies).
+              </p>
+            </div>
+          )}
 
           {/* Photos (before/after) */}
           <div class="detail-section">

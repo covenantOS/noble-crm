@@ -5,7 +5,7 @@ import type {
   Job, Customer, Technician, ServiceType, Material, Invoice, Stats, PaginatedState,
   CustomerLookup, TechnicianLookup, Priority, Brand, Estimate,
   Attachment, AttachmentEntityType, AttachmentKind, Payment, PaymentMethod,
-  ServiceAgreement,
+  ServiceAgreement, EstimateRoom, ChangeOrder,
 } from "../types";
 import type { AppContextValue, CurrentUser } from "../context";
 
@@ -55,6 +55,13 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   const [estimatesSearch, setEstimatesSearch] = useState("");
   const [estimatesStatusFilter, setEstimatesStatusFilter] = useState("");
   const [selectedEstimate, setSelectedEstimate] = useState<Estimate | null>(null);
+
+  // Structured estimate builder (rooms -> surfaces)
+  const [estimateRooms, setEstimateRooms] = useState<EstimateRoom[]>([]);
+
+  // Job invoice history (progress billing) + change orders
+  const [jobInvoices, setJobInvoices] = useState<Invoice[]>([]);
+  const [jobChangeOrders, setJobChangeOrders] = useState<ChangeOrder[]>([]);
 
   // Attachments (photo gallery on job-detail / estimate-detail)
   const [jobAttachments, setJobAttachments] = useState<Attachment[]>([]);
@@ -307,6 +314,43 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     await fetchStats();
     navigate("/invoices");
   }, [invoicesPag, invoicesStatusFilter, navigate, fetchInvoices, fetchStats]);
+
+  // ── Job invoice history (progress billing) ──
+
+  const fetchJobInvoices = useCallback(async (jobId: number) => {
+    const res = await api<{ invoices: Invoice[] }>("GET", `/api/jobs/${jobId}/invoices`);
+    setJobInvoices(res.invoices);
+  }, []);
+
+  const addJobProgressInvoice = useCallback(async (jobId: number, data: { description: string; amount: number; tax_rate?: number }) => {
+    await api("POST", `/api/jobs/${jobId}/invoices`, data);
+    await fetchJobInvoices(jobId);
+    await fetchStats();
+  }, [fetchJobInvoices, fetchStats]);
+
+  // ── Change orders ──
+
+  const fetchJobChangeOrders = useCallback(async (jobId: number) => {
+    const res = await api<{ change_orders: ChangeOrder[] }>("GET", `/api/jobs/${jobId}/change-orders`);
+    setJobChangeOrders(res.change_orders);
+  }, []);
+
+  const addChangeOrder = useCallback(async (jobId: number, data: { description: string; amount: number }) => {
+    await api("POST", `/api/jobs/${jobId}/change-orders`, data);
+    await fetchJobChangeOrders(jobId);
+  }, [fetchJobChangeOrders]);
+
+  const approveChangeOrder = useCallback(async (id: number, jobId: number) => {
+    await api("PUT", `/api/change-orders/${id}/approve`);
+    await fetchJobChangeOrders(jobId);
+    await fetchJobInvoices(jobId);
+    await fetchStats();
+  }, [fetchJobChangeOrders, fetchJobInvoices, fetchStats]);
+
+  const rejectChangeOrder = useCallback(async (id: number, jobId: number) => {
+    await api("PUT", `/api/change-orders/${id}/reject`);
+    await fetchJobChangeOrders(jobId);
+  }, [fetchJobChangeOrders]);
 
   // ── Customers CRUD ──
 
@@ -650,12 +694,67 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   }, [estimatesPag, estimatesSearch, estimatesStatusFilter, selectedEstimate, fetchEstimates, refreshSelectedEstimate]);
 
   const convertEstimate = useCallback(async (id: number) => {
-    const res = await api<{ ok: boolean; job_id: number; invoice_id: number }>("POST", `/api/estimates/${id}/convert`);
+    const res = await api<{ ok: boolean; job_id: number; invoice_id: number; deposit_invoice_id: number | null }>("POST", `/api/estimates/${id}/convert`);
     await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
     if (selectedEstimate && selectedEstimate.id === id) await refreshSelectedEstimate(id);
     await Promise.all([fetchStats(), fetchInvoices(invoicesPag, invoicesStatusFilter), fetchJobs(jobsPag, jobsSearch, jobsStatusFilter)]);
-    return { job_id: res.job_id, invoice_id: res.invoice_id };
+    return { job_id: res.job_id, invoice_id: res.invoice_id, deposit_invoice_id: res.deposit_invoice_id };
   }, [estimatesPag, estimatesSearch, estimatesStatusFilter, selectedEstimate, invoicesPag, invoicesStatusFilter, jobsPag, jobsSearch, jobsStatusFilter, fetchEstimates, fetchStats, fetchInvoices, fetchJobs, refreshSelectedEstimate]);
+
+  const setEstimateDeposit = useCallback(async (id: number, depositAmount: number | null) => {
+    await api("PUT", `/api/estimates/${id}/deposit`, { deposit_amount: depositAmount });
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+    if (selectedEstimate && selectedEstimate.id === id) await refreshSelectedEstimate(id);
+  }, [estimatesPag, estimatesSearch, estimatesStatusFilter, selectedEstimate, fetchEstimates, refreshSelectedEstimate]);
+
+  // ── Structured estimate builder (rooms -> surfaces) ──
+
+  const fetchEstimateRooms = useCallback(async (estimateId: number) => {
+    const res = await api<{ rooms: EstimateRoom[] }>("GET", `/api/estimates/${estimateId}/rooms`);
+    setEstimateRooms(res.rooms);
+  }, []);
+
+  const addEstimateRoom = useCallback(async (estimateId: number, name: string) => {
+    await api("POST", `/api/estimates/${estimateId}/rooms`, { name });
+    await fetchEstimateRooms(estimateId);
+    if (selectedEstimate && selectedEstimate.id === estimateId) await refreshSelectedEstimate(estimateId);
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+  }, [selectedEstimate, estimatesPag, estimatesSearch, estimatesStatusFilter, fetchEstimateRooms, fetchEstimates, refreshSelectedEstimate]);
+
+  const updateEstimateRoom = useCallback(async (roomId: number, estimateId: number, data: { name?: string; sort_order?: number }) => {
+    await api("PUT", `/api/estimate-rooms/${roomId}`, data);
+    await fetchEstimateRooms(estimateId);
+    if (selectedEstimate && selectedEstimate.id === estimateId) await refreshSelectedEstimate(estimateId);
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+  }, [selectedEstimate, estimatesPag, estimatesSearch, estimatesStatusFilter, fetchEstimateRooms, fetchEstimates, refreshSelectedEstimate]);
+
+  const deleteEstimateRoom = useCallback(async (roomId: number, estimateId: number) => {
+    await api("DELETE", `/api/estimate-rooms/${roomId}`);
+    await fetchEstimateRooms(estimateId);
+    if (selectedEstimate && selectedEstimate.id === estimateId) await refreshSelectedEstimate(estimateId);
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+  }, [selectedEstimate, estimatesPag, estimatesSearch, estimatesStatusFilter, fetchEstimateRooms, fetchEstimates, refreshSelectedEstimate]);
+
+  const addEstimateSurface = useCallback(async (roomId: number, estimateId: number, data: { surface_type: string; measurement?: number; prep_notes?: string; coats?: number; paint_product?: string; labor_cost?: number; material_cost?: number }) => {
+    await api("POST", `/api/estimate-rooms/${roomId}/surfaces`, data);
+    await fetchEstimateRooms(estimateId);
+    if (selectedEstimate && selectedEstimate.id === estimateId) await refreshSelectedEstimate(estimateId);
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+  }, [selectedEstimate, estimatesPag, estimatesSearch, estimatesStatusFilter, fetchEstimateRooms, fetchEstimates, refreshSelectedEstimate]);
+
+  const updateEstimateSurface = useCallback(async (surfaceId: number, estimateId: number, data: Partial<{ surface_type: string; measurement: number; prep_notes: string; coats: number; paint_product: string; labor_cost: number; material_cost: number }>) => {
+    await api("PUT", `/api/estimate-surfaces/${surfaceId}`, data);
+    await fetchEstimateRooms(estimateId);
+    if (selectedEstimate && selectedEstimate.id === estimateId) await refreshSelectedEstimate(estimateId);
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+  }, [selectedEstimate, estimatesPag, estimatesSearch, estimatesStatusFilter, fetchEstimateRooms, fetchEstimates, refreshSelectedEstimate]);
+
+  const deleteEstimateSurface = useCallback(async (surfaceId: number, estimateId: number) => {
+    await api("DELETE", `/api/estimate-surfaces/${surfaceId}`);
+    await fetchEstimateRooms(estimateId);
+    if (selectedEstimate && selectedEstimate.id === estimateId) await refreshSelectedEstimate(estimateId);
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+  }, [selectedEstimate, estimatesPag, estimatesSearch, estimatesStatusFilter, fetchEstimateRooms, fetchEstimates, refreshSelectedEstimate]);
 
   // ── Schedule ──
 
@@ -678,6 +777,8 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     selectedJob, selectJob, addJobNote, deleteJobNote,
     addChecklistItem, toggleChecklistItem, deleteChecklistItem,
     addJobMaterial, deleteJobMaterial, createInvoiceFromJob,
+    jobInvoices, fetchJobInvoices, addJobProgressInvoice,
+    jobChangeOrders, fetchJobChangeOrders, addChangeOrder, approveChangeOrder, rejectChangeOrder,
     customers, customersPag, setCustomersPage, customersSearch, setCustomersSearch,
     customersStatusFilter, setCustomersStatusFilter,
     addCustomer, updateCustomer, deleteCustomer,
@@ -697,6 +798,9 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     estimatesStatusFilter, setEstimatesStatusFilter,
     selectedEstimate, selectEstimate, addEstimate, updateEstimate, deleteEstimate,
     sendEstimate, approveEstimate, declineEstimate, addEstimateLine, deleteEstimateLine, convertEstimate,
+    setEstimateDeposit,
+    estimateRooms, fetchEstimateRooms, addEstimateRoom, updateEstimateRoom, deleteEstimateRoom,
+    addEstimateSurface, updateEstimateSurface, deleteEstimateSurface,
     scheduleJobs, scheduleStart, scheduleEnd, setScheduleRange,
     customerLookup, technicianLookup,
     serviceAgreements, addServiceAgreement, updateServiceAgreement, deleteServiceAgreement,

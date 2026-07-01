@@ -303,7 +303,7 @@ input, select, textarea, button { accent-color: var(--navy); }
 .status-badge[data-status="confirmed"] { background: #eaf1fb; color: #2f5c96; }
 .status-badge[data-status="in_progress"], .status-badge[data-status="approved"] { background: var(--warning-soft); color: var(--warning); }
 .status-badge[data-status="completed"], .status-badge[data-status="paid"] { background: var(--success-soft); color: var(--success); }
-.status-badge[data-status="cancelled"], .status-badge[data-status="declined"], .status-badge[data-status="overdue"], .status-badge[data-status="expired"] { background: var(--danger-soft); color: var(--danger); }
+.status-badge[data-status="cancelled"], .status-badge[data-status="declined"], .status-badge[data-status="overdue"], .status-badge[data-status="expired"], .status-badge[data-status="rejected"] { background: var(--danger-soft); color: var(--danger); }
 .status-badge[data-status="converted"] { background: #efe9f7; color: #6a4aa0; }
 .status-badge[data-status="active"] { background: var(--success-soft); color: var(--success); }
 .status-badge[data-status="inactive"] { background: #eef0f3; color: var(--text-muted); }
