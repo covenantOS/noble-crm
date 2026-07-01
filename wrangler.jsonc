@@ -1,12 +1,21 @@
 {
-  // Cloudflare Workers config for the Westchase Painting field service app.
+  // Cloudflare Workers config for Noble CRM (the whole multi-account platform;
+  // Westchase Painting + Tampa Kitchen Cabinets are accounts inside it).
   // Account: admin@goparadigmportal.com. Domain (my.nobletampa.com) added later.
+  // The worker name MUST stay "noble-crm" — that's the worker Will connected to
+  // the GitHub repo for auto-deploy-on-push; Workers Builds refuses to deploy
+  // if this name doesn't match the connected worker.
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "westchase-fieldservice",
+  "name": "noble-crm",
   "main": "src/server/index.ts",
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
+
+  // Custom build: `wrangler deploy` builds the SPA itself, so the Git
+  // auto-deploy works regardless of what the dashboard's build-command field
+  // says, and a bare `npx wrangler deploy` can never ship a stale ./dist.
+  "build": { "command": "pnpm run build" },
 
   "d1_databases": [
     {
