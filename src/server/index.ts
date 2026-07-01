@@ -1,6 +1,6 @@
 import { OpenAPIHono, createRoute, z } from "@hono/zod-openapi";
 import type { Context } from "hono";
-import { and, asc, desc, eq, like, or, sql, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, or, sql, inArray, type Column, type SQL } from "drizzle-orm";
 import { getDb, schema } from "../db/index.js";
 import { createAuth } from "../lib/auth.js";
 import type { AppBindings, Env, ReminderMessage } from "../lib/types.js";
@@ -525,6 +525,7 @@ function computePaymentAmount(invoiceTotalCents: number, method: "cash" | "check
 
 const ErrorSchema = z.object({ error: z.string() }).openapi("Error");
 const OkSchema = z.object({ ok: z.boolean() }).openapi("Ok");
+const OkInvoiceIdSchema = z.object({ ok: z.boolean(), invoice_id: z.number().int() }).openapi("OkInvoiceId");
 
 const CustomerSchema = z.object({
   id: z.number().int(),
@@ -616,6 +617,11 @@ const EstimateLineSchema = z.object({
   total: z.number().nullable(),
 }).openapi("EstimateLine");
 
+// getEstimate's response nests lines onto the base Estimate shape.
+const EstimateDetailSchema = EstimateSchema.extend({
+  lines: z.array(EstimateLineSchema),
+}).openapi("EstimateDetail");
+
 // NEW (structured estimate builder): rooms -> surfaces.
 const EstimateSurfaceSchema = z.object({
   id: z.number().int(),
@@ -693,6 +699,48 @@ const PaymentSchema = z.object({
   created_at: z.string(),
 }).openapi("Payment");
 
+// Matches the "joined with denormalized fields" shape shared by
+// listInvoices/getInvoice/getInvoiceJoinedById/listJobInvoices/getCustomer's
+// nested invoices -- customer_name/job_identifier are only present on some
+// of those (left out entirely rather than joined), hence .optional() on both.
+const InvoiceSchema = z.object({
+  id: z.number().int(),
+  identifier: z.string(),
+  customer_id: z.number().int(),
+  job_id: z.number().int().nullable(),
+  status: z.string(),
+  subtotal: z.number().nullable(),
+  tax_rate: z.number().nullable(),
+  tax_amount: z.number().nullable(),
+  total: z.number().nullable(),
+  notes: z.string().nullable(),
+  due_date: z.string().nullable(),
+  paid_date: z.string().nullable(),
+  created_at: z.string().nullable(),
+  updated_at: z.string().nullable(),
+  brand_id: z.number().int().nullable(),
+  customer_name: z.string().nullable().optional(),
+  job_identifier: z.string().nullable().optional(),
+  brand_name: z.string().nullable().optional(),
+  brand_color_primary: z.string().nullable().optional(),
+  brand_color_secondary: z.string().nullable().optional(),
+}).openapi("Invoice");
+
+const InvoiceLineSchema = z.object({
+  id: z.number().int(),
+  invoice_id: z.number().int(),
+  description: z.string(),
+  quantity: z.number().nullable(),
+  unit_price: z.number().nullable(),
+  total: z.number().nullable(),
+}).openapi("InvoiceLine");
+
+// getInvoice's response nests lines + payments onto the base Invoice shape.
+const InvoiceDetailSchema = InvoiceSchema.extend({
+  lines: z.array(InvoiceLineSchema),
+  payments: z.array(PaymentSchema),
+}).openapi("InvoiceDetail");
+
 const JobSchema = z.object({
   id: z.number().int(),
   identifier: z.string(),
@@ -760,27 +808,61 @@ const IdParam = z.object({ id: z.string().openapi({ description: "Resource ID" }
 // id column here is an autoincrement PK starting at 1.
 const toId = (id: string): number => (/^\d+$/.test(id) ? Number(id) : -1);
 
+// Escapes SQL LIKE's special characters (%, _) plus the escape character
+// itself (\) in user-supplied search text, so a literal "%" or "_" typed by
+// a user (e.g. searching for "50% off", or a customer name/address
+// containing an underscore) matches literally instead of being interpreted
+// as a wildcard. Every search/filter route below wraps its escaped search
+// term in %...% itself (to get "contains" matching) and passes the result to
+// likeEscaped(), which appends `ESCAPE '\'` so SQLite/D1 honors the
+// backslash-escaping instead of treating '\' as a literal character. Drizzle's
+// like() has no built-in ESCAPE-clause support, so this is expressed as a raw
+// sql fragment rather than composed through like(). Verified against local
+// D1 with a search term containing both a literal "%" and "_".
+function escapeLike(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+}
+function likeEscaped(column: Column | SQL, needle: string): SQL {
+  return sql`${column} LIKE ${`%${escapeLike(needle)}%`} ESCAPE '\\'`;
+}
+
+// Atomically increments a `_meta` counter row and returns its new value, in a
+// single SQL statement (UPDATE ... SET value = value + 1 ... RETURNING value).
+// This closes the race condition the old SELECT-then-UPDATE pattern had: two
+// concurrent requests reading the same counter value and both writing the
+// same "next" value, producing duplicate identifiers (e.g. two invoices both
+// named INV-42). D1/SQLite executes the read-modify-write of a single UPDATE
+// statement atomically -- there's no gap between reading the current value
+// and writing the incremented one for another concurrent request to land in.
+// Raw `sql` (via db.get) is used rather than Drizzle's query-builder
+// `.update().returning()` -- the counter is stored as TEXT in `_meta.value`,
+// so the increment itself has to happen as `CAST(value AS INTEGER) + 1`
+// inside SQL either way, and expressing the whole statement (including
+// RETURNING) as one raw template is the most direct, unambiguous way to get
+// that atomic guarantee against D1 -- confirmed working via `wrangler d1
+// execute` and under real concurrent load (see counter test script).
+async function incrementCounter(db: ReturnType<typeof getDb>, key: string): Promise<number> {
+  const row = await db.get<{ value: number }>(
+    sql`UPDATE _meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = ${key} RETURNING CAST(value AS INTEGER) as value`
+  );
+  return row!.value;
+}
+
 async function nextIdentifier(db: ReturnType<typeof getDb>): Promise<string> {
   const prefixRow = await db.select().from(schema.meta).where(eq(schema.meta.key, "identifier_prefix")).get();
-  const counterRow = await db.select().from(schema.meta).where(eq(schema.meta.key, "job_counter")).get();
-  const next = parseInt(counterRow?.value || "0", 10) + 1;
-  await db.update(schema.meta).set({ value: String(next) }).where(eq(schema.meta.key, "job_counter"));
+  const next = await incrementCounter(db, "job_counter");
   return `${prefixRow?.value || "JOB"}-${next}`;
 }
 
 async function nextInvoiceIdentifier(db: ReturnType<typeof getDb>): Promise<string> {
   const prefixRow = await db.select().from(schema.meta).where(eq(schema.meta.key, "invoice_prefix")).get();
-  const counterRow = await db.select().from(schema.meta).where(eq(schema.meta.key, "invoice_counter")).get();
-  const next = parseInt(counterRow?.value || "0", 10) + 1;
-  await db.update(schema.meta).set({ value: String(next) }).where(eq(schema.meta.key, "invoice_counter"));
+  const next = await incrementCounter(db, "invoice_counter");
   return `${prefixRow?.value || "INV"}-${next}`;
 }
 
 async function nextEstimateIdentifier(db: ReturnType<typeof getDb>): Promise<string> {
   const prefixRow = await db.select().from(schema.meta).where(eq(schema.meta.key, "estimate_prefix")).get();
-  const counterRow = await db.select().from(schema.meta).where(eq(schema.meta.key, "estimate_counter")).get();
-  const next = parseInt(counterRow?.value || "0", 10) + 1;
-  await db.update(schema.meta).set({ value: String(next) }).where(eq(schema.meta.key, "estimate_counter"));
+  const next = await incrementCounter(db, "estimate_counter");
   return `${prefixRow?.value || "EST"}-${next}`;
 }
 
@@ -1139,11 +1221,10 @@ app.openapi(listJobs, async (c) => {
   const user = c.get("user");
   const conditions = [];
   if (q.search) {
-    const s = `%${q.search}%`;
     conditions.push(or(
-      like(schema.jobs.identifier, s),
-      like(schema.customers.name, s),
-      like(schema.jobs.address, s),
+      likeEscaped(schema.jobs.identifier, q.search),
+      likeEscaped(schema.customers.name, q.search),
+      likeEscaped(schema.jobs.address, q.search),
     ));
   }
   if (q.status) {
@@ -1770,6 +1851,63 @@ app.openapi(deleteJobNote, async (c) => {
 const ATTACHMENT_ENTITY_TYPES = ["job", "estimate", "customer"] as const;
 type AttachmentEntityType = (typeof ATTACHMENT_ENTITY_TYPES)[number];
 
+// Server-side upload guards for /api/attachments (job photos/docs) and
+// /api/brands/:id/logo -- neither route capped size or content-type before
+// this pass, so R2 would silently store an arbitrarily large file and
+// `await file.arrayBuffer()` would read the whole thing into Worker memory
+// first. `file.size` is checked BEFORE that read so an oversized upload is
+// rejected with a clean 400 instead of the arrayBuffer() call itself
+// blowing up. Content-type is checked against a server-side allowlist AND
+// against the file's actual magic bytes (sniffFileType below) -- the
+// declared multipart Content-Type header alone is trivially spoofable (an
+// .exe renamed with Content-Type: image/png sailed straight through an
+// allowlist-only check; caught live by adversarial review before this was
+// added).
+const ATTACHMENT_MAX_BYTES = 15 * 1024 * 1024; // 15MB -- plenty for job photos/docs
+const ATTACHMENT_ALLOWED_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif", "image/heic", "application/pdf"];
+const LOGO_MAX_BYTES = 3 * 1024 * 1024; // 3MB -- plenty for a brand logo image
+const LOGO_ALLOWED_TYPES = ["image/jpeg", "image/png", "image/webp", "image/svg+xml"];
+
+// Checks the file's ACTUAL bytes against the format its declaredType claims
+// to be. Not full antivirus/format validation -- just enough to catch "this
+// isn't remotely the format it claims to be" (e.g. an MZ-header executable
+// uploaded with a spoofed image/* Content-Type). Most formats are checked by
+// magic-byte signature; SVG is text so it's checked for a real <svg> tag
+// instead.
+function sniffFileType(bytes: Uint8Array, declaredType: string): boolean {
+  const startsWith = (sig: number[]) => sig.every((b, i) => bytes[i] === b);
+  const asciiAt = (offset: number, len: number) =>
+    String.fromCharCode(...bytes.slice(offset, offset + len));
+
+  switch (declaredType) {
+    case "image/jpeg":
+      return startsWith([0xff, 0xd8, 0xff]);
+    case "image/png":
+      return startsWith([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    case "image/gif":
+      return asciiAt(0, 6) === "GIF87a" || asciiAt(0, 6) === "GIF89a";
+    case "image/webp":
+      return asciiAt(0, 4) === "RIFF" && asciiAt(8, 4) === "WEBP";
+    case "image/heic":
+      // ISO base media file format: "ftyp" box at offset 4, brand at offset 8.
+      return asciiAt(4, 4) === "ftyp" && /^(heic|heix|heim|heis|hevc|hevx|mif1)\0*$/.test(asciiAt(8, 4));
+    case "application/pdf":
+      return asciiAt(0, 5) === "%PDF-";
+    case "image/svg+xml": {
+      // Text format, not magic bytes: confirm a real <svg> tag appears near
+      // the start (after an optional BOM/XML prolog/DOCTYPE/comments) rather
+      // than trusting the declared type alone.
+      const head = new TextDecoder("utf-8", { fatal: false })
+        .decode(bytes.slice(0, Math.min(bytes.length, 1024)))
+        .replace(/^﻿/, "")
+        .trimStart();
+      return /^(<\?xml[^>]*\?>\s*)?(<!--[\s\S]*?-->\s*)?(<!DOCTYPE[^>]*>\s*)?<svg[\s>]/i.test(head);
+    }
+    default:
+      return false;
+  }
+}
+
 function attachmentOut(row: typeof schema.attachments.$inferSelect) {
   return {
     id: row.id,
@@ -1827,6 +1965,16 @@ app.post("/api/attachments", async (c) => {
   if (!(file instanceof File)) {
     return c.json({ error: "Missing file upload (multipart field \"file\")" }, 400);
   }
+  if (file.size > ATTACHMENT_MAX_BYTES) {
+    return c.json({ error: `File too large -- max ${ATTACHMENT_MAX_BYTES / (1024 * 1024)}MB` }, 400);
+  }
+  if (!ATTACHMENT_ALLOWED_TYPES.includes(file.type)) {
+    return c.json({ error: `Invalid file type -- must be one of: ${ATTACHMENT_ALLOWED_TYPES.join(", ")}` }, 400);
+  }
+  const fileBytes = new Uint8Array(await file.arrayBuffer());
+  if (!sniffFileType(fileBytes, file.type)) {
+    return c.json({ error: `File content doesn't match its declared type (${file.type}).` }, 400);
+  }
 
   const user = c.get("user");
   if (user.role === "technician") {
@@ -1835,7 +1983,7 @@ app.post("/api/attachments", async (c) => {
   }
 
   const key = `attachments/${entityType}/${entityId}/${crypto.randomUUID()}-${file.name}`;
-  await c.env.BUCKET.put(key, await file.arrayBuffer(), {
+  await c.env.BUCKET.put(key, fileBytes, {
     httpMetadata: { contentType: file.type || "application/octet-stream" },
   });
 
@@ -1957,12 +2105,11 @@ app.openapi(listCustomers, async (c) => {
 
   const conditions = [];
   if (q.search) {
-    const s = `%${q.search}%`;
     conditions.push(or(
-      like(schema.customers.name, s),
-      like(schema.customers.email, s),
-      like(schema.customers.phone, s),
-      like(schema.customers.address, s),
+      likeEscaped(schema.customers.name, q.search),
+      likeEscaped(schema.customers.email, q.search),
+      likeEscaped(schema.customers.phone, q.search),
+      likeEscaped(schema.customers.address, q.search),
     ));
   }
   if (q.status) {
@@ -2037,7 +2184,7 @@ const getCustomer = createRoute({
       customer: CustomerSchema,
       jobs: z.array(JobSchema),
       estimates: z.array(EstimateSchema),
-      invoices: z.array(z.any()),
+      invoices: z.array(InvoiceSchema),
       outstanding_balance: z.number(),
     }) } } },
     404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
@@ -2785,13 +2932,23 @@ app.post("/api/brands/:id/logo", async (c) => {
   if (!(file instanceof File)) {
     return c.json({ error: "Missing file upload (multipart field \"file\")" }, 400);
   }
+  if (file.size > LOGO_MAX_BYTES) {
+    return c.json({ error: `File too large -- max ${LOGO_MAX_BYTES / (1024 * 1024)}MB` }, 400);
+  }
+  if (!LOGO_ALLOWED_TYPES.includes(file.type)) {
+    return c.json({ error: `Invalid file type -- must be one of: ${LOGO_ALLOWED_TYPES.join(", ")}` }, 400);
+  }
+  const fileBytes = new Uint8Array(await file.arrayBuffer());
+  if (!sniffFileType(fileBytes, file.type)) {
+    return c.json({ error: `File content doesn't match its declared type (${file.type}).` }, 400);
+  }
 
   const extFromName = file.name.includes(".") ? file.name.split(".").pop()!.toLowerCase() : "";
   const extFromType = file.type ? file.type.split("/").pop()!.toLowerCase() : "";
   const ext = (extFromName || extFromType || "png").replace(/[^a-z0-9]/g, "") || "png";
   const key = `brands/${brand.slug}-logo.${ext}`;
 
-  await c.env.BUCKET.put(key, await file.arrayBuffer(), {
+  await c.env.BUCKET.put(key, fileBytes, {
     httpMetadata: { contentType: file.type || "application/octet-stream" },
   });
   await db.update(schema.brands).set({ logoR2Key: key }).where(eq(schema.brands.id, idNum));
@@ -3356,7 +3513,7 @@ const listInvoices = createRoute({
     200: {
       description: "Paginated invoice list",
       content: { "application/json": { schema: z.object({
-        invoices: z.array(z.any()),
+        invoices: z.array(InvoiceSchema),
         total: z.number().int(),
       }) } },
     },
@@ -3375,10 +3532,9 @@ app.openapi(listInvoices, async (c) => {
     conditions.push(eq(schema.invoices.status, q.status));
   }
   if (q.search) {
-    const s = `%${q.search}%`;
     conditions.push(or(
-      like(schema.invoices.identifier, s),
-      like(schema.customers.name, s),
+      likeEscaped(schema.invoices.identifier, q.search),
+      likeEscaped(schema.customers.name, q.search),
     ));
   }
   const where = conditions.length > 0 ? and(...conditions) : undefined;
@@ -3448,7 +3604,7 @@ const getInvoice = createRoute({
   path: "/api/invoices/{id}",
   request: { params: IdParam },
   responses: {
-    200: { description: "Invoice detail", content: { "application/json": { schema: z.object({ invoice: z.any() }) } } },
+    200: { description: "Invoice detail", content: { "application/json": { schema: z.object({ invoice: InvoiceDetailSchema }) } } },
     404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
@@ -3589,7 +3745,7 @@ const createInvoice = createRoute({
     }) } } },
   },
   responses: {
-    201: { description: "Created", content: { "application/json": { schema: z.any() } } },
+    201: { description: "Created", content: { "application/json": { schema: InvoiceSchema } } },
     400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
@@ -3909,7 +4065,7 @@ const invoiceFromJob = createRoute({
   path: "/api/jobs/{id}/invoice",
   request: { params: IdParam },
   responses: {
-    201: { description: "Invoice created from job", content: { "application/json": { schema: z.any() } } },
+    201: { description: "Invoice created from job", content: { "application/json": { schema: OkInvoiceIdSchema } } },
     404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
@@ -4017,7 +4173,7 @@ const listJobInvoices = createRoute({
   path: "/api/jobs/{id}/invoices",
   request: { params: IdParam },
   responses: {
-    200: { description: "Invoices for a job", content: { "application/json": { schema: z.any() } } },
+    200: { description: "Invoices for a job", content: { "application/json": { schema: z.object({ invoices: z.array(InvoiceSchema) }) } } },
     404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
@@ -4075,7 +4231,7 @@ const jobProgressInvoice = createRoute({
     ]) } } },
   },
   responses: {
-    201: { description: "Progress invoice created", content: { "application/json": { schema: z.any() } } },
+    201: { description: "Progress invoice created", content: { "application/json": { schema: InvoiceSchema } } },
     400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
     404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
   },
@@ -4267,10 +4423,9 @@ app.openapi(listEstimates, async (c) => {
     conditions.push(eq(schema.estimates.status, q.status));
   }
   if (q.search) {
-    const s = `%${q.search}%`;
     conditions.push(or(
-      like(schema.estimates.identifier, s),
-      like(schema.customers.name, s),
+      likeEscaped(schema.estimates.identifier, q.search),
+      likeEscaped(schema.customers.name, q.search),
     ));
   }
   const where = conditions.length > 0 ? and(...conditions) : undefined;
@@ -4309,7 +4464,7 @@ const getEstimate = createRoute({
   path: "/api/estimates/{id}",
   request: { params: IdParam },
   responses: {
-    200: { description: "Estimate detail", content: { "application/json": { schema: z.object({ estimate: z.any() }) } } },
+    200: { description: "Estimate detail", content: { "application/json": { schema: z.object({ estimate: EstimateDetailSchema }) } } },
     404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
@@ -4349,7 +4504,7 @@ const createEstimate = createRoute({
     }) } } },
   },
   responses: {
-    201: { description: "Created", content: { "application/json": { schema: z.any() } } },
+    201: { description: "Created", content: { "application/json": { schema: EstimateSchema } } },
     400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
