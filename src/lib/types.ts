@@ -25,6 +25,22 @@ export interface Env {
   BETTER_AUTH_SECRET: string;
   STRIPE_SECRET_KEY?: string;
   STRIPE_WEBHOOK_SECRET?: string;
+
+  // ── Notification provider keys (Phase 5, GATED) ──
+  // All optional. src/lib/notify.ts checks for these at call time: if a key
+  // is present it makes the real provider HTTP call; if ABSENT it returns
+  // { sent:false, reason:"no provider configured" } and never pretends to send.
+  //   - RESEND_API_KEY: Resend email API key (email provider).
+  //   - RESEND_FROM: verified "from" address for Resend (e.g.
+  //     "Westchase Painting <estimates@nobletampa.com>"). Required alongside
+  //     RESEND_API_KEY for email to send.
+  //   - TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM: Twilio SMS creds
+  //     + the sending phone number. All three needed for SMS to send.
+  RESEND_API_KEY?: string;
+  RESEND_FROM?: string;
+  TWILIO_ACCOUNT_SID?: string;
+  TWILIO_AUTH_TOKEN?: string;
+  TWILIO_FROM?: string;
 }
 
 // Authenticated user attached to Hono's context via the auth middleware in

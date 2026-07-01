@@ -202,6 +202,12 @@ export interface Estimate {
   valid_until: string | null;
   notes: string | null;
   approved_at: string | null;
+  // Customer-facing loop (Phase 5): the unguessable token minting the public
+  // /p/e/{token} link (present once the estimate has been sent), plus the
+  // customer-acceptance audit trail written when they e-sign.
+  public_token?: string | null;
+  signed_name?: string | null;
+  signed_at?: string | null;
   customer_name?: string | null;
   brand_name?: string | null;
   brand_color_primary?: string | null;

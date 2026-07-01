@@ -532,6 +532,18 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     return res.payment;
   }, [selectedInvoice, invoicesPag, invoicesStatusFilter, fetchInvoices, fetchStats]);
 
+  // Start a Stripe checkout for an invoice. Returns { configured:false } when
+  // Stripe isn't set up (the route responds 501) so the UI can show a "not
+  // configured yet" notice rather than surfacing an error. On success returns
+  // the hosted checkout URL for the caller to open.
+  const startInvoiceCheckout = useCallback(async (invoiceId: number): Promise<{ configured: boolean; url?: string }> => {
+    const r = await fetch(`/api/invoices/${invoiceId}/checkout`, { method: "POST", credentials: "include" });
+    const data = await r.json().catch(() => ({})) as { url?: string; error?: string; configured?: boolean };
+    if (r.status === 501) return { configured: false };
+    if (!r.ok) throw new Error(data.error || "Could not start checkout");
+    return { configured: true, url: data.url };
+  }, []);
+
   // ── Attachments ──
 
   const fetchJobAttachments = useCallback(async (jobId: number) => {
@@ -607,9 +619,10 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   }, []);
 
   const sendEstimate = useCallback(async (id: number) => {
-    await api("POST", `/api/estimates/${id}/send`);
+    const res = await api<{ ok: boolean; public_token: string; public_url: string; email_sent: boolean; email_reason?: string }>("POST", `/api/estimates/${id}/send`);
     await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
     if (selectedEstimate && selectedEstimate.id === id) await refreshSelectedEstimate(id);
+    return { public_url: res.public_url, email_sent: res.email_sent, email_reason: res.email_reason };
   }, [estimatesPag, estimatesSearch, estimatesStatusFilter, selectedEstimate, fetchEstimates, refreshSelectedEstimate]);
 
   const approveEstimate = useCallback(async (id: number) => {
@@ -677,7 +690,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     invoices, invoicesPag, setInvoicesPage, invoicesStatusFilter, setInvoicesStatusFilter,
     selectedInvoice, selectInvoice, addInvoice, updateInvoice, deleteInvoice,
     addInvoiceLine, deleteInvoiceLine,
-    recordPayment,
+    recordPayment, startInvoiceCheckout,
     jobAttachments, estimateAttachments, fetchJobAttachments, fetchEstimateAttachments,
     uploadAttachment, deleteAttachment,
     estimates, estimatesPag, setEstimatesPage, estimatesSearch, setEstimatesSearch,

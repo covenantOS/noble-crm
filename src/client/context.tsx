@@ -119,6 +119,10 @@ export interface AppContextValue {
 
   // Payments
   recordPayment: (invoiceId: number, method: PaymentMethod, amount?: number) => Promise<Payment>;
+  // Stripe online payment (GATED on STRIPE_SECRET_KEY). Resolves to a checkout
+  // URL to open, or { configured:false } when Stripe isn't set up so the UI
+  // can show a "not configured yet" notice instead of erroring.
+  startInvoiceCheckout: (invoiceId: number) => Promise<{ configured: boolean; url?: string }>;
 
   // Attachments
   jobAttachments: Attachment[];
@@ -141,7 +145,10 @@ export interface AppContextValue {
   addEstimate: (data: { customer_id: number; brand_id?: number | null; tax_rate?: number; valid_until?: string; notes?: string; lines: { description: string; quantity: number; unit_price: number }[] }) => Promise<void>;
   updateEstimate: (id: number, data: Partial<Estimate>) => Promise<void>;
   deleteEstimate: (id: number) => Promise<void>;
-  sendEstimate: (id: number) => Promise<void>;
+  // sendEstimate returns the send result so the UI can show whether the
+  // customer email was actually delivered (GATED on RESEND_API_KEY) and expose
+  // the public link. Also used by the "Resend" affordance.
+  sendEstimate: (id: number) => Promise<{ public_url: string; email_sent: boolean; email_reason?: string }>;
   approveEstimate: (id: number) => Promise<void>;
   declineEstimate: (id: number) => Promise<void>;
   addEstimateLine: (estimateId: number, line: { description: string; quantity: number; unit_price: number }) => Promise<void>;

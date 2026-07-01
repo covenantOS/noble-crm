@@ -4,7 +4,7 @@ import { ACORN_FINANCE_URL } from "../constants";
 import { NobleMark } from "./noble-mark";
 import { StatusBadge } from "./status-badge";
 import { formatDate, formatDateTime, formatMoney } from "../format";
-import { ArrowLeft, Trash2, Send, CheckCircle, XCircle, ArrowRightLeft, ExternalLink, Plus, X, Camera } from "lucide-preact";
+import { ArrowLeft, Trash2, Send, CheckCircle, XCircle, ArrowRightLeft, ExternalLink, Plus, X, Camera, FileDown, Link2, Copy, RefreshCw } from "lucide-preact";
 
 export function EstimateDetail() {
   const {
@@ -21,6 +21,10 @@ export function EstimateDetail() {
   const [convertResult, setConvertResult] = useState<{ job_id: number; invoice_id: number } | null>(null);
   const photoFileInput = useRef<HTMLInputElement>(null);
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
+  // Send/resend delivery feedback + copy-link confirmation.
+  const [sendNotice, setSendNotice] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [sending, setSending] = useState(false);
 
   useEffect(() => {
     if (estimate) fetchEstimateAttachments(estimate.id);
@@ -70,6 +74,44 @@ export function EstimateDetail() {
     }
   };
 
+  // The public customer link (only exists once the estimate has a token, i.e.
+  // after it's been sent). Absolute URL so it can be copied and shared.
+  const publicUrl = estimate.public_token ? `${window.location.origin}/p/e/${estimate.public_token}` : null;
+
+  // Send (draft -> sent): mints the token + tries to email the customer.
+  // Surfaces an honest delivery notice (email actually sent, vs link ready
+  // to copy when no email provider is configured).
+  const doSend = async () => {
+    setSending(true);
+    setSendNotice(null);
+    try {
+      const res = await sendEstimate(estimate.id);
+      setSendNotice(
+        res.email_sent
+          ? "Sent — the customer was emailed their estimate link."
+          : `Estimate marked as sent. Email wasn't delivered (${res.email_reason || "no email provider configured"}) — copy the link below to share it.`,
+      );
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const copyLink = async () => {
+    if (!publicUrl) return;
+    try {
+      await navigator.clipboard.writeText(publicUrl);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {
+      setError("Could not copy the link — select and copy it manually.");
+    }
+  };
+
+  // Open the estimate PDF in a new tab (authed route).
+  const downloadPdf = () => window.open(`/api/estimates/${estimate.id}/pdf`, "_blank", "noopener");
+
   return (
     <div class="page">
       <div class="page-header">
@@ -78,8 +120,13 @@ export function EstimateDetail() {
         </button>
         <div class="page-header-right">
           {estimate.status === "draft" && (
-            <button class="btn" onClick={() => sendEstimate(estimate.id)}>
-              <Send size={14} /> Send
+            <button class="btn" onClick={doSend} disabled={sending}>
+              <Send size={14} /> {sending ? "Sending..." : "Send"}
+            </button>
+          )}
+          {estimate.status === "sent" && (
+            <button class="btn" onClick={doSend} disabled={sending} title="Re-email the customer their link">
+              <RefreshCw size={14} /> {sending ? "Resending..." : "Resend"}
             </button>
           )}
           {(estimate.status === "draft" || estimate.status === "sent") && (
@@ -97,6 +144,9 @@ export function EstimateDetail() {
               <ArrowRightLeft size={14} /> {converting ? "Converting..." : "Convert to Job"}
             </button>
           )}
+          <button class="btn" onClick={downloadPdf} title="Open a branded PDF of this estimate">
+            <FileDown size={14} /> PDF
+          </button>
           <button class="btn btn-danger" onClick={() => deleteEstimate(estimate.id)}>
             <Trash2 size={14} /> Delete
           </button>
@@ -109,6 +159,35 @@ export function EstimateDetail() {
           <a href={`/jobs/${convertResult.job_id}`} onClick={(e) => { e.preventDefault(); navigate(`/jobs/${convertResult.job_id}`); }}>View Job</a>
           {" · "}
           <a href={`/invoices/${convertResult.invoice_id}`} onClick={(e) => { e.preventDefault(); navigate(`/invoices/${convertResult.invoice_id}`); }}>View Invoice</a>
+        </div>
+      )}
+
+      {sendNotice && (
+        <div class="card" style={{ padding: 12, marginBottom: 16, borderColor: "var(--gold)" }}>
+          {sendNotice}
+        </div>
+      )}
+
+      {/* Public customer link — always shown once the estimate has been sent
+          (it has a token). Copyable so the office can share it directly even
+          when no email provider is configured. */}
+      {publicUrl && (
+        <div class="card" style={{ padding: 12, marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, fontWeight: 600, color: "var(--navy-deep)" }}>
+            <Link2 size={15} /> Customer link
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <a href={publicUrl} target="_blank" rel="noopener noreferrer" style={{ fontFamily: "var(--font-mono)", fontSize: 13, wordBreak: "break-all", flex: 1 }}>{publicUrl}</a>
+            <button class="btn btn-sm" onClick={copyLink}>
+              <Copy size={13} /> {copied ? "Copied!" : "Copy"}
+            </button>
+            <a class="btn btn-sm" href={publicUrl} target="_blank" rel="noopener noreferrer">
+              <ExternalLink size={13} /> Open
+            </a>
+          </div>
+          <div class="text-muted" style={{ fontSize: 12, marginTop: 6 }}>
+            This is what the customer sees — they can review, e-sign, and accept or decline from here.
+          </div>
         </div>
       )}
 
@@ -161,6 +240,12 @@ export function EstimateDetail() {
               <div class="detail-meta-item">
                 <span class="detail-meta-label">Approved</span>
                 <span>{formatDateTime(estimate.approved_at)}</span>
+              </div>
+            )}
+            {estimate.signed_name && (
+              <div class="detail-meta-item">
+                <span class="detail-meta-label">Signed By</span>
+                <span>{estimate.signed_name}{estimate.signed_at ? ` · ${formatDateTime(estimate.signed_at)}` : ""}</span>
               </div>
             )}
           </div>

@@ -214,6 +214,17 @@ export const estimates = sqliteTable('estimates', {
   signatureR2Key: text('signature_r2_key'),
   approvedAt: text('approved_at'),
   createdAt: text('created_at').default(nowTimestamp()).notNull(),
+  // NEW (Phase 5 customer loop): unguessable random token minted when an
+  // estimate is SENT, used to gate the public /p/e/{token} customer view and
+  // the /api/public/estimates/{token}/* endpoints. Nullable until sent.
+  publicToken: text('public_token'),
+  // Customer-acceptance audit trail, written by the public accept endpoint:
+  // when they signed (full timestamp), the name they typed on the signature
+  // pad, and their best-effort request IP. The signature IMAGE itself is
+  // stored in R2 and pointed at by signatureR2Key (already defined above).
+  signedAt: text('signed_at'),
+  signedName: text('signed_name'),
+  signedIp: text('signed_ip'),
 });
 
 export const estimateLines = sqliteTable('estimate_lines', {

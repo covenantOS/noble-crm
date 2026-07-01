@@ -4,6 +4,10 @@ import { and, asc, desc, eq, like, or, sql, inArray } from "drizzle-orm";
 import { getDb, schema } from "../db/index.js";
 import { createAuth } from "../lib/auth.js";
 import type { AppBindings, Env, ReminderMessage } from "../lib/types.js";
+import { buildDocumentPdf, type PdfLine } from "../lib/pdf.js";
+import { sendEmail, escapeHtml } from "../lib/notify.js";
+import { createInvoiceCheckout, verifyStripeWebhook } from "../lib/payments.js";
+import { ACORN_FINANCE_URL } from "../lib/business.js";
 
 // defaultHook normalizes EVERY Zod request-validation failure across all
 // app.openapi routes into a clean 400 { error } shape (first issue's message),
@@ -59,6 +63,12 @@ const zDate = z.string().refine(isValidCalendarDate, { message: "Invalid date --
 const zTime = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, { message: "Invalid time -- must be HH:MM (24-hour)" });
 // A required human-readable name: trimmed, non-empty.
 const zName = z.string().trim().min(1, { message: "Required -- cannot be blank" });
+// A brand color: "#rgb" or "#rrggbb" only. These values get interpolated
+// directly into a raw <style> block on the public customer-facing estimate
+// page (see customerPageShell in the public routes below), so a strict format
+// here isn't just data hygiene -- it's what keeps that unauthenticated,
+// no-escaping render path from being a stored-XSS vector.
+const zHexColor = z.string().regex(/^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/, { message: "Must be a hex color like #1a2b4a" });
 // Money the client supplies: never negative. (Zero is allowed -- e.g. a $0
 // service line or a free item; over-collection/positive-only cases use
 // zPositive below.)
@@ -214,7 +224,19 @@ app.on(["GET", "POST"], "/api/auth/*", async (c) => {
 // session from the request cookie and attaches a normalized user onto
 // Hono's context for downstream handlers/authorization checks.
 app.use("/api/*", async (c, next) => {
-  if (c.req.path.startsWith("/api/auth/")) {
+  // Public, token-gated (or provider-signed) surfaces that must NOT require a
+  // session, alongside /api/auth/*:
+  //   - /api/public/*        : customer estimate view/accept/decline/pdf,
+  //                            gated by the unguessable public_token, not a
+  //                            session (see the routes below).
+  //   - /api/stripe/webhook  : Stripe calls this server-to-server with no
+  //                            cookie; it's authenticated by the webhook
+  //                            signature (STRIPE_WEBHOOK_SECRET), not a session.
+  if (
+    c.req.path.startsWith("/api/auth/") ||
+    c.req.path.startsWith("/api/public/") ||
+    c.req.path === "/api/stripe/webhook"
+  ) {
     return next();
   }
   const session = await createAuth(c.env).api.getSession({ headers: c.req.raw.headers });
@@ -247,6 +269,16 @@ app.use("/api/*", async (c, next) => {
 // checks (jobs, notes, checklist, job-materials) are handled per-route below
 // via requireOwnJobOrForbid since they depend on which job is involved.
 app.use("/api/*", async (c, next) => {
+  // Public/webhook surfaces never had `user` set (the auth middleware above
+  // skips them), so this role-gate must skip them too -- otherwise reading
+  // user.role on an unauthenticated public request would throw a 500.
+  if (
+    c.req.path.startsWith("/api/public/") ||
+    c.req.path.startsWith("/api/auth/") ||
+    c.req.path === "/api/stripe/webhook"
+  ) {
+    return next();
+  }
   const user = c.get("user");
   if (user.role !== "technician") {
     return next();
@@ -445,6 +477,9 @@ const EstimateSchema = z.object({
   valid_until: z.string().nullable(),
   notes: z.string().nullable(),
   approved_at: z.string().nullable(),
+  public_token: z.string().nullable().optional(),
+  signed_name: z.string().nullable().optional(),
+  signed_at: z.string().nullable().optional(),
   customer_name: z.string().nullable().optional(),
   brand_name: z.string().nullable().optional(),
   brand_color_primary: z.string().nullable().optional(),
@@ -2171,8 +2206,8 @@ const createBrand = createRoute({
       content: { "application/json": { schema: z.object({
         name: zName,
         slug: zName,
-        color_primary: z.string().optional(),
-        color_secondary: z.string().optional(),
+        color_primary: zHexColor.optional(),
+        color_secondary: zHexColor.optional(),
         active: z.number().int().optional(),
       }) } },
     },
@@ -2218,8 +2253,8 @@ const updateBrand = createRoute({
       content: { "application/json": { schema: z.object({
         name: zName.optional(),
         slug: zName.optional(),
-        color_primary: z.string().optional(),
-        color_secondary: z.string().optional(),
+        color_primary: zHexColor.optional(),
+        color_secondary: zHexColor.optional(),
         active: z.number().int().optional(),
       }) } },
     },
@@ -2296,7 +2331,7 @@ app.post("/api/brands/:id/logo", async (c) => {
 // "attachments/" was added in the attachments feature (Part A) alongside
 // the original "brands/" prefix -- extend this array for future R2-backed
 // features rather than duplicating the route.
-const R2_PROXY_ALLOWED_PREFIXES = ["brands/", "attachments/"];
+const R2_PROXY_ALLOWED_PREFIXES = ["brands/", "attachments/", "signatures/"];
 
 const EXT_CONTENT_TYPES: Record<string, string> = {
   webp: "image/webp",
@@ -2319,11 +2354,19 @@ app.get("/api/r2/*", async (c) => {
   // (or leak, via the URL) a photo on a job/estimate/customer they aren't
   // allowed to see.
   const user = c.get("user");
-  if (user.role === "technician" && key.startsWith("attachments/")) {
-    const [, entityType, entityIdRaw] = key.split("/");
-    const db = getDb(c.env);
-    const forbidden = await requireAttachmentAccessOrForbid(c, db, entityType, toId(entityIdRaw));
-    if (forbidden) return forbidden;
+  if (user.role === "technician") {
+    if (key.startsWith("attachments/")) {
+      const [, entityType, entityIdRaw] = key.split("/");
+      const db = getDb(c.env);
+      const forbidden = await requireAttachmentAccessOrForbid(c, db, entityType, toId(entityIdRaw));
+      if (forbidden) return forbidden;
+    } else if (key.startsWith("signatures/")) {
+      // E-signature images belong to estimates. Technicians have zero access
+      // to estimates at all (the blanket /api/estimates block above), so this
+      // is a flat forbid rather than an ownership check -- unlike attachments,
+      // there's no "own it" case where a technician should ever see one.
+      return c.json({ error: "forbidden" }, 403);
+    }
   }
   const obj = await c.env.BUCKET.get(key);
   if (!obj) return c.json({ error: "Not found" }, 404);
@@ -3344,6 +3387,11 @@ function estimateJoinedSelect(db: ReturnType<typeof getDb>) {
       valid_until: schema.estimates.validUntil,
       notes: schema.estimates.notes,
       approved_at: schema.estimates.approvedAt,
+      // Customer-facing loop fields, so estimate-detail can show/copy the
+      // public link and surface who signed + when.
+      public_token: schema.estimates.publicToken,
+      signed_name: schema.estimates.signedName,
+      signed_at: schema.estimates.signedAt,
       created_at: schema.estimates.createdAt,
       customer_name: schema.customers.name,
       brand_name: schema.brands.name,
@@ -3589,12 +3637,21 @@ app.openapi(deleteEstimate, async (c) => {
 
 // ── Estimate status transitions ───────────────────────────────────
 
+// Builds the absolute base URL (scheme+host) for the current request, so the
+// public customer link/email and Stripe redirect URLs point at the same origin
+// the app is actually being served from (localhost in dev, the real domain in
+// prod) rather than a hard-coded host.
+function requestBaseUrl(c: Context<AppBindings>): string {
+  const url = new URL(c.req.url);
+  return `${url.protocol}//${url.host}`;
+}
+
 const sendEstimate = createRoute({
   method: "post",
   path: "/api/estimates/{id}/send",
   request: { params: IdParam },
   responses: {
-    200: { description: "Sent", content: { "application/json": { schema: OkSchema } } },
+    200: { description: "Sent", content: { "application/json": { schema: z.object({ ok: z.boolean(), public_token: z.string(), public_url: z.string(), email_sent: z.boolean(), email_reason: z.string().optional() }) } } },
     404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
     409: { description: "Invalid state transition", content: { "application/json": { schema: ErrorSchema } } },
   },
@@ -3604,13 +3661,62 @@ app.openapi(sendEstimate, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
   const idNum = toId(id);
-  const estimate = await db.select({ status: schema.estimates.status }).from(schema.estimates).where(eq(schema.estimates.id, idNum)).get();
+  const estimate = await db
+    .select({
+      status: schema.estimates.status,
+      publicToken: schema.estimates.publicToken,
+      identifier: schema.estimates.identifier,
+      customerId: schema.estimates.customerId,
+      brandId: schema.estimates.brandId,
+    })
+    .from(schema.estimates)
+    .where(eq(schema.estimates.id, idNum))
+    .get();
   if (!estimate) return c.json({ error: "Estimate not found" }, 404);
   if (estimate.status !== "draft") {
     return c.json({ error: `Cannot send an estimate with status "${estimate.status}" -- only draft estimates can be sent` }, 409);
   }
-  await db.update(schema.estimates).set({ status: "sent" }).where(eq(schema.estimates.id, idNum));
-  return c.json({ ok: true }, 200);
+
+  // Mint an unguessable public token if the estimate doesn't already have one
+  // (a re-send keeps the same link). crypto.randomUUID() is available in the
+  // Workers runtime.
+  const token = estimate.publicToken || crypto.randomUUID();
+  await db.update(schema.estimates).set({ status: "sent", publicToken: token }).where(eq(schema.estimates.id, idNum));
+
+  const publicUrl = `${requestBaseUrl(c)}/p/e/${token}`;
+
+  // GATED: try to email the customer their estimate link. When RESEND_API_KEY
+  // (+ RESEND_FROM) is set AND the customer has an email, this actually sends;
+  // otherwise sendEmail returns { sent:false, reason } and the estimate is
+  // still marked sent (the link is always copyable from the UI).
+  const customer = await db
+    .select({ name: schema.customers.name, email: schema.customers.email })
+    .from(schema.customers)
+    .where(eq(schema.customers.id, estimate.customerId))
+    .get();
+  let brandName = "Noble Tampa";
+  if (estimate.brandId) {
+    const b = await db.select({ name: schema.brands.name }).from(schema.brands).where(eq(schema.brands.id, estimate.brandId)).get();
+    if (b?.name) brandName = b.name;
+  }
+  const emailResult = await sendEmail(c.env, {
+    to: customer?.email || "",
+    subject: `Your estimate from ${brandName}`,
+    html:
+      `<div style="font-family:Georgia,serif;color:#1a2b4a">` +
+      `<p>Hi ${escapeHtml(customer?.name || "there")},</p>` +
+      `<p>Your estimate <strong>${escapeHtml(estimate.identifier || "")}</strong> from ${escapeHtml(brandName)} is ready to review.</p>` +
+      `<p><a href="${publicUrl}" style="display:inline-block;padding:10px 18px;background:#1a2b4a;color:#fff;text-decoration:none;border-radius:6px">Review &amp; Approve Your Estimate</a></p>` +
+      `<p style="font-size:13px;color:#5a6478">Or paste this link into your browser:<br>${publicUrl}</p>` +
+      `<p style="font-size:13px;color:#5a6478">Thank you,<br>${escapeHtml(brandName)} — Tampa, FL</p>` +
+      `</div>`,
+    text: `Your estimate ${estimate.identifier || ""} from ${brandName} is ready. Review and approve it here: ${publicUrl}`,
+  });
+
+  return c.json(
+    { ok: true, public_token: token, public_url: publicUrl, email_sent: emailResult.sent, email_reason: emailResult.reason },
+    200,
+  );
 });
 
 const approveEstimate = createRoute({
@@ -4186,6 +4292,729 @@ app.openapi(runDueServiceAgreementsNow, async (c) => {
   return c.json({ ok: true, ...result }, 200);
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// CUSTOMER-FACING LOOP: PDFs, public token routes, HTML page, Stripe
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Shared PDF data assembly ───────────────────────────────────────
+// Loads an estimate (by id OR token) + its lines + customer + brand and shapes
+// them into the framework-free PdfDocInput the pdf.ts helper renders. Returns
+// null if not found. Used by both the authed and public estimate PDF routes.
+async function buildEstimatePdfBytes(db: ReturnType<typeof getDb>, estimateId: number): Promise<Uint8Array | null> {
+  const est = await db
+    .select({
+      identifier: schema.estimates.identifier,
+      createdAt: schema.estimates.createdAt,
+      subtotal: schema.estimates.subtotal,
+      taxRate: schema.estimates.taxRate,
+      taxAmount: schema.estimates.taxAmount,
+      total: schema.estimates.total,
+      notes: schema.estimates.notes,
+      signedName: schema.estimates.signedName,
+      signedAt: schema.estimates.signedAt,
+      customerName: schema.customers.name,
+      customerAddress: sql<string>`TRIM(COALESCE(${schema.customers.address}, '') || ' ' || COALESCE(${schema.customers.city}, '') || ' ' || COALESCE(${schema.customers.state}, '') || ' ' || COALESCE(${schema.customers.zip}, ''))`,
+      brandName: schema.brands.name,
+      brandColorPrimary: schema.brands.colorPrimary,
+      brandColorSecondary: schema.brands.colorSecondary,
+    })
+    .from(schema.estimates)
+    .leftJoin(schema.customers, eq(schema.estimates.customerId, schema.customers.id))
+    .leftJoin(schema.brands, eq(schema.estimates.brandId, schema.brands.id))
+    .where(eq(schema.estimates.id, estimateId))
+    .get();
+  if (!est) return null;
+  const lines = await db.select().from(schema.estimateLines).where(eq(schema.estimateLines.estimateId, estimateId)).orderBy(asc(schema.estimateLines.id)).all();
+  const pdfLines: PdfLine[] = lines.map((l) => ({ description: l.description, quantity: l.quantity ?? 0, unitPrice: l.unitPrice ?? 0, total: l.total ?? 0 }));
+  return await buildDocumentPdf({
+    docType: "Estimate",
+    businessName: est.brandName || "Noble Tampa",
+    identifier: est.identifier,
+    createdAt: est.createdAt,
+    customerName: est.customerName || "",
+    customerAddress: est.customerAddress || "",
+    lines: pdfLines,
+    subtotal: est.subtotal || 0,
+    taxRate: est.taxRate || 0,
+    taxAmount: est.taxAmount || 0,
+    total: est.total || 0,
+    notes: est.notes,
+    signedName: est.signedName,
+    signedAt: est.signedAt,
+    colorPrimary: est.brandColorPrimary,
+    colorSecondary: est.brandColorSecondary,
+  });
+}
+
+async function buildInvoicePdfBytes(db: ReturnType<typeof getDb>, invoiceId: number): Promise<Uint8Array | null> {
+  const inv = await db
+    .select({
+      identifier: schema.invoices.identifier,
+      createdAt: schema.invoices.createdAt,
+      subtotal: schema.invoices.subtotal,
+      taxRate: schema.invoices.taxRate,
+      taxAmount: schema.invoices.taxAmount,
+      total: schema.invoices.total,
+      notes: schema.invoices.notes,
+      customerName: schema.customers.name,
+      customerAddress: sql<string>`TRIM(COALESCE(${schema.customers.address}, '') || ' ' || COALESCE(${schema.customers.city}, '') || ' ' || COALESCE(${schema.customers.state}, '') || ' ' || COALESCE(${schema.customers.zip}, ''))`,
+      brandName: schema.brands.name,
+      brandColorPrimary: schema.brands.colorPrimary,
+      brandColorSecondary: schema.brands.colorSecondary,
+    })
+    .from(schema.invoices)
+    .leftJoin(schema.customers, eq(schema.invoices.customerId, schema.customers.id))
+    .leftJoin(schema.brands, eq(schema.invoices.brandId, schema.brands.id))
+    .where(eq(schema.invoices.id, invoiceId))
+    .get();
+  if (!inv) return null;
+  const lines = await db.select().from(schema.invoiceLines).where(eq(schema.invoiceLines.invoiceId, invoiceId)).orderBy(asc(schema.invoiceLines.id)).all();
+  const pdfLines: PdfLine[] = lines.map((l) => ({ description: l.description, quantity: l.quantity ?? 0, unitPrice: l.unitPrice ?? 0, total: l.total ?? 0 }));
+  return await buildDocumentPdf({
+    docType: "Invoice",
+    businessName: inv.brandName || "Noble Tampa",
+    identifier: inv.identifier,
+    createdAt: inv.createdAt,
+    customerName: inv.customerName || "",
+    customerAddress: inv.customerAddress || "",
+    lines: pdfLines,
+    subtotal: inv.subtotal || 0,
+    taxRate: inv.taxRate || 0,
+    taxAmount: inv.taxAmount || 0,
+    total: inv.total || 0,
+    notes: inv.notes,
+    colorPrimary: inv.brandColorPrimary,
+    colorSecondary: inv.brandColorSecondary,
+  });
+}
+
+// PDF byte responses aren't a JSON shape, so these are plain Hono routes
+// (like the R2 proxy / uploads) rather than app.openapi/Zod routes.
+// application/pdf with inline disposition so "Download PDF" opens in a new tab.
+function pdfResponse(bytes: Uint8Array, filename: string): Response {
+  // Copy into a standalone (non-shared) ArrayBuffer so the BodyInit type is a
+  // plain ArrayBuffer, not the Uint8Array's possibly-shared underlying buffer.
+  const ab = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(ab).set(bytes);
+  return new Response(ab, {
+    headers: {
+      "content-type": "application/pdf",
+      "content-disposition": `inline; filename="${filename}"`,
+      "cache-control": "no-store",
+    },
+  });
+}
+
+// GET /api/estimates/{id}/pdf (authed). Technicians are already 403'd on the
+// whole /api/estimates family by the blanket role-gate above.
+app.get("/api/estimates/:id/pdf", async (c) => {
+  const db = getDb(c.env);
+  const idNum = toId(c.req.param("id"));
+  const bytes = await buildEstimatePdfBytes(db, idNum);
+  if (!bytes) return c.json({ error: "Estimate not found" }, 404);
+  const idRow = await db.select({ identifier: schema.estimates.identifier }).from(schema.estimates).where(eq(schema.estimates.id, idNum)).get();
+  return pdfResponse(bytes, `${idRow?.identifier || "estimate"}.pdf`);
+});
+
+// GET /api/invoices/{id}/pdf (authed). Technicians are 403'd on /api/invoices.
+app.get("/api/invoices/:id/pdf", async (c) => {
+  const db = getDb(c.env);
+  const idNum = toId(c.req.param("id"));
+  const bytes = await buildInvoicePdfBytes(db, idNum);
+  if (!bytes) return c.json({ error: "Invoice not found" }, 404);
+  const idRow = await db.select({ identifier: schema.invoices.identifier }).from(schema.invoices).where(eq(schema.invoices.id, idNum)).get();
+  return pdfResponse(bytes, `${idRow?.identifier || "invoice"}.pdf`);
+});
+
+// ── Stripe checkout (authed, GATED on STRIPE_SECRET_KEY) ───────────
+// POST /api/invoices/{id}/checkout -> { url } when Stripe is configured, or a
+// clean 501 { error, configured:false } when it isn't (never a 500). Lives
+// under /api/invoices so it's already covered by the technician role-gate's
+// /api/invoices prefix block.
+const invoiceCheckout = createRoute({
+  method: "post",
+  path: "/api/invoices/{id}/checkout",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Checkout URL", content: { "application/json": { schema: z.object({ url: z.string() }) } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Invoice not in a payable state", content: { "application/json": { schema: ErrorSchema } } },
+    501: { description: "Online payments not configured", content: { "application/json": { schema: z.object({ error: z.string(), configured: z.boolean() }) } } },
+    502: { description: "Payment provider error", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(invoiceCheckout, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const invoice = await db
+    .select({
+      id: schema.invoices.id,
+      identifier: schema.invoices.identifier,
+      total: schema.invoices.total,
+      status: schema.invoices.status,
+      brandName: schema.brands.name,
+    })
+    .from(schema.invoices)
+    .leftJoin(schema.brands, eq(schema.invoices.brandId, schema.brands.id))
+    .where(eq(schema.invoices.id, idNum))
+    .get();
+  if (!invoice) return c.json({ error: "Invoice not found" }, 404);
+  // Only a sent (or now-overdue) invoice is payable online -- a draft hasn't
+  // been finalized/handed to the customer yet, and paid/cancelled are
+  // terminal. This matters even before Stripe keys exist: once they're added,
+  // this is what stops a draft invoice from getting a live checkout link.
+  if (invoice.status !== "sent" && invoice.status !== "overdue") {
+    return c.json({ error: `This invoice is not payable online (status: ${invoice.status}).` }, 409);
+  }
+  const result = await createInvoiceCheckout(c.env, { id: invoice.id, identifier: invoice.identifier, total: invoice.total || 0, brandName: invoice.brandName }, requestBaseUrl(c));
+  if (!result.configured) {
+    return c.json({ error: "Online payments are not configured yet.", configured: false }, 501);
+  }
+  if (result.error || !result.url) {
+    return c.json({ error: result.error || "Could not start checkout." }, 502);
+  }
+  return c.json({ url: result.url }, 200);
+});
+
+// ── Stripe webhook (public, GATED on STRIPE_WEBHOOK_SECRET) ────────
+// POST /api/stripe/webhook. Skipped by the auth middleware (authenticated by
+// the webhook SIGNATURE, not a session). With no STRIPE_WEBHOOK_SECRET set it
+// cleanly returns "not configured" rather than trusting an unverified body.
+// On a verified checkout.session.completed it records a 'card' payment against
+// the invoice named in the session metadata, reusing the same
+// raw-credit/flip-to-paid accounting as recordPayment.
+app.post("/api/stripe/webhook", async (c) => {
+  if (!c.env.STRIPE_WEBHOOK_SECRET) {
+    // Honest: nothing is wired up. 200 so Stripe (if somehow pointed here)
+    // doesn't hammer retries, but the body states it plainly.
+    return c.json({ received: false, reason: "online payments not configured" }, 200);
+  }
+  const payload = await c.req.text();
+  const sig = c.req.header("stripe-signature") || null;
+  const verified = await verifyStripeWebhook(c.env, payload, sig);
+  if (!verified.valid || !verified.event) {
+    return c.json({ error: verified.reason || "invalid signature" }, 400);
+  }
+  const event = verified.event;
+  if (event.type === "checkout.session.completed") {
+    const obj = event.data.object;
+    const invoiceIdStr = obj.metadata?.invoice_id || obj.client_reference_id;
+    const invoiceId = invoiceIdStr ? parseInt(invoiceIdStr, 10) : NaN;
+    if (!Number.isNaN(invoiceId)) {
+      const db = getDb(c.env);
+      const invoice = await db.select().from(schema.invoices).where(eq(schema.invoices.id, invoiceId)).get();
+      if (invoice) {
+        // Amount actually collected from Stripe (cents -> dollars). This is the
+        // real card charge; record it as-is with a card surcharge of 0 (the
+        // customer paid the amount Stripe collected -- see createInvoiceCheckout,
+        // which charges the plain total).
+        const amount = (obj.amount_total ?? Math.round((invoice.total || 0) * 100)) / 100;
+        // Guard against a duplicate webhook delivery creating a second payment
+        // for the same Stripe session/intent.
+        const ref = obj.payment_intent || obj.id || null;
+        const dup = ref ? await db.select({ id: schema.payments.id }).from(schema.payments).where(eq(schema.payments.processorRef, ref)).get() : null;
+        if (!dup) {
+          await db.insert(schema.payments).values({
+            invoiceId,
+            method: "card",
+            amount,
+            surchargeAmount: 0,
+            processorRef: ref,
+            status: "paid",
+            paidAt: sql`(datetime('now'))`,
+          });
+          // Reuse recordPayment's flip-to-paid rule: if accumulated raw credit
+          // now covers the total, mark the invoice paid.
+          const paid = await db.select({ amount: schema.payments.amount, surchargeAmount: schema.payments.surchargeAmount }).from(schema.payments).where(and(eq(schema.payments.invoiceId, invoiceId), eq(schema.payments.status, "paid"))).all();
+          const rawCredit = paid.reduce((s, p) => s + ((p.amount || 0) - (p.surchargeAmount || 0)), 0);
+          if (rawCredit >= (invoice.total || 0) - 0.005) {
+            await db.update(schema.invoices).set({ status: "paid", paidDate: todayInTampa(), updatedAt: sql`(datetime('now'))` }).where(eq(schema.invoices.id, invoiceId));
+          }
+        }
+      }
+    }
+  }
+  return c.json({ received: true }, 200);
+});
+
+// ── Public (UNAUTHENTICATED, token-gated) estimate routes ──────────
+// All under /api/public/*, skipped by the auth middleware. Security is the
+// unguessable public_token, not a session. A token that doesn't match -> 404.
+
+// Loads the estimate row by public token (or null). Shared by the public API +
+// the HTML page below.
+async function estimateByToken(db: ReturnType<typeof getDb>, token: string) {
+  if (!token || token.length < 8) return null;
+  return await db
+    .select({
+      id: schema.estimates.id,
+      identifier: schema.estimates.identifier,
+      status: schema.estimates.status,
+      subtotal: schema.estimates.subtotal,
+      taxRate: schema.estimates.taxRate,
+      taxAmount: schema.estimates.taxAmount,
+      total: schema.estimates.total,
+      validUntil: schema.estimates.validUntil,
+      notes: schema.estimates.notes,
+      approvedAt: schema.estimates.approvedAt,
+      signedName: schema.estimates.signedName,
+      signedAt: schema.estimates.signedAt,
+      createdAt: schema.estimates.createdAt,
+      customerId: schema.estimates.customerId,
+      customerName: schema.customers.name,
+      customerAddress: sql<string>`TRIM(COALESCE(${schema.customers.address}, '') || ' ' || COALESCE(${schema.customers.city}, '') || ' ' || COALESCE(${schema.customers.state}, '') || ' ' || COALESCE(${schema.customers.zip}, ''))`,
+      brandId: schema.estimates.brandId,
+      brandName: schema.brands.name,
+      brandColorPrimary: schema.brands.colorPrimary,
+      brandColorSecondary: schema.brands.colorSecondary,
+      brandLogoKey: schema.brands.logoR2Key,
+    })
+    .from(schema.estimates)
+    .leftJoin(schema.customers, eq(schema.estimates.customerId, schema.customers.id))
+    .leftJoin(schema.brands, eq(schema.estimates.brandId, schema.brands.id))
+    .where(eq(schema.estimates.publicToken, token))
+    .get();
+}
+
+// GET /api/public/estimates/{token} -> estimate + lines + brand identity +
+// business info, for the customer view. 404 on a non-matching token.
+app.get("/api/public/estimates/:token", async (c) => {
+  const db = getDb(c.env);
+  const token = c.req.param("token");
+  const est = await estimateByToken(db, token);
+  if (!est) return c.json({ error: "Not found" }, 404);
+  const lines = await db.select().from(schema.estimateLines).where(eq(schema.estimateLines.estimateId, est.id)).orderBy(asc(schema.estimateLines.id)).all();
+  return c.json({
+    estimate: {
+      identifier: est.identifier,
+      status: est.status,
+      subtotal: est.subtotal,
+      tax_rate: est.taxRate,
+      tax_amount: est.taxAmount,
+      total: est.total,
+      valid_until: est.validUntil,
+      notes: est.notes,
+      approved_at: est.approvedAt,
+      signed_name: est.signedName,
+      signed_at: est.signedAt,
+      created_at: est.createdAt,
+      customer_name: est.customerName,
+      lines: lines.map((l) => ({ id: l.id, description: l.description, quantity: l.quantity, unit_price: l.unitPrice, total: l.total })),
+    },
+    brand: {
+      name: est.brandName || "Noble Tampa",
+      color_primary: est.brandColorPrimary,
+      color_secondary: est.brandColorSecondary,
+      logo_key: est.brandLogoKey,
+    },
+    business: { location: "Tampa, FL", financing_url: ACORN_FINANCE_URL },
+  }, 200);
+});
+
+// GET /api/public/estimates/{token}/pdf -> the estimate PDF for the customer.
+app.get("/api/public/estimates/:token/pdf", async (c) => {
+  const db = getDb(c.env);
+  const est = await estimateByToken(db, c.req.param("token"));
+  if (!est) return c.json({ error: "Not found" }, 404);
+  const bytes = await buildEstimatePdfBytes(db, est.id);
+  if (!bytes) return c.json({ error: "Not found" }, 404);
+  return pdfResponse(bytes, `${est.identifier || "estimate"}.pdf`);
+});
+
+// POST /api/public/estimates/{token}/accept -> customer accepts + e-signs.
+// Body { name, signature (data:image/png;base64,...) }. Requires status 'sent'.
+// Stores the signature PNG in R2, records signed_* + moves to 'approved'.
+const publicAcceptSchema = z.object({
+  name: z.string().trim().min(1, { message: "Please enter your name" }),
+  signature: z.string().min(1, { message: "Please sign before accepting" }),
+});
+
+app.post("/api/public/estimates/:token/accept", async (c) => {
+  const db = getDb(c.env);
+  const token = c.req.param("token");
+  const est = await db.select().from(schema.estimates).where(eq(schema.estimates.publicToken, token)).get();
+  if (!est) return c.json({ error: "Not found" }, 404);
+
+  let body: z.infer<typeof publicAcceptSchema>;
+  try {
+    body = publicAcceptSchema.parse(await c.req.json());
+  } catch (err) {
+    const msg = (err as { errors?: { message?: string }[] })?.errors?.[0]?.message || "Invalid request";
+    return c.json({ error: msg }, 400);
+  }
+
+  // Friendly 409 for an estimate that isn't in a signable state.
+  if (est.status !== "sent") {
+    if (est.status === "approved") return c.json({ error: "This estimate has already been accepted." }, 409);
+    if (est.status === "declined") return c.json({ error: "This estimate was already declined." }, 409);
+    return c.json({ error: `This estimate can no longer be accepted (status: ${est.status}).` }, 409);
+  }
+
+  // Decode the base64 PNG data URL to bytes and store it in R2 under
+  // signatures/estimate-{id}-{uuid}.png. Reject a payload that isn't a PNG
+  // data URL so a garbage body can't be stored.
+  const m = /^data:image\/png;base64,([A-Za-z0-9+/=]+)$/.exec(body.signature.trim());
+  if (!m) return c.json({ error: "Signature must be a PNG image." }, 400);
+  let sigBytes: Uint8Array;
+  try {
+    const bin = atob(m[1]);
+    sigBytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) sigBytes[i] = bin.charCodeAt(i);
+  } catch {
+    return c.json({ error: "Could not read the signature image." }, 400);
+  }
+  const sigKey = `signatures/estimate-${est.id}-${crypto.randomUUID()}.png`;
+  await c.env.BUCKET.put(sigKey, sigBytes, { httpMetadata: { contentType: "image/png" } });
+
+  const ip = c.req.header("cf-connecting-ip") || c.req.header("x-forwarded-for") || "unknown";
+  // Full timestamp (UTC) for the audit trail; signed_at is what the PDF's
+  // "Accepted by ... on ..." line and the internal detail view read.
+  await db.update(schema.estimates).set({
+    status: "approved",
+    approvedAt: sql`(datetime('now'))`,
+    signatureR2Key: sigKey,
+    signedAt: sql`(datetime('now'))`,
+    signedName: body.name,
+    signedIp: ip,
+  }).where(eq(schema.estimates.id, est.id));
+
+  return c.json({ ok: true, status: "approved" }, 200);
+});
+
+// POST /api/public/estimates/{token}/decline -> 'sent' -> 'declined'.
+app.post("/api/public/estimates/:token/decline", async (c) => {
+  const db = getDb(c.env);
+  const token = c.req.param("token");
+  const est = await db.select({ id: schema.estimates.id, status: schema.estimates.status }).from(schema.estimates).where(eq(schema.estimates.publicToken, token)).get();
+  if (!est) return c.json({ error: "Not found" }, 404);
+  if (est.status !== "sent") {
+    if (est.status === "declined") return c.json({ error: "This estimate was already declined." }, 409);
+    if (est.status === "approved") return c.json({ error: "This estimate has already been accepted." }, 409);
+    return c.json({ error: `This estimate can no longer be declined (status: ${est.status}).` }, 409);
+  }
+  await db.update(schema.estimates).set({ status: "declined" }).where(eq(schema.estimates.id, est.id));
+  return c.json({ ok: true, status: "declined" }, 200);
+});
+
+// ── Public customer HTML page (branded, self-contained) ────────────
+// GET /p/e/{token}. A real Worker route returning text/html -- it takes
+// precedence over the ASSETS/SPA fallback (Hono matches this route before the
+// notFound handler defers to ASSETS). NOT the SPA (which is behind login).
+app.get("/p/e/:token", async (c) => {
+  const db = getDb(c.env);
+  const token = c.req.param("token");
+  const est = await estimateByToken(db, token);
+  if (!est) {
+    return c.html(customerErrorPage("Estimate not found", "This link is invalid or has expired. Please contact us for a new copy."), 404);
+  }
+  const lines = await db.select().from(schema.estimateLines).where(eq(schema.estimateLines.estimateId, est.id)).orderBy(asc(schema.estimateLines.id)).all();
+  return c.html(customerEstimatePage(token, est, lines));
+});
+
+// Branded "success"/"cancel" landing pages for the Stripe redirect (only
+// reachable when Stripe is configured, but harmless static pages otherwise).
+app.get("/pay/success", (c) => c.html(payResultPage(true)));
+app.get("/pay/cancel", (c) => c.html(payResultPage(false)));
+
+// ── Customer-facing HTML (self-contained, on-brand navy/gold) ──────
+// These render the trustworthy homeowner-facing document. Inline CSS + inline
+// vanilla JS (the SPA is behind login and can't be reused here). Function
+// declarations so they're hoisted above the routes that call them.
+
+// Server-side money/date formatters for the HTML (mirror the client's
+// format.ts -- self-contained so no cross-boundary import is needed).
+function htmlMoney(n: number | null | undefined): string {
+  const v = typeof n === "number" && isFinite(n) ? n : 0;
+  return "$" + v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function htmlDate(raw: string | null | undefined): string {
+  if (!raw) return "";
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(raw);
+  if (!m) return raw;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+  return d.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" });
+}
+// HTML-escape for interpolating DB text into the page.
+function esc(s: string | null | undefined): string {
+  return escapeHtml(s || "");
+}
+
+// Validates a brand color is a strict "#rgb"/"#rrggbb" hex string before it
+// gets interpolated into a raw <style> block (see customerPageShell) --
+// writes are already validated by zHexColor, but this is the last line of
+// defense against a bad/malicious value already sitting in the DB (e.g. from
+// before validation existed, or a future write path that forgets to use
+// zHexColor) turning into stored XSS on this unauthenticated customer page.
+function safeCssHex(hex: string | null | undefined, fallback: string): string {
+  return hex && /^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/.test(hex) ? hex : fallback;
+}
+
+// Shared page chrome (doctype, brand colors, base CSS). `body` is the inner
+// HTML; primary/secondary are the brand hex colors.
+function customerPageShell(title: string, primary: string, secondary: string, body: string): string {
+  const safePrimary = safeCssHex(primary, "#1a2b4a");
+  const safeSecondary = safeCssHex(secondary, "#c9a227");
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>${esc(title)}</title>
+<style>
+  :root { --navy:${safePrimary}; --gold:${safeSecondary}; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#eef1f5; color:#1c2333; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height:1.5; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 28px 18px 60px; }
+  .doc { background:#fff; border-radius:14px; box-shadow:0 10px 40px rgba(20,34,59,.10), 0 2px 6px rgba(20,34,59,.06); overflow:hidden; }
+  .letterhead { background: linear-gradient(180deg, var(--navy), #14223b); color:#fff; padding: 26px 30px; display:flex; justify-content:space-between; align-items:flex-start; gap:18px; border-bottom:3px solid var(--gold); }
+  .letterhead .org { display:flex; gap:14px; align-items:center; }
+  .letterhead img { height:46px; width:auto; border-radius:8px; background:#fff; padding:3px; }
+  .org-name { font-size:20px; font-weight:700; letter-spacing:-.01em; }
+  .org-meta { font-size:12.5px; color:#c9d2e2; margin-top:2px; }
+  .doc-title { text-align:right; }
+  .doc-title .t { font-size:22px; font-weight:700; color:var(--gold); letter-spacing:.02em; }
+  .doc-title .s { font-size:12.5px; color:#c9d2e2; margin-top:3px; }
+  .body { padding: 26px 30px 30px; }
+  .billto-label { font-size:11px; font-weight:700; letter-spacing:.06em; color:#8b93a5; text-transform:uppercase; }
+  .billto-name { font-size:16px; font-weight:700; margin-top:4px; color:#1c2333; }
+  .billto-addr { font-size:13.5px; color:#5a6478; margin-top:2px; }
+  table.lines { width:100%; border-collapse:collapse; margin-top:22px; font-size:14px; }
+  table.lines th { text-align:left; font-size:11px; letter-spacing:.05em; text-transform:uppercase; color:#8b93a5; padding:0 0 8px; border-bottom:2px solid #eceef2; }
+  table.lines th.r, table.lines td.r { text-align:right; }
+  table.lines td { padding:11px 0; border-bottom:1px solid #f0f2f5; vertical-align:top; }
+  .totals { margin-top:18px; margin-left:auto; width:min(320px,100%); font-size:14px; }
+  .totals .row { display:flex; justify-content:space-between; padding:5px 0; color:#5a6478; }
+  .totals .grand { border-top:2px solid var(--navy); margin-top:6px; padding-top:10px; font-size:18px; font-weight:700; color:var(--navy); }
+  .financing { margin-top:20px; }
+  .financing a { display:inline-flex; align-items:center; gap:8px; font-size:13.5px; font-weight:600; color:#8a6d12; background:rgba(201,162,39,.12); border:1px solid rgba(201,162,39,.35); padding:9px 14px; border-radius:8px; text-decoration:none; }
+  .notes { margin-top:22px; font-size:13.5px; color:#5a6478; }
+  .notes .lbl { font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:#8b93a5; margin-bottom:4px; }
+  .actions { margin-top:26px; padding-top:24px; border-top:1px dashed #d8dde5; }
+  .actions h3 { margin:0 0 4px; font-size:17px; color:var(--navy); }
+  .actions p { margin:0 0 16px; font-size:13.5px; color:#5a6478; }
+  .field { margin-bottom:14px; }
+  .field label { display:block; font-size:12.5px; font-weight:600; color:#3a4256; margin-bottom:6px; }
+  .field input[type=text] { width:100%; padding:11px 12px; font-size:15px; border:1px solid #cdd3dd; border-radius:8px; }
+  .field input[type=text]:focus { outline:none; border-color:var(--navy); box-shadow:0 0 0 3px rgba(26,43,74,.12); }
+  .sigpad-wrap { border:1px solid #cdd3dd; border-radius:8px; background:#fcfcfd; position:relative; }
+  canvas#sig { width:100%; height:170px; display:block; touch-action:none; border-radius:8px; }
+  .sig-hint { position:absolute; left:14px; top:12px; font-size:12.5px; color:#aeb5c2; pointer-events:none; }
+  .sig-clear { position:absolute; right:10px; bottom:8px; font-size:12px; color:#5a6478; background:#fff; border:1px solid #d8dde5; border-radius:6px; padding:4px 10px; cursor:pointer; }
+  .btnrow { display:flex; gap:12px; margin-top:20px; flex-wrap:wrap; }
+  .btn { flex:1; min-width:150px; padding:13px 18px; font-size:15px; font-weight:600; border-radius:9px; border:none; cursor:pointer; }
+  .btn-accept { background:var(--navy); color:#fff; }
+  .btn-accept:hover { background:#14223b; }
+  .btn-decline { background:#fff; color:#8a3b3b; border:1px solid #e3c6c6; }
+  .btn:disabled { opacity:.6; cursor:default; }
+  .state { margin-top:24px; padding:18px 20px; border-radius:10px; font-size:14.5px; }
+  .state.ok { background:#e8f2ec; color:#256b43; border:1px solid #bfe0cd; }
+  .state.no { background:#fbecec; color:#8a3b3b; border:1px solid #edcccc; }
+  .state .big { font-weight:700; font-size:16px; display:block; margin-bottom:3px; }
+  .err { margin-top:12px; color:#a12f2f; font-size:13.5px; display:none; }
+  .downloadrow { margin-top:20px; text-align:center; }
+  .downloadrow a { font-size:13px; color:var(--navy); font-weight:600; text-decoration:none; border-bottom:1px solid rgba(26,43,74,.3); }
+  .foot { text-align:center; font-size:12px; color:#8b93a5; margin-top:22px; }
+</style>
+</head><body><div class="wrap">${body}</div></body></html>`;
+}
+
+function customerErrorPage(heading: string, message: string): string {
+  const body = `<div class="doc"><div class="letterhead"><div class="org"><div><div class="org-name">Noble Tampa</div><div class="org-meta">Tampa, FL</div></div></div></div>
+  <div class="body"><div class="state no"><span class="big">${esc(heading)}</span>${esc(message)}</div></div></div>
+  <div class="foot">Noble Tampa · Tampa, FL</div>`;
+  return customerPageShell(heading, "#1a2b4a", "#c9a227", body);
+}
+
+function payResultPage(success: boolean): string {
+  const body = `<div class="doc"><div class="letterhead"><div class="org"><div><div class="org-name">Noble Tampa</div><div class="org-meta">Tampa, FL</div></div></div></div>
+  <div class="body"><div class="state ${success ? "ok" : "no"}"><span class="big">${success ? "Payment received — thank you!" : "Payment canceled"}</span>${success ? "Your payment was processed successfully. A receipt has been recorded on your invoice." : "No charge was made. You can return and try again whenever you're ready."}</div></div></div>
+  <div class="foot">Noble Tampa · Tampa, FL</div>`;
+  return customerPageShell(success ? "Payment received" : "Payment canceled", "#1a2b4a", "#c9a227", body);
+}
+
+// The full customer estimate page. `est` is the estimateByToken row; `lines`
+// its estimate_lines. Renders the interactive signature pad + accept/decline
+// only when status === 'sent'; otherwise a read-only already-accepted/declined
+// state.
+function customerEstimatePage(
+  token: string,
+  est: NonNullable<Awaited<ReturnType<typeof estimateByToken>>>,
+  lines: (typeof schema.estimateLines.$inferSelect)[],
+): string {
+  const primary = est.brandColorPrimary || "#1a2b4a";
+  const secondary = est.brandColorSecondary || "#c9a227";
+  const brandName = est.brandName || "Noble Tampa";
+  const logo = est.brandLogoKey ? `<img src="/api/r2/${esc(est.brandLogoKey)}" alt="${esc(brandName)}">` : "";
+
+  const linesHtml = lines.map((l) => `
+    <tr>
+      <td>${esc(l.description)}</td>
+      <td class="r">${l.quantity ?? 0}</td>
+      <td class="r">${htmlMoney(l.unitPrice)}</td>
+      <td class="r">${htmlMoney(l.total)}</td>
+    </tr>`).join("");
+
+  const taxRow = (est.taxRate || 0) > 0
+    ? `<div class="row"><span>Tax (${est.taxRate}%)</span><span>${htmlMoney(est.taxAmount)}</span></div>`
+    : "";
+
+  const notesHtml = est.notes && est.notes.trim()
+    ? `<div class="notes"><div class="lbl">Notes</div>${esc(est.notes)}</div>`
+    : "";
+
+  // The action zone depends on status.
+  let actionZone: string;
+  if (est.status === "sent") {
+    // Interactive: name input + signature canvas + Accept/Decline.
+    actionZone = `
+    <div class="actions" id="action-zone">
+      <h3>Accept this estimate</h3>
+      <p>Sign below and enter your name to approve the work. Prefer not to move forward? You can decline.</p>
+      <div class="field">
+        <label for="name">Your full name</label>
+        <input type="text" id="name" placeholder="e.g. Jane Homeowner" autocomplete="name">
+      </div>
+      <div class="field">
+        <label>Signature</label>
+        <div class="sigpad-wrap">
+          <canvas id="sig"></canvas>
+          <span class="sig-hint" id="sig-hint">Draw your signature here</span>
+          <button type="button" class="sig-clear" id="sig-clear">Clear</button>
+        </div>
+      </div>
+      <div class="err" id="err"></div>
+      <div class="btnrow">
+        <button class="btn btn-accept" id="btn-accept">Accept &amp; Sign</button>
+        <button class="btn btn-decline" id="btn-decline">Decline</button>
+      </div>
+    </div>`;
+  } else if (est.status === "approved" || est.status === "converted") {
+    const who = est.signedName ? ` by ${esc(est.signedName)}` : "";
+    const when = est.signedAt ? ` on ${htmlDate(est.signedAt)}` : (est.approvedAt ? ` on ${htmlDate(est.approvedAt)}` : "");
+    actionZone = `<div class="state ok"><span class="big">This estimate has been accepted${when ? "" : ""}.</span>Accepted${who}${when}. Thank you — we'll be in touch to schedule your work.</div>`;
+  } else if (est.status === "declined") {
+    actionZone = `<div class="state no"><span class="big">This estimate was declined.</span>If this was a mistake or you'd like to revisit it, please contact us.</div>`;
+  } else {
+    // draft/expired or anything else: read-only, no actions.
+    actionZone = `<div class="state no"><span class="big">This estimate isn't available for approval.</span>Please contact us for an up-to-date copy.</div>`;
+  }
+
+  const body = `
+  <div class="doc">
+    <div class="letterhead">
+      <div class="org">${logo}<div><div class="org-name">${esc(brandName)}</div><div class="org-meta">Tampa, FL</div></div></div>
+      <div class="doc-title"><div class="t">ESTIMATE</div><div class="s">${esc(est.identifier || "")}</div><div class="s">${htmlDate(est.createdAt)}</div></div>
+    </div>
+    <div class="body">
+      <div class="billto-label">Prepared for</div>
+      <div class="billto-name">${esc(est.customerName || "")}</div>
+      ${est.customerAddress && est.customerAddress.trim() ? `<div class="billto-addr">${esc(est.customerAddress)}</div>` : ""}
+
+      <table class="lines">
+        <thead><tr><th>Description</th><th class="r">Qty</th><th class="r">Unit Price</th><th class="r">Total</th></tr></thead>
+        <tbody>${linesHtml}</tbody>
+      </table>
+
+      <div class="totals">
+        <div class="row"><span>Subtotal</span><span>${htmlMoney(est.subtotal)}</span></div>
+        ${taxRow}
+        <div class="row grand"><span>Total</span><span>${htmlMoney(est.total)}</span></div>
+      </div>
+
+      <div class="financing"><a href="${esc(ACORN_FINANCE_URL)}" target="_blank" rel="noopener noreferrer">Financing available — pre-qualify now</a></div>
+
+      ${notesHtml}
+      ${actionZone}
+
+      <div class="downloadrow"><a href="/api/public/estimates/${esc(token)}/pdf" target="_blank" rel="noopener">Download PDF copy</a></div>
+    </div>
+  </div>
+  <div class="foot">${esc(brandName)} · Tampa, FL</div>
+
+  <script>
+  (function(){
+    var token = ${JSON.stringify(token)};
+    var canvas = document.getElementById('sig');
+    if (!canvas) return; // read-only state, no pad
+    var hint = document.getElementById('sig-hint');
+    var errEl = document.getElementById('err');
+    var accept = document.getElementById('btn-accept');
+    var decline = document.getElementById('btn-decline');
+    var clearBtn = document.getElementById('sig-clear');
+    var ctx = canvas.getContext('2d');
+    var drawing = false, hasInk = false, last = null;
+
+    function resize(){
+      var ratio = window.devicePixelRatio || 1;
+      var rect = canvas.getBoundingClientRect();
+      canvas.width = Math.round(rect.width * ratio);
+      canvas.height = Math.round(rect.height * ratio);
+      ctx.setTransform(ratio,0,0,ratio,0,0);
+      ctx.lineWidth = 2.2; ctx.lineCap='round'; ctx.lineJoin='round'; ctx.strokeStyle='#1c2333';
+    }
+    // Delay initial size to after layout.
+    setTimeout(resize, 0);
+    window.addEventListener('resize', resize);
+
+    function pos(e){
+      var rect = canvas.getBoundingClientRect();
+      var p = (e.touches && e.touches[0]) ? e.touches[0] : e;
+      return { x: p.clientX - rect.left, y: p.clientY - rect.top };
+    }
+    function start(e){ e.preventDefault(); drawing = true; last = pos(e); if(hint) hint.style.display='none'; }
+    function move(e){ if(!drawing) return; e.preventDefault(); var p = pos(e); ctx.beginPath(); ctx.moveTo(last.x,last.y); ctx.lineTo(p.x,p.y); ctx.stroke(); last = p; hasInk = true; }
+    function end(e){ if(drawing){ e.preventDefault(); } drawing = false; }
+
+    canvas.addEventListener('pointerdown', start);
+    canvas.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', end);
+
+    clearBtn.addEventListener('click', function(){ ctx.clearRect(0,0,canvas.width,canvas.height); hasInk=false; if(hint) hint.style.display=''; });
+
+    function showErr(m){ errEl.textContent = m; errEl.style.display='block'; }
+    function lock(){ accept.disabled = true; decline.disabled = true; }
+    function unlock(){ accept.disabled = false; decline.disabled = false; }
+
+    function replaceZone(cls, big, msg){
+      var z = document.getElementById('action-zone');
+      z.innerHTML = '<div class="state '+cls+'"><span class="big">'+big+'</span>'+msg+'</div>';
+    }
+
+    accept.addEventListener('click', function(){
+      errEl.style.display='none';
+      var name = (document.getElementById('name').value||'').trim();
+      if(!name){ showErr('Please enter your name.'); return; }
+      if(!hasInk){ showErr('Please sign in the box above before accepting.'); return; }
+      var sig = canvas.toDataURL('image/png');
+      lock(); accept.textContent = 'Submitting…';
+      fetch('/api/public/estimates/'+encodeURIComponent(token)+'/accept', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ name: name, signature: sig })
+      }).then(function(r){ return r.json().then(function(d){ return { ok:r.ok, d:d }; }); })
+      .then(function(res){
+        if(!res.ok){ unlock(); accept.textContent='Accept & Sign'; showErr(res.d.error || 'Could not accept. Please try again.'); return; }
+        replaceZone('ok','Thank you — estimate accepted!','Your signature was recorded. We\\'ll reach out soon to schedule your work.');
+      }).catch(function(){ unlock(); accept.textContent='Accept & Sign'; showErr('Network error. Please try again.'); });
+    });
+
+    decline.addEventListener('click', function(){
+      errEl.style.display='none';
+      lock(); decline.textContent = 'Submitting…';
+      fetch('/api/public/estimates/'+encodeURIComponent(token)+'/decline', { method:'POST' })
+      .then(function(r){ return r.json().then(function(d){ return { ok:r.ok, d:d }; }); })
+      .then(function(res){
+        if(!res.ok){ unlock(); decline.textContent='Decline'; showErr(res.d.error || 'Could not decline. Please try again.'); return; }
+        replaceZone('no','Estimate declined','Thank you for letting us know. Contact us anytime if you change your mind.');
+      }).catch(function(){ unlock(); decline.textContent='Decline'; showErr('Network error. Please try again.'); });
+    });
+  })();
+  </script>`;
+
+  return customerPageShell(`Estimate ${est.identifier || ""} — ${brandName}`, primary, secondary, body);
+}
+
 // ── Global error handler ───────────────────────────────────────────
 // Any error that bubbles out of a route (including Zod validation failures
 // that OpenAPIHono re-throws, and raw D1 constraint errors) lands here. We
@@ -4268,22 +5097,50 @@ export default {
   },
 
   // Consumes reminder messages enqueued by createJob/updateJob (see
-  // enqueueJobReminder above) off the "westchase-reminders" queue. There is
-  // no real SMS/email provider configured (Twilio/SendGrid/etc. -- none of
-  // that is set up, and wiring one up is out of scope for this pass), so
-  // this deliberately does NOT pretend to send a notification. Instead it
-  // records the reminder intent as a job_notes row so it's durable and
-  // inspectable from the job detail view -- a clear, visible placeholder for
-  // real Phase 5/6 notification-provider integration, not a fake "sent"
-  // status.
+  // enqueueJobReminder above) off the "westchase-reminders" queue. Points at
+  // notify.ts so it becomes REAL when keys are added, staying an HONEST no-op
+  // when they aren't:
+  //   - If RESEND_API_KEY (+ RESEND_FROM) is set AND the job's customer has an
+  //     email, sendEmail actually sends a reminder and we record a "reminder
+  //     sent" job note.
+  //   - If no provider is configured (or no customer email), sendEmail returns
+  //     { sent:false, reason } WITHOUT pretending to send, and we record an
+  //     honest "reminder queued — not sent (reason)" note. Either way the
+  //     intent is durable and inspectable on the job detail view.
   async queue(batch: MessageBatch<ReminderMessage>, env: Env) {
     const db = getDb(env);
     for (const message of batch.messages) {
       try {
         const { job_id, scheduled_date } = message.body;
+        // Look up the job's customer + brand for a personalized reminder.
+        const job = await db
+          .select({
+            identifier: schema.jobs.identifier,
+            customerName: schema.customers.name,
+            customerEmail: schema.customers.email,
+            brandName: schema.brands.name,
+          })
+          .from(schema.jobs)
+          .leftJoin(schema.customers, eq(schema.jobs.customerId, schema.customers.id))
+          .leftJoin(schema.brands, eq(schema.jobs.brandId, schema.brands.id))
+          .where(eq(schema.jobs.id, job_id))
+          .get();
+        const brand = job?.brandName || "Noble Tampa";
+        const result = await sendEmail(env, {
+          to: job?.customerEmail || "",
+          subject: `Reminder: your ${brand} appointment on ${scheduled_date}`,
+          html:
+            `<div style="font-family:Georgia,serif;color:#1a2b4a">` +
+            `<p>Hi ${escapeHtml(job?.customerName || "there")},</p>` +
+            `<p>This is a friendly reminder about your upcoming appointment (${escapeHtml(job?.identifier || "")}) scheduled for <strong>${escapeHtml(scheduled_date)}</strong>.</p>` +
+            `<p>Thank you,<br>${escapeHtml(brand)} — Tampa, FL</p></div>`,
+          text: `Reminder: your ${brand} appointment ${job?.identifier || ""} is scheduled for ${scheduled_date}.`,
+        });
         await db.insert(schema.jobNotes).values({
           jobId: job_id,
-          content: `Reminder queued for ${scheduled_date} (no notification provider configured yet).`,
+          content: result.sent
+            ? `Reminder email sent to the customer for ${scheduled_date}.`
+            : `Reminder queued for ${scheduled_date} — not sent (${result.reason || "no provider"}).`,
         });
         message.ack();
       } catch (err) {

@@ -4,7 +4,7 @@ import { ACORN_FINANCE_URL, PAYMENT_TIERS, computePaymentAmount } from "../const
 import { NobleMark } from "./noble-mark";
 import { StatusBadge } from "./status-badge";
 import { formatDate, formatDateTime, formatMoney } from "../format";
-import { ArrowLeft, Trash2, ExternalLink, CreditCard, Plus } from "lucide-preact";
+import { ArrowLeft, Trash2, ExternalLink, CreditCard, Plus, FileDown } from "lucide-preact";
 import type { InvoiceStatus, PaymentMethod } from "../types";
 
 const ALL_STATUSES: InvoiceStatus[] = ["draft", "sent", "paid", "overdue", "cancelled"];
@@ -19,7 +19,7 @@ const PAYMENT_METHOD_LABELS: Record<PaymentMethod, string> = {
 };
 
 export function InvoiceDetail() {
-  const { selectedInvoice: invoice, navigate, updateInvoice, deleteInvoice, addInvoiceLine, deleteInvoiceLine, brands, recordPayment, setError } = useApp();
+  const { selectedInvoice: invoice, navigate, updateInvoice, deleteInvoice, addInvoiceLine, deleteInvoiceLine, brands, recordPayment, startInvoiceCheckout, setError } = useApp();
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("cash");
   const [customAmount, setCustomAmount] = useState("");
   const [recording, setRecording] = useState(false);
@@ -27,8 +27,33 @@ export function InvoiceDetail() {
   const [lineDesc, setLineDesc] = useState("");
   const [lineQty, setLineQty] = useState("1");
   const [linePrice, setLinePrice] = useState("0");
+  const [checkingOut, setCheckingOut] = useState(false);
+  const [payNotice, setPayNotice] = useState<string | null>(null);
 
   if (!invoice) return null;
+
+  // Open the branded invoice PDF in a new tab (authed route).
+  const downloadPdf = () => window.open(`/api/invoices/${invoice.id}/pdf`, "_blank", "noopener");
+
+  // "Pay online" via Stripe Checkout (GATED on STRIPE_SECRET_KEY). When Stripe
+  // isn't configured the route returns 501 and we show an inline notice rather
+  // than erroring.
+  const payOnline = async () => {
+    setCheckingOut(true);
+    setPayNotice(null);
+    try {
+      const res = await startInvoiceCheckout(invoice.id);
+      if (!res.configured) {
+        setPayNotice("Online card payments aren't set up yet. Add a Stripe key to enable this.");
+        return;
+      }
+      if (res.url) window.location.href = res.url;
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setCheckingOut(false);
+    }
+  };
 
   const handleAddLine = async () => {
     if (!lineDesc.trim()) return;
@@ -69,6 +94,9 @@ export function InvoiceDetail() {
           <ArrowLeft size={16} /> Back
         </button>
         <div class="page-header-right">
+          <button class="btn" onClick={downloadPdf} title="Open a branded PDF of this invoice">
+            <FileDown size={14} /> PDF
+          </button>
           <button class="btn btn-danger" onClick={() => deleteInvoice(invoice.id)}>
             <Trash2 size={14} /> Delete
           </button>
@@ -268,6 +296,20 @@ export function InvoiceDetail() {
                 {recording ? "Recording..." : "Record Payment"}
               </button>
             </div>
+
+            {/* Online card payment via Stripe (GATED on STRIPE_SECRET_KEY).
+                Only a sent/overdue invoice is payable online -- matches the
+                server-side guard on POST /api/invoices/{id}/checkout. */}
+            {(invoice.status === "sent" || invoice.status === "overdue") && (
+              <div style={{ marginTop: 12 }}>
+                <button class="btn btn-sm" onClick={payOnline} disabled={checkingOut} title="Send the customer to a secure Stripe checkout">
+                  <CreditCard size={13} /> {checkingOut ? "Starting checkout..." : "Pay online (card)"}
+                </button>
+                {payNotice && (
+                  <span class="text-muted" style={{ fontSize: 12, marginLeft: 10 }}>{payNotice}</span>
+                )}
+              </div>
+            )}
           </div>
 
           {invoice.notes && (
