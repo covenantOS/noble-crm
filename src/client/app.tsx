@@ -1,9 +1,11 @@
-import { useEffect, useMemo } from "preact/hooks";
+import { useEffect, useMemo, useState } from "preact/hooks";
+import { Menu } from "lucide-preact";
 import { AppContext } from "./context";
 import { useAppState } from "./hooks/use-app";
 import { useRouter } from "./hooks/use-router";
 import { useSession } from "./hooks/use-session";
 import { Sidebar } from "./components/sidebar";
+import { NobleMark } from "./components/noble-mark";
 import { Dashboard } from "./components/dashboard";
 import { ScheduleView } from "./components/schedule-view";
 import { JobList } from "./components/job-list";
@@ -56,6 +58,9 @@ function AuthenticatedApp({ isAgent, session }: { isAgent: boolean; session: Non
     email: session.user.email,
   }), [session]);
   const appState = useAppState(isAgent, navigate, currentUser);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  // Close the mobile drawer whenever the route changes.
+  useEffect(() => { setDrawerOpen(false); }, [view, id]);
 
   // Load detail when URL has an ID
   useEffect(() => {
@@ -93,7 +98,16 @@ function AuthenticatedApp({ isAgent, session }: { isAgent: boolean; session: Non
   return (
     <AppContext.Provider value={appState}>
       <div class="layout">
-        <Sidebar currentView={view} />
+        {/* Mobile top bar — hamburger + wordmark (hidden on desktop via CSS) */}
+        <header class="topbar">
+          <button class="topbar-toggle" onClick={() => setDrawerOpen(true)} aria-label="Open menu">
+            <Menu size={20} />
+          </button>
+          <NobleMark size={28} class="topbar-mark" />
+          <span class="topbar-name">Noble<em> CRM</em></span>
+        </header>
+        <div class={`sidebar-overlay ${drawerOpen ? "open" : ""}`} onClick={() => setDrawerOpen(false)} />
+        <Sidebar currentView={view} open={drawerOpen} onNavigate={() => setDrawerOpen(false)} />
         <main class="main-content">
           {appState.loading ? (
             <div class="loading-text">Loading...</div>

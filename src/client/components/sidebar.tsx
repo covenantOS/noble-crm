@@ -1,5 +1,6 @@
 import { useApp } from "../context";
-import { CalendarClock, LayoutDashboard, Briefcase, Users, Wrench, Settings, CalendarDays, FileText, ClipboardList, Package, LogOut, Palette, Repeat } from "lucide-preact";
+import { LayoutDashboard, Briefcase, Users, Wrench, Settings, CalendarDays, FileText, ClipboardList, Package, LogOut, Palette, Repeat } from "lucide-preact";
+import { NobleMark } from "./noble-mark";
 import type { View } from "../types";
 
 const navItems: { view: View; path: string; label: string; icon: typeof LayoutDashboard }[] = [
@@ -27,8 +28,9 @@ const TECHNICIAN_HIDDEN_VIEWS: View[] = ["customers", "technicians", "invoices",
 // pills elsewhere (jobs/invoices), just not the settings page.
 const ESTIMATOR_HIDDEN_VIEWS: View[] = ["brands"];
 
-export function Sidebar({ currentView }: { currentView: View }) {
+export function Sidebar({ currentView, open, onNavigate }: { currentView: View; open?: boolean; onNavigate?: () => void }) {
   const { navigate, stats, currentUser, logout, jobsPag } = useApp();
+  const go = (path: string) => { navigate(path); onNavigate?.(); };
   const isTechnician = currentUser?.role === "technician";
   const isEstimator = currentUser?.role === "estimator";
   const visibleNavItems = navItems.filter((item) => {
@@ -42,12 +44,13 @@ export function Sidebar({ currentView }: { currentView: View }) {
   const jobsBadgeCount = isTechnician ? jobsPag.total : stats.jobs;
 
   return (
-    <aside class="sidebar">
+    <aside class={`sidebar ${open ? "open" : ""}`}>
       <div class="sidebar-brand">
-        <div class="sidebar-brand-icon">
-          <CalendarClock size={16} />
+        <NobleMark size={34} class="sidebar-brand-mark" />
+        <div class="sidebar-wordmark">
+          <span class="sidebar-wordmark-name">Noble<em> CRM</em></span>
+          <span class="sidebar-wordmark-sub">Noble Tampa</span>
         </div>
-        Field Scheduler
       </div>
       <nav class="sidebar-nav">
         <div class="sidebar-section-title">Menu</div>
@@ -55,7 +58,7 @@ export function Sidebar({ currentView }: { currentView: View }) {
           <button
             key={item.view}
             class={`sidebar-item ${currentView === item.view ? "active" : ""}`}
-            onClick={() => navigate(item.path)}
+            onClick={() => go(item.path)}
           >
             <item.icon size={16} />
             <span>{item.label}</span>

@@ -1,7 +1,7 @@
 import { useState } from "preact/hooks";
 import type { JSX } from "preact";
-import { LogIn } from "lucide-preact";
 import { authClient } from "../auth-client";
+import { NobleMark } from "./noble-mark";
 
 export function Login() {
   const [email, setEmail] = useState("");
@@ -30,11 +30,11 @@ export function Login() {
   return (
     <div class="login-screen">
       <form class="login-card" onSubmit={handleSubmit}>
-        <div class="sidebar-brand-icon login-icon">
-          <LogIn size={18} />
+        <div class="login-brand">
+          <NobleMark size={54} class="login-mark" />
         </div>
-        <h1 class="login-title">Field Scheduler</h1>
-        <p class="login-subtitle">Sign in to continue</p>
+        <h1 class="login-title">Noble<em> CRM</em></h1>
+        <p class="login-subtitle">Sign in to your workspace</p>
 
         <div class="form-group full-width">
           <label htmlFor="login-email">Email</label>
