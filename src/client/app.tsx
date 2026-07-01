@@ -15,6 +15,8 @@ import { ServiceTypeList } from "./components/service-type-list";
 import { MaterialList } from "./components/material-list";
 import { InvoiceList } from "./components/invoice-list";
 import { InvoiceDetail } from "./components/invoice-detail";
+import { EstimateList } from "./components/estimate-list";
+import { EstimateDetail } from "./components/estimate-detail";
 import { BrandList } from "./components/brand-list";
 import { ErrorBanner } from "./components/error-banner";
 import { Login } from "./components/login";
@@ -62,6 +64,8 @@ function AuthenticatedApp({ isAgent, session }: { isAgent: boolean; session: Non
       appState.selectCustomer(parseInt(id, 10));
     } else if (view === "invoices" && id) {
       appState.selectInvoice(parseInt(id, 10));
+    } else if (view === "estimates" && id) {
+      appState.selectEstimate(parseInt(id, 10));
     }
   }, [view, id]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -69,6 +73,7 @@ function AuthenticatedApp({ isAgent, session }: { isAgent: boolean; session: Non
     if (view === "jobs" && id && appState.selectedJob) return <JobDetail />;
     if (view === "customers" && id && appState.selectedCustomer) return <CustomerDetail />;
     if (view === "invoices" && id && appState.selectedInvoice) return <InvoiceDetail />;
+    if (view === "estimates" && id && appState.selectedEstimate) return <EstimateDetail />;
     switch (view) {
       case "schedule": return <ScheduleView />;
       case "jobs": return <JobList />;
@@ -77,6 +82,7 @@ function AuthenticatedApp({ isAgent, session }: { isAgent: boolean; session: Non
       case "services": return <ServiceTypeList />;
       case "materials": return <MaterialList />;
       case "invoices": return <InvoiceList />;
+      case "estimates": return <EstimateList />;
       case "brands": return <BrandList />;
       default: return <Dashboard />;
     }

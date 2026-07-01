@@ -57,6 +57,11 @@ app.use("/api/*", async (c, next) => {
   if (path.startsWith("/api/invoices") || /^\/api\/jobs\/[^/]+\/invoice$/.test(path)) {
     return c.json({ error: "forbidden" }, 403);
   }
+  // Estimates are a sales/estimating task (admin, office, estimator) --
+  // technicians get no access at all, matching the invoices block above.
+  if (path.startsWith("/api/estimates") || path.startsWith("/api/estimate-lines")) {
+    return c.json({ error: "forbidden" }, 403);
+  }
   if (isMutating && (path.startsWith("/api/materials") || path.startsWith("/api/service-types"))) {
     return c.json({ error: "forbidden" }, 403);
   }
@@ -156,6 +161,35 @@ const BrandSchema = z.object({
   active: z.number().int(),
 }).openapi("Brand");
 
+const EstimateSchema = z.object({
+  id: z.number().int(),
+  identifier: z.string().nullable(),
+  customer_id: z.number().int(),
+  brand_id: z.number().int().nullable().optional(),
+  status: z.string(),
+  subtotal: z.number().nullable(),
+  tax_rate: z.number().nullable(),
+  tax_amount: z.number().nullable(),
+  total: z.number().nullable(),
+  valid_until: z.string().nullable(),
+  notes: z.string().nullable(),
+  approved_at: z.string().nullable(),
+  customer_name: z.string().nullable().optional(),
+  brand_name: z.string().nullable().optional(),
+  brand_color_primary: z.string().nullable().optional(),
+  brand_color_secondary: z.string().nullable().optional(),
+  created_at: z.string(),
+}).openapi("Estimate");
+
+const EstimateLineSchema = z.object({
+  id: z.number().int(),
+  estimate_id: z.number().int(),
+  description: z.string(),
+  quantity: z.number().nullable(),
+  unit_price: z.number().nullable(),
+  total: z.number().nullable(),
+}).openapi("EstimateLine");
+
 const JobNoteSchema = z.object({
   id: z.number().int(),
   job_id: z.number().int(),
@@ -224,6 +258,14 @@ async function nextInvoiceIdentifier(db: ReturnType<typeof getDb>): Promise<stri
   const next = parseInt(counterRow?.value || "0", 10) + 1;
   await db.update(schema.meta).set({ value: String(next) }).where(eq(schema.meta.key, "invoice_counter"));
   return `${prefixRow?.value || "INV"}-${next}`;
+}
+
+async function nextEstimateIdentifier(db: ReturnType<typeof getDb>): Promise<string> {
+  const prefixRow = await db.select().from(schema.meta).where(eq(schema.meta.key, "estimate_prefix")).get();
+  const counterRow = await db.select().from(schema.meta).where(eq(schema.meta.key, "estimate_counter")).get();
+  const next = parseInt(counterRow?.value || "0", 10) + 1;
+  await db.update(schema.meta).set({ value: String(next) }).where(eq(schema.meta.key, "estimate_counter"));
+  return `${prefixRow?.value || "EST"}-${next}`;
 }
 
 // Shared "job with joined denormalized fields" select shape, matching the
@@ -2124,6 +2166,506 @@ app.openapi(invoiceFromJob, async (c) => {
   }
 
   return c.json({ ok: true, invoice_id: inv!.id }, 201);
+});
+
+// ── Estimates ──────────────────────────────────────────────────────
+// Sales/estimating task: admin, office, and estimator all get full access.
+// Technicians are blocked entirely by the blanket role-gate middleware
+// above (mirrors the /api/invoices block).
+
+// Shared "estimate with joined denormalized fields" select shape, matching
+// the invoices join pattern (customer_name + brand_*).
+function estimateJoinedSelect(db: ReturnType<typeof getDb>) {
+  return db
+    .select({
+      id: schema.estimates.id,
+      identifier: schema.estimates.identifier,
+      customer_id: schema.estimates.customerId,
+      brand_id: schema.estimates.brandId,
+      status: schema.estimates.status,
+      subtotal: schema.estimates.subtotal,
+      tax_rate: schema.estimates.taxRate,
+      tax_amount: schema.estimates.taxAmount,
+      total: schema.estimates.total,
+      valid_until: schema.estimates.validUntil,
+      notes: schema.estimates.notes,
+      approved_at: schema.estimates.approvedAt,
+      created_at: schema.estimates.createdAt,
+      customer_name: schema.customers.name,
+      brand_name: schema.brands.name,
+      brand_color_primary: schema.brands.colorPrimary,
+      brand_color_secondary: schema.brands.colorSecondary,
+    })
+    .from(schema.estimates)
+    .leftJoin(schema.customers, eq(schema.estimates.customerId, schema.customers.id))
+    .leftJoin(schema.brands, eq(schema.estimates.brandId, schema.brands.id));
+}
+
+const listEstimates = createRoute({
+  method: "get",
+  path: "/api/estimates",
+  request: {
+    query: z.object({
+      page: z.string().optional(),
+      limit: z.string().optional(),
+      status: z.string().optional(),
+      search: z.string().optional(),
+    }),
+  },
+  responses: {
+    200: {
+      description: "Paginated estimate list",
+      content: { "application/json": { schema: z.object({ estimates: z.array(EstimateSchema), total: z.number().int() }) } },
+    },
+  },
+});
+
+app.openapi(listEstimates, async (c) => {
+  const db = getDb(c.env);
+  const q = c.req.valid("query");
+  const page = parseInt(q.page || "1", 10);
+  const limit = parseInt(q.limit || "50", 10);
+  const offset = (page - 1) * limit;
+
+  const conditions = [];
+  if (q.status) {
+    conditions.push(eq(schema.estimates.status, q.status));
+  }
+  if (q.search) {
+    const s = `%${q.search}%`;
+    conditions.push(or(
+      like(schema.estimates.identifier, s),
+      like(schema.customers.name, s),
+    ));
+  }
+  const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+  const countRow = await db
+    .select({ count: sql<number>`COUNT(*)` })
+    .from(schema.estimates)
+    .leftJoin(schema.customers, eq(schema.estimates.customerId, schema.customers.id))
+    .where(where)
+    .get();
+
+  const estimates = await estimateJoinedSelect(db)
+    .where(where)
+    .orderBy(desc(schema.estimates.createdAt))
+    .limit(limit)
+    .offset(offset)
+    .all();
+
+  return c.json({ estimates, total: countRow?.count || 0 }, 200);
+});
+
+const getEstimate = createRoute({
+  method: "get",
+  path: "/api/estimates/{id}",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Estimate detail", content: { "application/json": { schema: z.object({ estimate: z.any() }) } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(getEstimate, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const estimate = await estimateJoinedSelect(db).where(eq(schema.estimates.id, idNum)).get();
+  if (!estimate) return c.json({ error: "Estimate not found" }, 404);
+  const lines = await db
+    .select()
+    .from(schema.estimateLines)
+    .where(eq(schema.estimateLines.estimateId, idNum))
+    .orderBy(asc(schema.estimateLines.id))
+    .all();
+  const linesOut = lines.map((l) => ({
+    id: l.id,
+    estimate_id: l.estimateId,
+    description: l.description,
+    quantity: l.quantity,
+    unit_price: l.unitPrice,
+    total: l.total,
+  }));
+  return c.json({ estimate: { ...estimate, lines: linesOut } }, 200);
+});
+
+const createEstimate = createRoute({
+  method: "post",
+  path: "/api/estimates",
+  request: {
+    body: { content: { "application/json": { schema: z.object({
+      customer_id: z.number().int(),
+      brand_id: z.number().int().nullable().optional(),
+      tax_rate: z.number().optional(),
+      valid_until: z.string().optional(),
+      notes: z.string().optional(),
+      lines: z.array(z.object({
+        description: z.string(),
+        quantity: z.number(),
+        unit_price: z.number(),
+      })),
+    }) } } },
+  },
+  responses: {
+    201: { description: "Created", content: { "application/json": { schema: z.any() } } },
+  },
+});
+
+app.openapi(createEstimate, async (c) => {
+  const db = getDb(c.env);
+  const data = c.req.valid("json");
+  const identifier = await nextEstimateIdentifier(db);
+  const taxRate = data.tax_rate || 0;
+
+  let subtotal = 0;
+  for (const line of data.lines) {
+    subtotal += line.quantity * line.unit_price;
+  }
+  const taxAmount = subtotal * (taxRate / 100);
+  const total = subtotal + taxAmount;
+
+  await db.insert(schema.estimates).values({
+    identifier,
+    customerId: data.customer_id,
+    brandId: data.brand_id ?? null,
+    status: "draft",
+    subtotal,
+    taxRate,
+    taxAmount,
+    total,
+    validUntil: data.valid_until || null,
+    notes: data.notes || "",
+  });
+
+  const estimate = await db.select({ id: schema.estimates.id }).from(schema.estimates).where(eq(schema.estimates.identifier, identifier)).get();
+  for (const line of data.lines) {
+    const lineTotal = line.quantity * line.unit_price;
+    await db.insert(schema.estimateLines).values({
+      estimateId: estimate!.id,
+      description: line.description,
+      quantity: line.quantity,
+      unitPrice: line.unit_price,
+      total: lineTotal,
+    });
+  }
+
+  const result = await estimateJoinedSelect(db).where(eq(schema.estimates.id, estimate!.id)).get();
+  return c.json(result!, 201);
+});
+
+const updateEstimate = createRoute({
+  method: "put",
+  path: "/api/estimates/{id}",
+  request: {
+    params: IdParam,
+    body: { content: { "application/json": { schema: z.object({
+      // Deliberately no "status" field here -- status changes must go
+      // through /send, /approve, /decline, /convert, each of which enforces
+      // its own transition rule. A generic status write here would let a
+      // caller skip straight to "approved" (or resurrect a declined/
+      // converted estimate) with none of those checks.
+      notes: z.string().optional(),
+      valid_until: z.string().optional(),
+      tax_rate: z.number().optional(),
+      brand_id: z.number().int().nullable().optional(),
+    }) } } },
+  },
+  responses: {
+    200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(updateEstimate, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const data = c.req.valid("json");
+  const existing = await db.select().from(schema.estimates).where(eq(schema.estimates.id, idNum)).get();
+  if (!existing) return c.json({ error: "Estimate not found" }, 404);
+
+  const updates: Record<string, unknown> = {};
+  if (data.notes !== undefined) updates.notes = data.notes;
+  if (data.valid_until !== undefined) updates.validUntil = data.valid_until;
+  if (data.brand_id !== undefined) updates.brandId = data.brand_id;
+  // Recompute tax_amount/total if tax_rate changes -- subtotal stays
+  // derived from lines (this route never touches lines directly), so it's
+  // safe to reuse the existing subtotal in the recompute.
+  if (data.tax_rate !== undefined) {
+    const subtotal = existing.subtotal || 0;
+    const taxAmount = subtotal * (data.tax_rate / 100);
+    updates.taxRate = data.tax_rate;
+    updates.taxAmount = taxAmount;
+    updates.total = subtotal + taxAmount;
+  }
+  if (Object.keys(updates).length > 0) {
+    await db.update(schema.estimates).set(updates).where(eq(schema.estimates.id, idNum));
+  }
+  return c.json({ ok: true }, 200);
+});
+
+const deleteEstimate = createRoute({
+  method: "delete",
+  path: "/api/estimates/{id}",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Deleted", content: { "application/json": { schema: OkSchema } } },
+  },
+});
+
+app.openapi(deleteEstimate, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  // estimate_lines.estimate_id has no ON DELETE CASCADE at the DB level
+  // (unlike invoice_lines/job_notes/etc), so the FK constraint would reject
+  // deleting an estimate that still has lines -- clear the children first.
+  await db.delete(schema.estimateLines).where(eq(schema.estimateLines.estimateId, idNum));
+  await db.delete(schema.estimates).where(eq(schema.estimates.id, idNum));
+  return c.json({ ok: true }, 200);
+});
+
+// ── Estimate status transitions ───────────────────────────────────
+
+const sendEstimate = createRoute({
+  method: "post",
+  path: "/api/estimates/{id}/send",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Sent", content: { "application/json": { schema: OkSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Invalid state transition", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(sendEstimate, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const estimate = await db.select({ status: schema.estimates.status }).from(schema.estimates).where(eq(schema.estimates.id, idNum)).get();
+  if (!estimate) return c.json({ error: "Estimate not found" }, 404);
+  if (estimate.status !== "draft") {
+    return c.json({ error: `Cannot send an estimate with status "${estimate.status}" -- only draft estimates can be sent` }, 409);
+  }
+  await db.update(schema.estimates).set({ status: "sent" }).where(eq(schema.estimates.id, idNum));
+  return c.json({ ok: true }, 200);
+});
+
+const approveEstimate = createRoute({
+  method: "post",
+  path: "/api/estimates/{id}/approve",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Approved", content: { "application/json": { schema: OkSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Invalid state transition", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(approveEstimate, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const estimate = await db.select({ status: schema.estimates.status }).from(schema.estimates).where(eq(schema.estimates.id, idNum)).get();
+  if (!estimate) return c.json({ error: "Estimate not found" }, 404);
+  // "sent" is the normal path, but a paper-signed estimate (customer signs
+  // in person before the office ever formally "sends" it) can go straight
+  // from draft -> approved, so both are accepted here.
+  if (estimate.status !== "sent" && estimate.status !== "draft") {
+    return c.json({ error: `Cannot approve an estimate with status "${estimate.status}" -- only draft or sent estimates can be approved` }, 409);
+  }
+  await db.update(schema.estimates).set({ status: "approved", approvedAt: sql`(datetime('now'))` }).where(eq(schema.estimates.id, idNum));
+  return c.json({ ok: true }, 200);
+});
+
+const declineEstimate = createRoute({
+  method: "post",
+  path: "/api/estimates/{id}/decline",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Declined", content: { "application/json": { schema: OkSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Invalid state transition", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(declineEstimate, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const estimate = await db.select({ status: schema.estimates.status }).from(schema.estimates).where(eq(schema.estimates.id, idNum)).get();
+  if (!estimate) return c.json({ error: "Estimate not found" }, 404);
+  // Same source states as approve -- an already-approved (customer signed
+  // off) or already-converted (real job/invoice exist) estimate can't be
+  // silently declined after the fact.
+  if (estimate.status !== "draft" && estimate.status !== "sent") {
+    return c.json({ error: `Cannot decline an estimate with status "${estimate.status}" -- only draft or sent estimates can be declined` }, 409);
+  }
+  await db.update(schema.estimates).set({ status: "declined" }).where(eq(schema.estimates.id, idNum));
+  return c.json({ ok: true }, 200);
+});
+
+// ── Estimate line management ───────────────────────────────────────
+
+// Recomputes and persists an estimate's subtotal/tax_amount/total from its
+// current set of estimate_lines rows. Called after any line add/remove so
+// the parent estimate's totals never drift from its line items.
+async function recomputeEstimateTotals(db: ReturnType<typeof getDb>, estimateId: number) {
+  const lines = await db.select({ total: schema.estimateLines.total }).from(schema.estimateLines).where(eq(schema.estimateLines.estimateId, estimateId)).all();
+  const subtotal = lines.reduce((sum, l) => sum + (l.total || 0), 0);
+  const estimate = await db.select({ taxRate: schema.estimates.taxRate }).from(schema.estimates).where(eq(schema.estimates.id, estimateId)).get();
+  const taxRate = estimate?.taxRate || 0;
+  const taxAmount = subtotal * (taxRate / 100);
+  const total = subtotal + taxAmount;
+  await db.update(schema.estimates).set({ subtotal, taxAmount, total }).where(eq(schema.estimates.id, estimateId));
+}
+
+const addEstimateLine = createRoute({
+  method: "post",
+  path: "/api/estimates/{id}/lines",
+  request: {
+    params: IdParam,
+    body: { content: { "application/json": { schema: z.object({
+      description: z.string(),
+      quantity: z.number(),
+      unit_price: z.number(),
+    }) } } },
+  },
+  responses: {
+    201: { description: "Line added", content: { "application/json": { schema: OkSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(addEstimateLine, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const estimate = await db.select({ id: schema.estimates.id }).from(schema.estimates).where(eq(schema.estimates.id, idNum)).get();
+  if (!estimate) return c.json({ error: "Estimate not found" }, 404);
+  const data = c.req.valid("json");
+  const lineTotal = data.quantity * data.unit_price;
+  await db.insert(schema.estimateLines).values({
+    estimateId: idNum,
+    description: data.description,
+    quantity: data.quantity,
+    unitPrice: data.unit_price,
+    total: lineTotal,
+  });
+  await recomputeEstimateTotals(db, idNum);
+  return c.json({ ok: true }, 201);
+});
+
+const deleteEstimateLine = createRoute({
+  method: "delete",
+  path: "/api/estimate-lines/{id}",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Deleted", content: { "application/json": { schema: OkSchema } } },
+  },
+});
+
+app.openapi(deleteEstimateLine, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const line = await db.select({ estimateId: schema.estimateLines.estimateId }).from(schema.estimateLines).where(eq(schema.estimateLines.id, idNum)).get();
+  await db.delete(schema.estimateLines).where(eq(schema.estimateLines.id, idNum));
+  if (line) {
+    await recomputeEstimateTotals(db, line.estimateId);
+  }
+  return c.json({ ok: true }, 200);
+});
+
+// ── Convert estimate to job + invoice ──────────────────────────────
+// Only valid when status is "approved". Creates a new scheduled job priced
+// at the estimate's total, plus a new draft invoice whose lines are a 1:1
+// copy of the estimate's lines (same description/quantity/unit_price/total
+// for each row -- no re-derivation), with the invoice's job_id pointing at
+// the newly created job.
+
+const convertEstimate = createRoute({
+  method: "post",
+  path: "/api/estimates/{id}/convert",
+  request: { params: IdParam },
+  responses: {
+    201: { description: "Converted", content: { "application/json": { schema: z.object({ ok: z.boolean(), job_id: z.number().int(), invoice_id: z.number().int() }) } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Invalid state transition", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(convertEstimate, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const estimate = await db.select().from(schema.estimates).where(eq(schema.estimates.id, idNum)).get();
+  if (!estimate) return c.json({ error: "Estimate not found" }, 404);
+  if (estimate.status !== "approved") {
+    return c.json({ error: `Cannot convert an estimate with status "${estimate.status}" -- only approved estimates can be converted` }, 409);
+  }
+
+  const lines = await db.select().from(schema.estimateLines).where(eq(schema.estimateLines.estimateId, idNum)).orderBy(asc(schema.estimateLines.id)).all();
+
+  // ── Create the job ──
+  // createJob's Zod schema only requires customer_id + scheduled_date;
+  // everything else has a server-side default. scheduled_date defaults to
+  // today since an approved estimate has no other date signal to draw
+  // from -- office/dispatch can reschedule from the job detail view same
+  // as any other job.
+  const jobIdentifier = await nextIdentifier(db);
+  const today = new Date().toISOString().split("T")[0];
+  await db.insert(schema.jobs).values({
+    identifier: jobIdentifier,
+    customerId: estimate.customerId,
+    status: "scheduled",
+    priority: "normal",
+    scheduledDate: today,
+    scheduledTime: "09:00",
+    duration: 60,
+    price: estimate.total || 0,
+    notes: estimate.notes || "",
+    brandId: estimate.brandId ?? null,
+  });
+  const job = await db.select({ id: schema.jobs.id }).from(schema.jobs).where(eq(schema.jobs.identifier, jobIdentifier)).get();
+  const jobId = job!.id;
+
+  // ── Create the draft invoice, lines copied 1:1 from the estimate ──
+  const invoiceIdentifier = await nextInvoiceIdentifier(db);
+  await db.insert(schema.invoices).values({
+    identifier: invoiceIdentifier,
+    customerId: estimate.customerId,
+    jobId,
+    status: "draft",
+    subtotal: estimate.subtotal || 0,
+    taxRate: estimate.taxRate || 0,
+    taxAmount: estimate.taxAmount || 0,
+    total: estimate.total || 0,
+    notes: estimate.notes || "",
+    dueDate: "",
+    brandId: estimate.brandId ?? null,
+  });
+  const invoice = await db.select({ id: schema.invoices.id }).from(schema.invoices).where(eq(schema.invoices.identifier, invoiceIdentifier)).get();
+  const invoiceId = invoice!.id;
+
+  for (const line of lines) {
+    await db.insert(schema.invoiceLines).values({
+      invoiceId,
+      description: line.description,
+      quantity: line.quantity ?? 0,
+      unitPrice: line.unitPrice ?? 0,
+      total: line.total ?? 0,
+    });
+  }
+
+  // Mark converted so a second call 409s (the `status !== "approved"` check
+  // above) instead of silently minting a duplicate job+invoice. Without
+  // this, clicking Convert twice -- or retrying after a slow response --
+  // creates a second real job and invoice for the same estimate.
+  await db.update(schema.estimates).set({ status: "converted" }).where(eq(schema.estimates.id, idNum));
+
+  return c.json({ ok: true, job_id: jobId, invoice_id: invoiceId }, 201);
 });
 
 export default app;

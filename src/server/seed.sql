@@ -5,6 +5,8 @@ INSERT OR IGNORE INTO _meta (key, value) VALUES ('job_counter', '0');
 INSERT OR IGNORE INTO _meta (key, value) VALUES ('identifier_prefix', 'JOB');
 INSERT OR IGNORE INTO _meta (key, value) VALUES ('invoice_counter', '0');
 INSERT OR IGNORE INTO _meta (key, value) VALUES ('invoice_prefix', 'INV');
+INSERT OR IGNORE INTO _meta (key, value) VALUES ('estimate_counter', '0');
+INSERT OR IGNORE INTO _meta (key, value) VALUES ('estimate_prefix', 'EST');
 
 INSERT OR IGNORE INTO service_types (id, name, description, default_duration, default_price, color)
 VALUES

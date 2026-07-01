@@ -1,8 +1,9 @@
-export type View = "dashboard" | "schedule" | "jobs" | "customers" | "technicians" | "services" | "invoices" | "materials" | "brands";
+export type View = "dashboard" | "schedule" | "jobs" | "customers" | "technicians" | "services" | "invoices" | "estimates" | "materials" | "brands";
 
 export type JobStatus = "scheduled" | "confirmed" | "in_progress" | "completed" | "cancelled";
 export type Priority = "low" | "normal" | "high" | "urgent";
 export type InvoiceStatus = "draft" | "sent" | "paid" | "overdue" | "cancelled";
+export type EstimateStatus = "draft" | "sent" | "approved" | "declined" | "expired" | "converted";
 
 export interface Job {
   id: number;
@@ -147,6 +148,36 @@ export interface Invoice {
 export interface InvoiceLine {
   id: number;
   invoice_id: number;
+  description: string;
+  quantity: number;
+  unit_price: number;
+  total: number;
+}
+
+export interface Estimate {
+  id: number;
+  identifier: string | null;
+  customer_id: number;
+  brand_id?: number | null;
+  status: EstimateStatus;
+  subtotal: number;
+  tax_rate: number;
+  tax_amount: number;
+  total: number;
+  valid_until: string | null;
+  notes: string | null;
+  approved_at: string | null;
+  customer_name?: string | null;
+  brand_name?: string | null;
+  brand_color_primary?: string | null;
+  brand_color_secondary?: string | null;
+  lines?: EstimateLine[];
+  created_at: string;
+}
+
+export interface EstimateLine {
+  id: number;
+  estimate_id: number;
   description: string;
   quantity: number;
   unit_price: number;

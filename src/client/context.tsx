@@ -2,7 +2,7 @@ import { createContext } from "preact";
 import { useContext } from "preact/hooks";
 import type {
   Job, Customer, Technician, ServiceType, Material, Invoice, Stats, PaginatedState,
-  CustomerLookup, TechnicianLookup, Priority, Brand,
+  CustomerLookup, TechnicianLookup, Priority, Brand, Estimate,
 } from "./types";
 
 export interface CurrentUser {
@@ -107,6 +107,26 @@ export interface AppContextValue {
   addInvoice: (data: { customer_id: number; job_id?: number | null; tax_rate?: number; notes?: string; due_date?: string; brand_id?: number | null; lines: { description: string; quantity: number; unit_price: number }[] }) => Promise<void>;
   updateInvoice: (id: number, data: Partial<Invoice>) => Promise<void>;
   deleteInvoice: (id: number) => Promise<void>;
+
+  // Estimates
+  estimates: Estimate[];
+  estimatesPag: PaginatedState;
+  setEstimatesPage: (page: number) => void;
+  estimatesSearch: string;
+  setEstimatesSearch: (s: string) => void;
+  estimatesStatusFilter: string;
+  setEstimatesStatusFilter: (s: string) => void;
+  selectedEstimate: Estimate | null;
+  selectEstimate: (id: number | null) => Promise<void>;
+  addEstimate: (data: { customer_id: number; brand_id?: number | null; tax_rate?: number; valid_until?: string; notes?: string; lines: { description: string; quantity: number; unit_price: number }[] }) => Promise<void>;
+  updateEstimate: (id: number, data: Partial<Estimate>) => Promise<void>;
+  deleteEstimate: (id: number) => Promise<void>;
+  sendEstimate: (id: number) => Promise<void>;
+  approveEstimate: (id: number) => Promise<void>;
+  declineEstimate: (id: number) => Promise<void>;
+  addEstimateLine: (estimateId: number, line: { description: string; quantity: number; unit_price: number }) => Promise<void>;
+  deleteEstimateLine: (lineId: number) => Promise<void>;
+  convertEstimate: (id: number) => Promise<{ job_id: number; invoice_id: number }>;
 
   // Schedule
   scheduleJobs: Job[];

@@ -1,5 +1,6 @@
 import { useApp } from "../context";
-import { ArrowLeft, Trash2 } from "lucide-preact";
+import { ACORN_FINANCE_URL } from "../constants";
+import { ArrowLeft, Trash2, ExternalLink } from "lucide-preact";
 import type { InvoiceStatus } from "../types";
 
 const ALL_STATUSES: InvoiceStatus[] = ["draft", "sent", "paid", "overdue", "cancelled"];
@@ -72,6 +73,13 @@ export function InvoiceDetail() {
                 <span>{invoice.paid_date}</span>
               </div>
             )}
+          </div>
+
+          {/* Financing CTA */}
+          <div class="card" style={{ padding: 12, marginTop: 12, marginBottom: 12 }}>
+            <a href={ACORN_FINANCE_URL} target="_blank" rel="noopener noreferrer" class="btn btn-primary">
+              <ExternalLink size={14} /> Financing available — pre-qualify now
+            </a>
           </div>
 
           {/* Line items */}

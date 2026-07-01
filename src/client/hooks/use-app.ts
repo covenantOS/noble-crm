@@ -3,7 +3,7 @@ import { api } from "../api";
 import { authClient } from "../auth-client";
 import type {
   Job, Customer, Technician, ServiceType, Material, Invoice, Stats, PaginatedState,
-  CustomerLookup, TechnicianLookup, Priority, Brand,
+  CustomerLookup, TechnicianLookup, Priority, Brand, Estimate,
 } from "../types";
 import type { AppContextValue, CurrentUser } from "../context";
 
@@ -39,6 +39,13 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   const [invoicesPag, setInvoicesPag] = useState<PaginatedState>({ page: 1, limit: 50, total: 0 });
   const [invoicesStatusFilter, setInvoicesStatusFilter] = useState("");
   const [selectedInvoice, setSelectedInvoice] = useState<Invoice | null>(null);
+
+  // Estimates
+  const [estimates, setEstimates] = useState<Estimate[]>([]);
+  const [estimatesPag, setEstimatesPag] = useState<PaginatedState>({ page: 1, limit: 50, total: 0 });
+  const [estimatesSearch, setEstimatesSearch] = useState("");
+  const [estimatesStatusFilter, setEstimatesStatusFilter] = useState("");
+  const [selectedEstimate, setSelectedEstimate] = useState<Estimate | null>(null);
 
   // Schedule
   const today = new Date();
@@ -106,6 +113,15 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     setInvoicesPag((prev) => ({ ...prev, total: data.total }));
   }, []);
 
+  const fetchEstimates = useCallback(async (pag: PaginatedState, search: string, status: string) => {
+    const params = new URLSearchParams({ page: String(pag.page), limit: String(pag.limit) });
+    if (search) params.set("search", search);
+    if (status) params.set("status", status);
+    const data = await api<{ estimates: Estimate[]; total: number }>("GET", `/api/estimates?${params}`);
+    setEstimates(data.estimates);
+    setEstimatesPag((prev) => ({ ...prev, total: data.total }));
+  }, []);
+
   const fetchSchedule = useCallback(async (start: string, end: string) => {
     const data = await api<{ jobs: Job[] }>("GET", `/api/schedule?start=${start}&end=${end}`);
     setScheduleJobs(data.jobs);
@@ -134,7 +150,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
       const isTechnician = currentUser?.role === "technician";
       const tasks = [fetchStats(), fetchJobs(jobsPag, "", ""), fetchServiceTypes(), fetchMaterials(), fetchSchedule(scheduleStart, scheduleEnd), fetchBrands()];
       if (!isTechnician) {
-        tasks.push(fetchCustomers(customersPag, ""), fetchTechnicians(), fetchInvoices(invoicesPag, ""), fetchLookups());
+        tasks.push(fetchCustomers(customersPag, ""), fetchTechnicians(), fetchInvoices(invoicesPag, ""), fetchEstimates(estimatesPag, "", ""), fetchLookups());
       }
       const results = await Promise.allSettled(tasks);
       const firstFailure = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
@@ -159,6 +175,14 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     if (currentUser?.role === "technician") return;
     fetchInvoices(invoicesPag, invoicesStatusFilter).catch((err) => setError((err as Error).message));
   }, [invoicesPag.page, invoicesStatusFilter]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Estimates are also part of the technician-forbidden resource family
+  // (see the blanket role-gate middleware in src/server/index.ts) -- skip
+  // the fetch entirely for that role, same as customers/invoices above.
+  useEffect(() => {
+    if (currentUser?.role === "technician") return;
+    fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter).catch((err) => setError((err as Error).message));
+  }, [estimatesPag.page, estimatesSearch, estimatesStatusFilter]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     fetchSchedule(scheduleStart, scheduleEnd).catch((err) => setError((err as Error).message));
@@ -422,6 +446,79 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     setSelectedInvoice(res.invoice);
   }, []);
 
+  // ── Estimates CRUD ──
+
+  const setEstimatesPage = useCallback((page: number) => setEstimatesPag((p) => ({ ...p, page })), []);
+
+  const addEstimate = useCallback(async (data: { customer_id: number; brand_id?: number | null; tax_rate?: number; valid_until?: string; notes?: string; lines: { description: string; quantity: number; unit_price: number }[] }) => {
+    await api("POST", "/api/estimates", data);
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+  }, [estimatesPag, estimatesSearch, estimatesStatusFilter, fetchEstimates]);
+
+  const updateEstimate = useCallback(async (id: number, data: Partial<Estimate>) => {
+    await api("PUT", `/api/estimates/${id}`, data);
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+    if (selectedEstimate && selectedEstimate.id === id) {
+      const res = await api<{ estimate: Estimate }>("GET", `/api/estimates/${id}`);
+      setSelectedEstimate(res.estimate);
+    }
+  }, [estimatesPag, estimatesSearch, estimatesStatusFilter, selectedEstimate, fetchEstimates]);
+
+  const deleteEstimate = useCallback(async (id: number) => {
+    await api("DELETE", `/api/estimates/${id}`);
+    if (selectedEstimate && selectedEstimate.id === id) { setSelectedEstimate(null); navigate("/estimates"); }
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+  }, [estimatesPag, estimatesSearch, estimatesStatusFilter, selectedEstimate, navigate, fetchEstimates]);
+
+  const selectEstimate = useCallback(async (id: number | null) => {
+    if (id === null) { setSelectedEstimate(null); return; }
+    const res = await api<{ estimate: Estimate }>("GET", `/api/estimates/${id}`);
+    setSelectedEstimate(res.estimate);
+  }, []);
+
+  const refreshSelectedEstimate = useCallback(async (id: number) => {
+    const res = await api<{ estimate: Estimate }>("GET", `/api/estimates/${id}`);
+    setSelectedEstimate(res.estimate);
+  }, []);
+
+  const sendEstimate = useCallback(async (id: number) => {
+    await api("POST", `/api/estimates/${id}/send`);
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+    if (selectedEstimate && selectedEstimate.id === id) await refreshSelectedEstimate(id);
+  }, [estimatesPag, estimatesSearch, estimatesStatusFilter, selectedEstimate, fetchEstimates, refreshSelectedEstimate]);
+
+  const approveEstimate = useCallback(async (id: number) => {
+    await api("POST", `/api/estimates/${id}/approve`);
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+    if (selectedEstimate && selectedEstimate.id === id) await refreshSelectedEstimate(id);
+  }, [estimatesPag, estimatesSearch, estimatesStatusFilter, selectedEstimate, fetchEstimates, refreshSelectedEstimate]);
+
+  const declineEstimate = useCallback(async (id: number) => {
+    await api("POST", `/api/estimates/${id}/decline`);
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+    if (selectedEstimate && selectedEstimate.id === id) await refreshSelectedEstimate(id);
+  }, [estimatesPag, estimatesSearch, estimatesStatusFilter, selectedEstimate, fetchEstimates, refreshSelectedEstimate]);
+
+  const addEstimateLine = useCallback(async (estimateId: number, line: { description: string; quantity: number; unit_price: number }) => {
+    await api("POST", `/api/estimates/${estimateId}/lines`, line);
+    await refreshSelectedEstimate(estimateId);
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+  }, [estimatesPag, estimatesSearch, estimatesStatusFilter, fetchEstimates, refreshSelectedEstimate]);
+
+  const deleteEstimateLine = useCallback(async (lineId: number) => {
+    await api("DELETE", `/api/estimate-lines/${lineId}`);
+    if (selectedEstimate) await refreshSelectedEstimate(selectedEstimate.id);
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+  }, [estimatesPag, estimatesSearch, estimatesStatusFilter, selectedEstimate, fetchEstimates, refreshSelectedEstimate]);
+
+  const convertEstimate = useCallback(async (id: number) => {
+    const res = await api<{ ok: boolean; job_id: number; invoice_id: number }>("POST", `/api/estimates/${id}/convert`);
+    await fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter);
+    if (selectedEstimate && selectedEstimate.id === id) await refreshSelectedEstimate(id);
+    await Promise.all([fetchStats(), fetchInvoices(invoicesPag, invoicesStatusFilter), fetchJobs(jobsPag, jobsSearch, jobsStatusFilter)]);
+    return { job_id: res.job_id, invoice_id: res.invoice_id };
+  }, [estimatesPag, estimatesSearch, estimatesStatusFilter, selectedEstimate, invoicesPag, invoicesStatusFilter, jobsPag, jobsSearch, jobsStatusFilter, fetchEstimates, fetchStats, fetchInvoices, fetchJobs, refreshSelectedEstimate]);
+
   // ── Schedule ──
 
   const setScheduleRange = useCallback((start: string, end: string) => {
@@ -452,6 +549,10 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     brands, addBrand, updateBrand, uploadBrandLogo,
     invoices, invoicesPag, setInvoicesPage, invoicesStatusFilter, setInvoicesStatusFilter,
     selectedInvoice, selectInvoice, addInvoice, updateInvoice, deleteInvoice,
+    estimates, estimatesPag, setEstimatesPage, estimatesSearch, setEstimatesSearch,
+    estimatesStatusFilter, setEstimatesStatusFilter,
+    selectedEstimate, selectEstimate, addEstimate, updateEstimate, deleteEstimate,
+    sendEstimate, approveEstimate, declineEstimate, addEstimateLine, deleteEstimateLine, convertEstimate,
     scheduleJobs, scheduleStart, scheduleEnd, setScheduleRange,
     customerLookup, technicianLookup,
     loading, error, setError,
