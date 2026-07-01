@@ -226,7 +226,12 @@ input, select, textarea, button { accent-color: var(--navy); }
 
 /* ── Page ────────────────────────────────────────────────────────────── */
 
-.page { padding: 26px 34px; max-width: 1240px; animation: rise 0.4s ease both; }
+/* fill-mode must NOT be "both"/"forwards" here: a filling transform animation
+   leaves a computed identity matrix (not `none`) on .page forever, which makes
+   .page the containing block for every position:fixed descendant — all modal
+   overlays then pin to the page box instead of the viewport (cut-off modals,
+   partial backdrops). "backwards" ends identically but stops applying on finish. */
+.page { padding: 26px 34px; max-width: 1440px; margin-inline: auto; animation: rise 0.4s ease backwards; }
 @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
 .page-header {
@@ -486,7 +491,9 @@ input, select, textarea, button { accent-color: var(--navy); }
 .modal {
   background: var(--card-bg); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg);
   width: 100%; max-width: 580px; max-height: 88vh; overflow-y: auto; border: 1px solid var(--border);
-  animation: pop 0.2s cubic-bezier(0.16, 1, 0.3, 1) both;
+  /* backwards, not both: see .page — a filling transform would break any future
+     position:fixed descendant (dropdowns, pickers) inside the modal */
+  animation: pop 0.2s cubic-bezier(0.16, 1, 0.3, 1) backwards;
 }
 @keyframes pop { from { opacity: 0; transform: translateY(10px) scale(0.985); } to { opacity: 1; transform: none; } }
 .modal-sm { max-width: 460px; }
@@ -537,7 +544,7 @@ input, select, textarea, button { accent-color: var(--navy); }
   border: 1px solid #e7c3bd; border-left: 3px solid var(--danger); color: var(--danger);
   padding: 12px 16px; border-radius: var(--radius); font-size: 13px; display: flex;
   align-items: center; gap: 10px; box-shadow: var(--shadow-lg); z-index: 200; max-width: 400px;
-  animation: pop 0.2s ease both;
+  animation: pop 0.2s ease backwards; /* backwards, not both: see .page */
 }
 .error-close { border: none; background: none; color: var(--danger); cursor: pointer; padding: 2px; flex-shrink: 0; }
 
