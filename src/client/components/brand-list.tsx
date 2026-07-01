@@ -106,7 +106,8 @@ export function BrandList() {
                       <td><input type="text" value={editForm.name} onInput={(e) => setEditForm({ ...editForm, name: (e.target as HTMLInputElement).value })} class="inline-input" /></td>
                       <td><input type="text" value={editForm.slug} onInput={(e) => setEditForm({ ...editForm, slug: (e.target as HTMLInputElement).value })} class="inline-input" /></td>
                       <td>
-                        <span class={`status-badge-sm ${b.active ? "active" : "inactive"}`}>
+                        <span class="status-badge" data-status={b.active ? "active" : "inactive"}>
+                          <span class="status-dot" />
                           {b.active ? "Active" : "Inactive"}
                         </span>
                       </td>
@@ -136,10 +137,14 @@ export function BrandList() {
                       <td class="text-muted">{b.slug}</td>
                       <td>
                         <button
-                          class={`status-badge-sm clickable ${b.active ? "active" : "inactive"}`}
+                          class="status-badge-btn"
+                          title="Toggle active"
                           onClick={() => updateBrand(b.id, { active: b.active ? 0 : 1 })}
                         >
-                          {b.active ? "Active" : "Inactive"}
+                          <span class="status-badge" data-status={b.active ? "active" : "inactive"}>
+                            <span class="status-dot" />
+                            {b.active ? "Active" : "Inactive"}
+                          </span>
                         </button>
                       </td>
                       <td>

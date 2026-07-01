@@ -53,7 +53,7 @@ export function CustomerList() {
               </tr>
             </thead>
             <tbody>
-              {customers.map((c) => (
+              {customers.filter((c) => c.name && c.name.trim()).map((c) => (
                 <tr key={c.id} class="table-row clickable" onClick={() => navigate(`/customers/${c.id}`)}>
                   <td class="text-bold">{c.name}</td>
                   <td class="text-muted">{c.phone || "—"}</td>

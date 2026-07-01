@@ -1,5 +1,6 @@
 import { useState } from "preact/hooks";
 import { useApp } from "../context";
+import { formatMoney } from "../format";
 import { X } from "lucide-preact";
 
 export function CreateJob({ onClose }: { onClose: () => void }) {
@@ -65,7 +66,7 @@ export function CreateJob({ onClose }: { onClose: () => void }) {
               <select value={serviceTypeId} onChange={(e) => setServiceTypeId((e.target as HTMLSelectElement).value)}>
                 <option value="">Select service...</option>
                 {serviceTypes.map((s) => (
-                  <option key={s.id} value={s.id}>{s.name} (${s.default_price})</option>
+                  <option key={s.id} value={s.id}>{s.name} ({formatMoney(s.default_price)})</option>
                 ))}
               </select>
             </div>

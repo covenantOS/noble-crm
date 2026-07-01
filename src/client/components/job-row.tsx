@@ -1,5 +1,6 @@
 import { useApp } from "../context";
 import { StatusBadge } from "./status-badge";
+import { formatDate, formatTime, formatMoney } from "../format";
 import { Trash2 } from "lucide-preact";
 import type { Job } from "../types";
 
@@ -11,11 +12,14 @@ export function JobRow({ job }: { job: Job }) {
       <td>
         <span class="identifier">{job.identifier}</span>
         {job.brand_name && (
-          <span class="color-swatch" title={job.brand_name} style={{ background: job.brand_color_primary || "#ccc", marginLeft: 6 }} />
+          <span class="brand-chip" style={{ marginLeft: 8 }}>
+            <span class="brand-chip-dot" style={{ background: job.brand_color_primary || "#ccc" }} />
+            {job.brand_name}
+          </span>
         )}
       </td>
-      <td>{job.scheduled_date}</td>
-      <td class="text-muted">{job.scheduled_time}</td>
+      <td>{formatDate(job.scheduled_date)}</td>
+      <td class="text-muted">{formatTime(job.scheduled_time)}</td>
       <td>{job.customer_name || "—"}</td>
       <td>
         {job.service_type_name ? (
@@ -38,7 +42,7 @@ export function JobRow({ job }: { job: Job }) {
         )}
       </td>
       <td><StatusBadge status={job.status} /></td>
-      <td class="text-right">${job.price.toFixed(2)}</td>
+      <td class="text-right money">{formatMoney(job.price)}</td>
       {isAgent && (
         <td>
           <button

@@ -1,5 +1,6 @@
 import { useState } from "preact/hooks";
 import { useApp } from "../context";
+import { formatMoney } from "../format";
 import { X, Plus, Trash2 } from "lucide-preact";
 
 interface DraftLine {
@@ -137,7 +138,7 @@ export function CreateEstimate({ onClose }: { onClose: () => void }) {
                           onInput={(e) => updateLine(i, { unit_price: (e.target as HTMLInputElement).value })}
                         />
                       </td>
-                      <td class="text-right">${((parseFloat(line.quantity) || 0) * (parseFloat(line.unit_price) || 0)).toFixed(2)}</td>
+                      <td class="text-right money">{formatMoney((parseFloat(line.quantity) || 0) * (parseFloat(line.unit_price) || 0))}</td>
                       <td>
                         {lines.length > 1 && (
                           <button type="button" class="btn-icon danger" onClick={() => removeLine(i)}>
@@ -151,19 +152,19 @@ export function CreateEstimate({ onClose }: { onClose: () => void }) {
                 <tfoot>
                   <tr>
                     <td colSpan={3} class="text-right text-muted">Subtotal</td>
-                    <td class="text-right">${subtotal.toFixed(2)}</td>
+                    <td class="text-right money">{formatMoney(subtotal)}</td>
                     <td></td>
                   </tr>
                   {parseFloat(taxRate) > 0 && (
                     <tr>
                       <td colSpan={3} class="text-right text-muted">Tax ({taxRate}%)</td>
-                      <td class="text-right">${taxAmount.toFixed(2)}</td>
+                      <td class="text-right money">{formatMoney(taxAmount)}</td>
                       <td></td>
                     </tr>
                   )}
                   <tr>
                     <td colSpan={3} class="text-right text-bold">Total</td>
-                    <td class="text-right text-bold">${total.toFixed(2)}</td>
+                    <td class="text-right text-bold money">{formatMoney(total)}</td>
                     <td></td>
                   </tr>
                 </tfoot>

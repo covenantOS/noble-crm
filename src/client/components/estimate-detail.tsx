@@ -1,17 +1,10 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { useApp } from "../context";
 import { ACORN_FINANCE_URL } from "../constants";
+import { NobleMark } from "./noble-mark";
+import { StatusBadge } from "./status-badge";
+import { formatDate, formatDateTime, formatMoney } from "../format";
 import { ArrowLeft, Trash2, Send, CheckCircle, XCircle, ArrowRightLeft, ExternalLink, Plus, X, Camera } from "lucide-preact";
-import type { EstimateStatus } from "../types";
-
-const STATUS_COLORS: Record<EstimateStatus, string> = {
-  draft: "#6b7280",
-  sent: "#3b82f6",
-  approved: "#16a34a",
-  declined: "#dc2626",
-  expired: "#9ca3af",
-  converted: "#7c3aed",
-};
 
 export function EstimateDetail() {
   const {
@@ -48,7 +41,9 @@ export function EstimateDetail() {
     }
   };
 
-  const color = STATUS_COLORS[(estimate.status as EstimateStatus)] || "#6b7280";
+  // Resolve the brand record (for a logo) from the estimate's brand_id.
+  const brand = estimate.brand_id ? brands.find((b) => b.id === estimate.brand_id) : undefined;
+  const orgName = estimate.brand_name || "Noble CRM";
 
   const handleAddLine = async () => {
     if (!lineDesc.trim()) return;
@@ -109,7 +104,7 @@ export function EstimateDetail() {
       </div>
 
       {convertResult && (
-        <div class="card" style={{ padding: 12, marginBottom: 16, borderColor: "#16a34a" }}>
+        <div class="card" style={{ padding: 12, marginBottom: 16, borderColor: "var(--success)" }}>
           <strong>Converted successfully.</strong>{" "}
           <a href={`/jobs/${convertResult.job_id}`} onClick={(e) => { e.preventDefault(); navigate(`/jobs/${convertResult.job_id}`); }}>View Job</a>
           {" · "}
@@ -119,12 +114,29 @@ export function EstimateDetail() {
 
       <div class="detail-layout">
         <div class="detail-main">
+          {/* Letterhead — makes the estimate read as a sendable document */}
+          <div class="doc-letterhead">
+            <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+              {brand?.logo_r2_key ? (
+                <img class="doc-logo" src={`/api/r2/${brand.logo_r2_key}`} alt={orgName} />
+              ) : (
+                <NobleMark size={46} />
+              )}
+              <div>
+                <div class="doc-org-name">{orgName}</div>
+                <div class="doc-org-meta">Tampa, FL</div>
+              </div>
+            </div>
+            <div>
+              <div class="doc-title">Estimate</div>
+              <div class="doc-title-sub">{estimate.identifier || "Draft"}</div>
+              <div class="doc-title-sub">{formatDate(estimate.created_at)}</div>
+            </div>
+          </div>
+
           <div class="detail-title-row">
             <span class="identifier-lg">{estimate.identifier}</span>
-            <span class="status-badge" style={{ background: `${color}14`, color, borderColor: `${color}30` }}>
-              <span class="status-dot" style={{ background: color }} />
-              {estimate.status}
-            </span>
+            <StatusBadge status={estimate.status} />
           </div>
 
           <div class="detail-meta-grid">
@@ -135,29 +147,22 @@ export function EstimateDetail() {
             {estimate.brand_name && (
               <div class="detail-meta-item">
                 <span class="detail-meta-label">Brand</span>
-                <span class="service-pill" style={{ borderColor: estimate.brand_color_primary || "#ccc" }}>
-                  <span class="service-dot" style={{ background: estimate.brand_color_primary || "#ccc" }} />
+                <span class="brand-chip">
+                  <span class="brand-chip-dot" style={{ background: estimate.brand_color_primary || "#ccc" }} />
                   {estimate.brand_name}
                 </span>
               </div>
             )}
             <div class="detail-meta-item">
               <span class="detail-meta-label">Valid Until</span>
-              <span>{estimate.valid_until || "Not set"}</span>
+              <span>{formatDate(estimate.valid_until)}</span>
             </div>
             {estimate.approved_at && (
               <div class="detail-meta-item">
                 <span class="detail-meta-label">Approved</span>
-                <span>{estimate.approved_at}</span>
+                <span>{formatDateTime(estimate.approved_at)}</span>
               </div>
             )}
-          </div>
-
-          {/* Financing CTA */}
-          <div class="card" style={{ padding: 12, marginTop: 12, marginBottom: 12 }}>
-            <a href={ACORN_FINANCE_URL} target="_blank" rel="noopener noreferrer" class="btn btn-primary">
-              <ExternalLink size={14} /> Financing available — pre-qualify now
-            </a>
           </div>
 
           {/* Line items */}
@@ -173,8 +178,8 @@ export function EstimateDetail() {
                     <tr key={line.id} class="table-row">
                       <td>{line.description}</td>
                       <td>{line.quantity}</td>
-                      <td>${line.unit_price.toFixed(2)}</td>
-                      <td class="text-right">${line.total.toFixed(2)}</td>
+                      <td class="money">{formatMoney(line.unit_price)}</td>
+                      <td class="text-right money">{formatMoney(line.total)}</td>
                       <td>
                         <button class="btn-icon danger" onClick={() => deleteEstimateLine(line.id)}>
                           <Trash2 size={12} />
@@ -186,26 +191,34 @@ export function EstimateDetail() {
                 <tfoot>
                   <tr>
                     <td colSpan={3} class="text-right text-muted">Subtotal</td>
-                    <td class="text-right">${estimate.subtotal.toFixed(2)}</td>
+                    <td class="text-right money">{formatMoney(estimate.subtotal)}</td>
                     <td></td>
                   </tr>
                   {estimate.tax_rate > 0 && (
                     <tr>
                       <td colSpan={3} class="text-right text-muted">Tax ({estimate.tax_rate}%)</td>
-                      <td class="text-right">${estimate.tax_amount.toFixed(2)}</td>
+                      <td class="text-right money">{formatMoney(estimate.tax_amount)}</td>
                       <td></td>
                     </tr>
                   )}
                   <tr>
                     <td colSpan={3} class="text-right text-bold">Total</td>
-                    <td class="text-right text-bold" style={{ fontSize: 16 }}>${estimate.total.toFixed(2)}</td>
+                    <td class="text-right text-bold money" style={{ fontSize: 16 }}>{formatMoney(estimate.total)}</td>
                     <td></td>
                   </tr>
                 </tfoot>
               </table>
             </div>
+
+            {/* Financing — tasteful on-brand gold chip near the totals */}
+            <div style={{ marginTop: 12 }}>
+              <a href={ACORN_FINANCE_URL} target="_blank" rel="noopener noreferrer" class="financing-callout">
+                <ExternalLink size={14} /> Financing available — pre-qualify now
+              </a>
+            </div>
+
             {showAddLine ? (
-              <div class="note-input-row">
+              <div class="note-input-row" style={{ marginTop: 12 }}>
                 <input type="text" value={lineDesc} onInput={(e) => setLineDesc((e.target as HTMLInputElement).value)} placeholder="Description" style={{ flex: 2 }} />
                 <input type="number" step="0.01" min="0" value={lineQty} onInput={(e) => setLineQty((e.target as HTMLInputElement).value)} style={{ width: 70 }} placeholder="Qty" />
                 <input type="number" step="0.01" min="0" value={linePrice} onInput={(e) => setLinePrice((e.target as HTMLInputElement).value)} style={{ width: 90 }} placeholder="Unit Price" />
@@ -254,7 +267,6 @@ export function EstimateDetail() {
               type="date"
               value={estimate.valid_until || ""}
               onChange={(e) => updateEstimate(estimate.id, { valid_until: (e.target as HTMLInputElement).value })}
-              style={{ width: "100%", padding: "6px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", fontSize: 13 }}
             />
           </div>
 
@@ -266,7 +278,6 @@ export function EstimateDetail() {
               min="0"
               value={estimate.tax_rate}
               onChange={(e) => updateEstimate(estimate.id, { tax_rate: parseFloat((e.target as HTMLInputElement).value) || 0 })}
-              style={{ width: "100%", padding: "6px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", fontSize: 13 }}
             />
           </div>
 

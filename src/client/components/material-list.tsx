@@ -1,5 +1,6 @@
 import { useState } from "preact/hooks";
 import { useApp } from "../context";
+import { formatMoney } from "../format";
 import { Plus, Trash2, Edit3 } from "lucide-preact";
 
 export function MaterialList() {
@@ -88,7 +89,7 @@ export function MaterialList() {
                     <>
                       <td class="text-bold">{m.name}</td>
                       <td class="text-muted">{m.unit}</td>
-                      <td>${m.unit_cost.toFixed(2)}</td>
+                      <td class="money">{formatMoney(m.unit_cost)}</td>
                       <td>{m.in_stock}</td>
                       <td>
                         <div class="action-btns">

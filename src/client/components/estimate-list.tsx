@@ -2,8 +2,9 @@ import { useState } from "preact/hooks";
 import { useApp } from "../context";
 import { Pagination } from "./pagination";
 import { CreateEstimate } from "./create-estimate";
+import { StatusBadge } from "./status-badge";
+import { formatDate, formatMoney } from "../format";
 import { Search, Trash2, Plus } from "lucide-preact";
-import type { EstimateStatus } from "../types";
 
 const STATUSES: { value: string; label: string }[] = [
   { value: "", label: "All" },
@@ -14,15 +15,6 @@ const STATUSES: { value: string; label: string }[] = [
   { value: "expired", label: "Expired" },
   { value: "converted", label: "Converted" },
 ];
-
-const STATUS_COLORS: Record<EstimateStatus, string> = {
-  draft: "#6b7280",
-  sent: "#3b82f6",
-  approved: "#16a34a",
-  declined: "#dc2626",
-  expired: "#9ca3af",
-  converted: "#7c3aed",
-};
 
 export function EstimateList() {
   const {
@@ -79,40 +71,35 @@ export function EstimateList() {
                 <th>Customer</th>
                 <th>Status</th>
                 <th>Valid Until</th>
-                <th>Total</th>
+                <th class="text-right">Total</th>
                 {isAgent && <th>Actions</th>}
               </tr>
             </thead>
             <tbody>
-              {estimates.map((est) => {
-                const color = STATUS_COLORS[(est.status as EstimateStatus)] || "#6b7280";
-                return (
-                  <tr key={est.id} class="table-row clickable" onClick={() => navigate(`/estimates/${est.id}`)}>
-                    <td>
-                      <span class="identifier">{est.identifier}</span>
-                      {est.brand_name && (
-                        <span class="color-swatch" title={est.brand_name} style={{ background: est.brand_color_primary || "#ccc", marginLeft: 6 }} />
-                      )}
-                    </td>
-                    <td>{est.customer_name || "—"}</td>
-                    <td>
-                      <span class="status-badge" style={{ background: `${color}14`, color, borderColor: `${color}30` }}>
-                        <span class="status-dot" style={{ background: color }} />
-                        {est.status}
+              {estimates.map((est) => (
+                <tr key={est.id} class="table-row clickable" onClick={() => navigate(`/estimates/${est.id}`)}>
+                  <td>
+                    <span class="identifier">{est.identifier}</span>
+                    {est.brand_name && (
+                      <span class="brand-chip" style={{ marginLeft: 8 }}>
+                        <span class="brand-chip-dot" style={{ background: est.brand_color_primary || "#ccc" }} />
+                        {est.brand_name}
                       </span>
-                    </td>
-                    <td class="text-muted">{est.valid_until || "—"}</td>
-                    <td class="text-bold">${est.total.toFixed(2)}</td>
-                    {isAgent && (
-                      <td>
-                        <button class="btn-icon danger" onClick={(e) => { e.stopPropagation(); deleteEstimate(est.id); }}>
-                          <Trash2 size={14} />
-                        </button>
-                      </td>
                     )}
-                  </tr>
-                );
-              })}
+                  </td>
+                  <td>{est.customer_name || "—"}</td>
+                  <td><StatusBadge status={est.status} /></td>
+                  <td class="text-muted">{formatDate(est.valid_until)}</td>
+                  <td class="text-bold text-right money">{formatMoney(est.total)}</td>
+                  {isAgent && (
+                    <td>
+                      <button class="btn-icon danger" onClick={(e) => { e.stopPropagation(); deleteEstimate(est.id); }}>
+                        <Trash2 size={14} />
+                      </button>
+                    </td>
+                  )}
+                </tr>
+              ))}
             </tbody>
           </table>
         )}

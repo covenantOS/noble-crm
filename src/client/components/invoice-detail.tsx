@@ -1,18 +1,13 @@
 import { useState } from "preact/hooks";
 import { useApp } from "../context";
 import { ACORN_FINANCE_URL, PAYMENT_TIERS, computePaymentAmount } from "../constants";
+import { NobleMark } from "./noble-mark";
+import { StatusBadge } from "./status-badge";
+import { formatDate, formatDateTime, formatMoney } from "../format";
 import { ArrowLeft, Trash2, ExternalLink, CreditCard } from "lucide-preact";
 import type { InvoiceStatus, PaymentMethod } from "../types";
 
 const ALL_STATUSES: InvoiceStatus[] = ["draft", "sent", "paid", "overdue", "cancelled"];
-
-const STATUS_COLORS: Record<InvoiceStatus, string> = {
-  draft: "#6b7280",
-  sent: "#3b82f6",
-  paid: "#16a34a",
-  overdue: "#dc2626",
-  cancelled: "#9ca3af",
-};
 
 const PAYMENT_METHODS: PaymentMethod[] = ["cash", "check", "card", "financing"];
 
@@ -31,9 +26,11 @@ export function InvoiceDetail() {
 
   if (!invoice) return null;
 
-  const color = STATUS_COLORS[(invoice.status as InvoiceStatus)] || "#6b7280";
-
   const tierAmount = computePaymentAmount(invoice.total, paymentMethod).amount;
+
+  // Resolve the brand record (for a logo) from the invoice's brand_id.
+  const brand = invoice.brand_id ? brands.find((b) => b.id === invoice.brand_id) : undefined;
+  const orgName = invoice.brand_name || "Noble CRM";
 
   const handleRecordPayment = async () => {
     setRecording(true);
@@ -63,12 +60,29 @@ export function InvoiceDetail() {
 
       <div class="detail-layout">
         <div class="detail-main">
+          {/* Letterhead — makes the invoice read as a sendable document */}
+          <div class="doc-letterhead">
+            <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+              {brand?.logo_r2_key ? (
+                <img class="doc-logo" src={`/api/r2/${brand.logo_r2_key}`} alt={orgName} />
+              ) : (
+                <NobleMark size={46} />
+              )}
+              <div>
+                <div class="doc-org-name">{orgName}</div>
+                <div class="doc-org-meta">Tampa, FL</div>
+              </div>
+            </div>
+            <div>
+              <div class="doc-title">Invoice</div>
+              <div class="doc-title-sub">{invoice.identifier}</div>
+              <div class="doc-title-sub">{formatDate(invoice.created_at)}</div>
+            </div>
+          </div>
+
           <div class="detail-title-row">
             <span class="identifier-lg">{invoice.identifier}</span>
-            <span class="status-badge" style={{ background: `${color}14`, color, borderColor: `${color}30` }}>
-              <span class="status-dot" style={{ background: color }} />
-              {invoice.status}
-            </span>
+            <StatusBadge status={invoice.status} />
           </div>
 
           <div class="detail-meta-grid">
@@ -85,29 +99,22 @@ export function InvoiceDetail() {
             {invoice.brand_name && (
               <div class="detail-meta-item">
                 <span class="detail-meta-label">Brand</span>
-                <span class="service-pill" style={{ borderColor: invoice.brand_color_primary || "#ccc" }}>
-                  <span class="service-dot" style={{ background: invoice.brand_color_primary || "#ccc" }} />
+                <span class="brand-chip">
+                  <span class="brand-chip-dot" style={{ background: invoice.brand_color_primary || "#ccc" }} />
                   {invoice.brand_name}
                 </span>
               </div>
             )}
             <div class="detail-meta-item">
               <span class="detail-meta-label">Due Date</span>
-              <span>{invoice.due_date || "Not set"}</span>
+              <span>{formatDate(invoice.due_date)}</span>
             </div>
             {invoice.paid_date && (
               <div class="detail-meta-item">
                 <span class="detail-meta-label">Paid Date</span>
-                <span>{invoice.paid_date}</span>
+                <span>{formatDate(invoice.paid_date)}</span>
               </div>
             )}
-          </div>
-
-          {/* Financing CTA */}
-          <div class="card" style={{ padding: 12, marginTop: 12, marginBottom: 12 }}>
-            <a href={ACORN_FINANCE_URL} target="_blank" rel="noopener noreferrer" class="btn btn-primary">
-              <ExternalLink size={14} /> Financing available — pre-qualify now
-            </a>
           </div>
 
           {/* Line items */}
@@ -123,28 +130,35 @@ export function InvoiceDetail() {
                     <tr key={line.id} class="table-row">
                       <td>{line.description}</td>
                       <td>{line.quantity}</td>
-                      <td>${line.unit_price.toFixed(2)}</td>
-                      <td class="text-right">${line.total.toFixed(2)}</td>
+                      <td class="money">{formatMoney(line.unit_price)}</td>
+                      <td class="text-right money">{formatMoney(line.total)}</td>
                     </tr>
                   ))}
                 </tbody>
                 <tfoot>
                   <tr>
                     <td colSpan={3} class="text-right text-muted">Subtotal</td>
-                    <td class="text-right">${invoice.subtotal.toFixed(2)}</td>
+                    <td class="text-right money">{formatMoney(invoice.subtotal)}</td>
                   </tr>
                   {invoice.tax_rate > 0 && (
                     <tr>
                       <td colSpan={3} class="text-right text-muted">Tax ({invoice.tax_rate}%)</td>
-                      <td class="text-right">${invoice.tax_amount.toFixed(2)}</td>
+                      <td class="text-right money">{formatMoney(invoice.tax_amount)}</td>
                     </tr>
                   )}
                   <tr>
                     <td colSpan={3} class="text-right text-bold">Total</td>
-                    <td class="text-right text-bold" style={{ fontSize: 16 }}>${invoice.total.toFixed(2)}</td>
+                    <td class="text-right text-bold money" style={{ fontSize: 16 }}>{formatMoney(invoice.total)}</td>
                   </tr>
                 </tfoot>
               </table>
+            </div>
+
+            {/* Financing — tasteful on-brand gold chip near the totals */}
+            <div style={{ marginTop: 12 }}>
+              <a href={ACORN_FINANCE_URL} target="_blank" rel="noopener noreferrer" class="financing-callout">
+                <ExternalLink size={14} /> Financing available — pre-qualify now
+              </a>
             </div>
           </div>
 
@@ -166,9 +180,9 @@ export function InvoiceDetail() {
                       <tr key={m} class="table-row">
                         <td>{PAYMENT_METHOD_LABELS[m]}</td>
                         <td class={surchargeAmount < 0 ? "text-muted" : ""}>
-                          {surchargeAmount === 0 ? "—" : `${surchargeAmount > 0 ? "+" : ""}${(PAYMENT_TIERS[m] * 100).toFixed(0)}% (${surchargeAmount > 0 ? "+" : ""}$${surchargeAmount.toFixed(2)})`}
+                          {surchargeAmount === 0 ? "—" : `${surchargeAmount > 0 ? "+" : ""}${(PAYMENT_TIERS[m] * 100).toFixed(0)}% (${surchargeAmount > 0 ? "+" : ""}${formatMoney(surchargeAmount)})`}
                         </td>
-                        <td class="text-right text-bold">${amount.toFixed(2)}</td>
+                        <td class="text-right text-bold money">{formatMoney(amount)}</td>
                       </tr>
                     );
                   })}
@@ -186,9 +200,9 @@ export function InvoiceDetail() {
                     {(invoice.payments || []).map((p) => (
                       <tr key={p.id} class="table-row">
                         <td>{PAYMENT_METHOD_LABELS[p.method] || p.method}</td>
-                        <td class="text-right">${p.amount.toFixed(2)}</td>
-                        <td class="text-right">{p.surcharge_amount ? `${p.surcharge_amount > 0 ? "+" : ""}$${p.surcharge_amount.toFixed(2)}` : "—"}</td>
-                        <td>{p.paid_at ? new Date(p.paid_at).toLocaleString() : "—"}</td>
+                        <td class="text-right money">{formatMoney(p.amount)}</td>
+                        <td class="text-right money">{p.surcharge_amount ? `${p.surcharge_amount > 0 ? "+" : ""}${formatMoney(p.surcharge_amount)}` : "—"}</td>
+                        <td class="text-muted">{formatDateTime(p.paid_at)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -206,7 +220,7 @@ export function InvoiceDetail() {
                 type="number"
                 step="0.01"
                 min="0"
-                placeholder={`$${tierAmount.toFixed(2)}`}
+                placeholder={formatMoney(tierAmount)}
                 value={customAmount}
                 onInput={(e) => setCustomAmount((e.target as HTMLInputElement).value)}
                 style={{ width: 110 }}
@@ -247,7 +261,6 @@ export function InvoiceDetail() {
               type="date"
               value={invoice.due_date}
               onChange={(e) => updateInvoice(invoice.id, { due_date: (e.target as HTMLInputElement).value })}
-              style={{ width: "100%", padding: "6px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", fontSize: 13 }}
             />
           </div>
 

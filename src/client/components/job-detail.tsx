@@ -1,8 +1,14 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { useApp } from "../context";
 import { StatusBadge, PriorityBadge } from "./status-badge";
+import { formatDate, formatTime, formatDuration, formatDateTime, formatMoney } from "../format";
 import { ArrowLeft, Trash2, Send, MapPin, Clock, DollarSign, User, Wrench, Plus, X, CheckSquare, Square, Package, FileText, Palette, Camera } from "lucide-preact";
 import type { AttachmentKind, JobStatus } from "../types";
+
+// Internal reminder-note plumbing that should never surface to a user (the
+// notification provider isn't wired up yet, so these placeholder notes are
+// noise). Filtered out of the activity log.
+const REMINDER_PLACEHOLDER = "no notification provider configured yet";
 
 const ALL_STATUSES: JobStatus[] = ["scheduled", "confirmed", "in_progress", "completed", "cancelled"];
 
@@ -113,13 +119,13 @@ export function JobDetail() {
             <div class="detail-meta-item">
               <Clock size={14} />
               <span class="detail-meta-label">Scheduled</span>
-              <span>{job.scheduled_date} at {job.scheduled_time}</span>
-              <span class="text-muted">{job.duration} min</span>
+              <span>{formatDate(job.scheduled_date)} at {formatTime(job.scheduled_time)}</span>
+              <span class="text-muted">{formatDuration(job.duration)}</span>
             </div>
             <div class="detail-meta-item">
               <DollarSign size={14} />
               <span class="detail-meta-label">Price</span>
-              <span>${job.price.toFixed(2)}</span>
+              <span class="money">{formatMoney(job.price)}</span>
             </div>
             {job.service_type_name && (
               <div class="detail-meta-item">
@@ -208,8 +214,8 @@ export function JobDetail() {
                       <tr key={jm.id} class="table-row">
                         <td>{jm.material_name || "—"}</td>
                         <td>{jm.quantity} {jm.material_unit}</td>
-                        <td>${jm.unit_cost.toFixed(2)}</td>
-                        <td class="text-bold">${(jm.quantity * jm.unit_cost).toFixed(2)}</td>
+                        <td class="money">{formatMoney(jm.unit_cost)}</td>
+                        <td class="text-bold money">{formatMoney(jm.quantity * jm.unit_cost)}</td>
                         {isAgent && (
                           <td><button class="btn-icon danger" onClick={() => deleteJobMaterial(jm.id)}><Trash2 size={12} /></button></td>
                         )}
@@ -224,7 +230,7 @@ export function JobDetail() {
                 <select value={materialId} onChange={(e) => setMaterialId((e.target as HTMLSelectElement).value)} style={{ flex: 2 }}>
                   <option value="">Select material...</option>
                   {materials.map((m) => (
-                    <option key={m.id} value={m.id}>{m.name} (${m.unit_cost}/{m.unit})</option>
+                    <option key={m.id} value={m.id}>{m.name} ({formatMoney(m.unit_cost)}/{m.unit})</option>
                   ))}
                 </select>
                 <input type="number" value={materialQty} onInput={(e) => setMaterialQty((e.target as HTMLInputElement).value)} style={{ width: 70 }} min="0.1" step="0.1" />
@@ -286,11 +292,13 @@ export function JobDetail() {
               </button>
             </div>
             <div class="notes-list">
-              {(job.job_notes || []).map((note) => (
+              {(job.job_notes || [])
+                .filter((note) => !note.content.includes(REMINDER_PLACEHOLDER))
+                .map((note) => (
                 <div key={note.id} class="note-item">
                   <div class="note-content">{note.content}</div>
                   <div class="note-meta">
-                    <span>{new Date(note.created_at).toLocaleString()}</span>
+                    <span>{formatDateTime(note.created_at)}</span>
                     {isAgent && (
                       <button class="btn-icon danger" onClick={() => deleteJobNote(note.id)}>
                         <Trash2 size={12} />

@@ -62,7 +62,8 @@ export function TechnicianList() {
                       <td><input type="tel" value={editForm.phone} onInput={(e) => setEditForm({ ...editForm, phone: (e.target as HTMLInputElement).value })} class="inline-input" /></td>
                       <td>{t.job_count || 0}</td>
                       <td>
-                        <span class={`status-badge-sm ${t.active ? "active" : "inactive"}`}>
+                        <span class="status-badge" data-status={t.active ? "active" : "inactive"}>
+                          <span class="status-dot" />
                           {t.active ? "Active" : "Inactive"}
                         </span>
                       </td>
@@ -82,10 +83,14 @@ export function TechnicianList() {
                       <td>{t.job_count || 0}</td>
                       <td>
                         <button
-                          class={`status-badge-sm clickable ${t.active ? "active" : "inactive"}`}
+                          class="status-badge-btn"
+                          title="Toggle active"
                           onClick={() => updateTechnician(t.id, { active: t.active ? 0 : 1 })}
                         >
-                          {t.active ? "Active" : "Inactive"}
+                          <span class="status-badge" data-status={t.active ? "active" : "inactive"}>
+                            <span class="status-dot" />
+                            {t.active ? "Active" : "Inactive"}
+                          </span>
                         </button>
                       </td>
                       <td>

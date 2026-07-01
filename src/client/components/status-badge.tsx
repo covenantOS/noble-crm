@@ -1,40 +1,36 @@
-import type { JobStatus, Priority } from "../types";
+import type { Priority } from "../types";
 
-const STATUS_COLORS: Record<JobStatus, string> = {
-  scheduled: "#3b82f6",
-  confirmed: "#8b5cf6",
-  in_progress: "#f59e0b",
-  completed: "#16a34a",
-  cancelled: "#6b7280",
-};
+// Canonical status badge. The color map lives entirely in styles.css keyed on
+// the data-status attribute (draft/pending/scheduled/sent/confirmed/
+// in_progress/approved/completed/paid/cancelled/declined/overdue/expired/
+// converted); this component just normalizes the label and stamps the
+// attribute so every status across jobs/estimates/invoices renders identically.
+// The dot inherits currentColor via CSS, so no inline colors here.
+function humanizeStatus(status: string): string {
+  return status
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
 
-const STATUS_LABELS: Record<JobStatus, string> = {
-  scheduled: "Scheduled",
-  confirmed: "Confirmed",
-  in_progress: "In Progress",
-  completed: "Completed",
-  cancelled: "Cancelled",
-};
-
-const PRIORITY_COLORS: Record<Priority, string> = {
-  low: "#6b7280",
-  normal: "#3b82f6",
-  high: "#f59e0b",
-  urgent: "#dc2626",
-};
-
-export function StatusBadge({ status }: { status: JobStatus }) {
-  const color = STATUS_COLORS[status] || "#6b7280";
+export function StatusBadge({ status }: { status: string }) {
+  const raw = String(status);
   return (
-    <span class="status-badge" style={{ background: `${color}14`, color, borderColor: `${color}30` }}>
-      <span class="status-dot" style={{ background: color }} />
-      {STATUS_LABELS[status] || status}
+    <span class="status-badge" data-status={raw}>
+      <span class="status-dot" />
+      {humanizeStatus(raw)}
     </span>
   );
 }
 
+const PRIORITY_COLORS: Record<Priority, string> = {
+  low: "var(--text-muted)",
+  normal: "var(--info)",
+  high: "var(--warning)",
+  urgent: "var(--danger)",
+};
+
 export function PriorityBadge({ priority }: { priority: Priority }) {
-  const color = PRIORITY_COLORS[priority] || "#6b7280";
+  const color = PRIORITY_COLORS[priority] || "var(--text-muted)";
   return (
     <span class="priority-badge" style={{ color }}>
       {priority.charAt(0).toUpperCase() + priority.slice(1)}

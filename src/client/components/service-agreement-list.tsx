@@ -1,5 +1,6 @@
 import { useState } from "preact/hooks";
 import { useApp } from "../context";
+import { formatDate } from "../format";
 import { Plus, Trash2 } from "lucide-preact";
 import type { ServiceAgreementInterval } from "../types";
 
@@ -131,13 +132,17 @@ export function ServiceAgreementList() {
                   <td>{a.service_type_name || <span class="text-muted">—</span>}</td>
                   <td>{a.brand_name || <span class="text-muted">—</span>}</td>
                   <td class="text-muted">{a.interval}</td>
-                  <td>{a.next_run_date || "—"}</td>
+                  <td>{formatDate(a.next_run_date)}</td>
                   <td>
                     <button
-                      class={`status-badge-sm clickable ${a.active ? "active" : "inactive"}`}
+                      class="status-badge-btn"
+                      title="Toggle active"
                       onClick={() => updateServiceAgreement(a.id, { active: a.active ? 0 : 1 })}
                     >
-                      {a.active ? "Active" : "Inactive"}
+                      <span class="status-badge" data-status={a.active ? "active" : "inactive"}>
+                        <span class="status-dot" />
+                        {a.active ? "Active" : "Inactive"}
+                      </span>
                     </button>
                   </td>
                   <td>

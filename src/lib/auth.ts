@@ -29,6 +29,10 @@ export function createAuth(env: Env) {
     database: drizzleAdapter(db, { provider: 'sqlite' }),
     baseURL: env.BETTER_AUTH_URL,
     secret: env.BETTER_AUTH_SECRET,
+    // Accept requests from either local host spelling in dev, plus the real
+    // app URL. In production BETTER_AUTH_URL is the deployed origin; add the
+    // production domain here (or via env) when my.nobletampa.com goes live.
+    trustedOrigins: ["http://localhost:8787", "http://127.0.0.1:8787", "http://localhost:5173", env.BETTER_AUTH_URL],
     emailAndPassword: { enabled: true },
     user: {
       additionalFields: {

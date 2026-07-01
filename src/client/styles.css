@@ -295,7 +295,7 @@ input, select, textarea, button { accent-color: var(--navy); }
   display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600;
   padding: 3px 10px; border-radius: 20px; border: 1px solid transparent; white-space: nowrap; text-transform: capitalize;
 }
-.status-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.status-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: currentColor; }
 
 /* Cohesive status color map (data-status set by the shared Badge helper) */
 .status-badge[data-status="draft"], .status-badge[data-status="pending"] { background: #eef0f3; color: #5a6472; }
@@ -305,6 +305,12 @@ input, select, textarea, button { accent-color: var(--navy); }
 .status-badge[data-status="completed"], .status-badge[data-status="paid"] { background: var(--success-soft); color: var(--success); }
 .status-badge[data-status="cancelled"], .status-badge[data-status="declined"], .status-badge[data-status="overdue"], .status-badge[data-status="expired"] { background: var(--danger-soft); color: var(--danger); }
 .status-badge[data-status="converted"] { background: #efe9f7; color: #6a4aa0; }
+.status-badge[data-status="active"] { background: var(--success-soft); color: var(--success); }
+.status-badge[data-status="inactive"] { background: #eef0f3; color: var(--text-muted); }
+
+/* A bare button wrapper for a clickable status badge (active/inactive
+   toggles) -- resets the native button chrome so only the badge shows. */
+.status-badge-btn { border: none; background: none; padding: 0; cursor: pointer; font-family: var(--font); display: inline-flex; }
 
 .status-badge-sm { font-size: 12px; font-weight: 600; text-transform: capitalize; }
 .status-badge-sm.active { color: var(--success); }
@@ -378,11 +384,13 @@ input, select, textarea, button { accent-color: var(--navy); }
   font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--text-muted);
   margin-bottom: 11px; letter-spacing: 0.08em;
 }
-.detail-sidebar-section select {
+.detail-sidebar-section select,
+.detail-sidebar-section input {
   width: 100%; padding: 8px 10px; border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm); font-size: 13.5px; font-family: var(--font); outline: none; background: var(--card-bg);
+  border-radius: var(--radius-sm); font-size: 13.5px; font-family: var(--font); outline: none; background: var(--card-bg); color: var(--text);
 }
-.detail-sidebar-section select:focus { border-color: var(--navy-500); box-shadow: 0 0 0 3px var(--primary-light); }
+.detail-sidebar-section select:focus,
+.detail-sidebar-section input:focus { border-color: var(--navy-500); box-shadow: 0 0 0 3px var(--primary-light); }
 
 .detail-title-row { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; flex-wrap: wrap; }
 .detail-customer-name { font-family: var(--font-display); font-size: 26px; font-weight: 600; margin-bottom: 16px; color: var(--navy-deep); }
@@ -607,6 +615,64 @@ input, select, textarea, button { accent-color: var(--navy); }
 .doc-title { font-family: var(--font-display); font-size: 24px; font-weight: 600; color: var(--navy-deep); text-align: right; }
 .doc-title-sub { font-family: var(--font-mono); font-size: 13px; color: var(--text-secondary); text-align: right; margin-top: 2px; }
 
+/* ── Dispatch board (DayPilot Lite) Noble overrides ──────────────────── */
+
+.dispatch-board .calendar_default_main {
+  border: none !important;
+  font-family: var(--font) !important;
+  color: var(--text);
+  background: var(--card-bg);
+}
+
+/* Column (technician) + corner headers */
+.dispatch-board .calendar_default_colheader_inner,
+.dispatch-board .calendar_default_cornerright_inner,
+.dispatch-board .calendar_default_corner_inner {
+  background: var(--bg-tint) !important;
+  border-color: var(--border) !important;
+  color: var(--navy-deep) !important;
+  font-family: var(--font) !important;
+  font-size: 12.5px !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.01em;
+  display: flex; align-items: center; justify-content: center;
+}
+
+/* Hour gutter labels */
+.dispatch-board .calendar_default_rowheader_inner {
+  background: var(--card-bg) !important;
+  border-color: var(--border-subtle) !important;
+  color: var(--text-muted) !important;
+  font-family: var(--font) !important;
+  font-size: 11px !important;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Grid cells: quiet paper with a warm business-hours band */
+.dispatch-board .calendar_default_cell_inner {
+  background: var(--bg-tint) !important;
+  border-color: var(--border-subtle) !important;
+}
+.dispatch-board .calendar_default_cell_business .calendar_default_cell_inner {
+  background: var(--card-bg) !important;
+}
+
+/* Event cards: soft, rounded, dark-text (colors set in onBeforeEventRender) */
+.dispatch-board .calendar_default_event_inner {
+  border-radius: 8px !important;
+  border: 1px solid transparent;
+  font-family: var(--font) !important;
+  box-shadow: var(--shadow-xs);
+  padding: 5px 8px 5px 10px !important;
+  line-height: 1.25;
+  overflow: hidden;
+}
+.dispatch-board .calendar_default_event_bar {
+  border-radius: 8px 0 0 8px;
+}
+.dispatch-board .calendar_default_now { border-top: 2px solid var(--gold) !important; }
+.dispatch-board .calendar_default_scroll { border-radius: 0 0 var(--radius) var(--radius); }
+
 /* ── Agent mode overrides ────────────────────────────────────────────── */
 
 [data-agent] .btn-icon { opacity: 1 !important; }
@@ -680,6 +746,15 @@ input, select, textarea, button { accent-color: var(--navy); }
   .page { padding: 18px 16px; }
   .page-header h1 { font-size: 23px; }
   .page-header { flex-wrap: wrap; }
+  /* Detail action rows wrap instead of clipping the last button off-screen */
+  .page-header-right { flex-wrap: wrap; width: 100%; }
+  .page-header-right .btn { flex: 1 1 auto; }
+  .page-header-right .btn-back { flex: 0 0 auto; }
+
+  /* Document letterhead stacks so the doc title/number never gets cut off */
+  .doc-letterhead { flex-direction: column; gap: 14px; padding: 16px 4px; }
+  .doc-title, .doc-title-sub { text-align: left; }
+  .doc-title { font-size: 21px; }
 
   /* Detail pages + forms collapse to a single column */
   .detail-layout { flex-direction: column; }

@@ -1,6 +1,7 @@
 import { useState } from "preact/hooks";
 import { useApp } from "../context";
 import { StatusBadge } from "./status-badge";
+import { formatDate, formatMoney } from "../format";
 import { ArrowLeft, Trash2, Edit3, Save, X } from "lucide-preact";
 
 export function CustomerDetail() {
@@ -122,11 +123,11 @@ export function CustomerDetail() {
                     {jobs.map((j) => (
                       <tr key={j.id} class="table-row clickable" onClick={() => navigate(`/jobs/${j.id}`)}>
                         <td><span class="identifier">{j.identifier}</span></td>
-                        <td>{j.scheduled_date}</td>
+                        <td>{formatDate(j.scheduled_date)}</td>
                         <td>{j.service_type_name || "—"}</td>
                         <td>{j.technician_name || "Unassigned"}</td>
                         <td><StatusBadge status={j.status} /></td>
-                        <td class="text-right">${j.price.toFixed(2)}</td>
+                        <td class="text-right money">{formatMoney(j.price)}</td>
                       </tr>
                     ))}
                   </tbody>

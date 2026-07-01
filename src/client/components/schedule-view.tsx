@@ -1,5 +1,6 @@
 import { useState } from "preact/hooks";
 import { useApp } from "../context";
+import { formatTime } from "../format";
 import { ChevronLeft, ChevronRight, List, LayoutGrid } from "lucide-preact";
 import { DispatchBoard } from "./dispatch-board";
 
@@ -108,7 +109,7 @@ export function ScheduleView() {
                     style={{ borderLeftColor: job.technician_color || job.service_type_color || "#16a34a" }}
                     onClick={() => navigate(`/jobs/${job.id}`)}
                   >
-                    <div class="schedule-job-time">{job.scheduled_time}</div>
+                    <div class="schedule-job-time">{formatTime(job.scheduled_time)}</div>
                     <div class="schedule-job-title">{job.customer_name}</div>
                     {job.service_type_name && <div class="schedule-job-service">{job.service_type_name}</div>}
                     {job.technician_name && <div class="schedule-job-tech">{job.technician_name}</div>}

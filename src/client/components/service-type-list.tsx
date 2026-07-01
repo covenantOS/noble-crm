@@ -1,6 +1,7 @@
 import { useState } from "preact/hooks";
 import { useApp } from "../context";
 import { CreateServiceType } from "./create-service-type";
+import { formatDuration, formatMoney } from "../format";
 import { Plus, Trash2, Edit3 } from "lucide-preact";
 
 export function ServiceTypeList() {
@@ -78,8 +79,8 @@ export function ServiceTypeList() {
                       <td><span class="color-swatch" style={{ background: s.color }} /></td>
                       <td class="text-bold">{s.name}</td>
                       <td class="text-muted">{s.description || "—"}</td>
-                      <td>{s.default_duration} min</td>
-                      <td>${s.default_price.toFixed(2)}</td>
+                      <td>{formatDuration(s.default_duration)}</td>
+                      <td class="money">{formatMoney(s.default_price)}</td>
                       <td>
                         <div class="action-btns">
                           <button class="btn-icon" onClick={() => startEdit(s)}><Edit3 size={14} /></button>
