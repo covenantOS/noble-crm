@@ -5,13 +5,205 @@ import { getDb, schema } from "../db/index.js";
 import { createAuth } from "../lib/auth.js";
 import type { AppBindings, Env, ReminderMessage } from "../lib/types.js";
 
-const app = new OpenAPIHono<AppBindings>();
+// defaultHook normalizes EVERY Zod request-validation failure across all
+// app.openapi routes into a clean 400 { error } shape (first issue's message),
+// instead of OpenAPIHono's default verbose ZodError payload. This gives the
+// client one consistent error contract for bad input and keeps internal Zod
+// structure out of the response.
+const app = new OpenAPIHono<AppBindings>({
+  defaultHook: (result, c) => {
+    if (!result.success) {
+      const issue = result.error.issues[0];
+      const path = issue?.path?.length ? `${issue.path.join(".")}: ` : "";
+      return c.json({ error: `${path}${issue?.message || "Invalid request"}` }, 400);
+    }
+  },
+});
+
+// ── Timezone helper ────────────────────────────────────────────────
+// The business runs in Tampa (America/New_York). "Today" for user-facing
+// calendar logic (which day a job is scheduled for, the recurring-agreement
+// due cutoff, dashboard "today's jobs") must be computed in that zone, NOT
+// UTC -- a UTC "today" rolls over at 8pm/7pm Tampa time, so an evening job
+// created in Tampa would land on tomorrow's date. Intl.DateTimeFormat with an
+// explicit timeZone works in the Workers runtime. Returns "YYYY-MM-DD".
+// NOTE: only for user-facing "which calendar day" logic -- created_at/
+// updated_at audit timestamps stay UTC (that's correct for storage).
+const NY_DATE_FMT = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "America/New_York",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+function todayInTampa(): string {
+  // en-CA formats as YYYY-MM-DD, which is exactly the shape we store.
+  return NY_DATE_FMT.format(new Date());
+}
+
+// ── Reusable validation refinements ────────────────────────────────
+// Strict "YYYY-MM-DD" calendar-date validator: rejects garbage ("not-a-date"),
+// out-of-range ("2026-13-45"), and empty strings. It isn't enough to regex the
+// shape -- "2026-02-30" matches the shape but isn't a real day, so we re-parse
+// with Date.UTC and confirm the components round-trip.
+function isValidCalendarDate(s: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const [y, m, d] = s.split("-").map((n) => parseInt(n, 10));
+  if (m < 1 || m > 12 || d < 1 || d > 31) return false;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+// z.string() that must be a real calendar date. Use .optional() at the call
+// site where the field is optional.
+const zDate = z.string().refine(isValidCalendarDate, { message: "Invalid date -- must be a real YYYY-MM-DD calendar date" });
+// 24-hour HH:MM time.
+const zTime = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, { message: "Invalid time -- must be HH:MM (24-hour)" });
+// A required human-readable name: trimmed, non-empty.
+const zName = z.string().trim().min(1, { message: "Required -- cannot be blank" });
+// Money the client supplies: never negative. (Zero is allowed -- e.g. a $0
+// service line or a free item; over-collection/positive-only cases use
+// zPositive below.)
+const zMoney = z.number().nonnegative({ message: "Must not be negative" });
+// Quantities and amounts that must be strictly positive (a payment of $0 or a
+// line quantity of 0 is nonsensical).
+const zPositive = z.number().positive({ message: "Must be greater than zero" });
+// Tax rate as a percentage 0..100.
+const zTaxRate = z.number().min(0, { message: "Tax rate cannot be negative" }).max(100, { message: "Tax rate cannot exceed 100" });
+
+// Allowed value sets for previously-free-string status/enum fields. Kept as
+// consts so they're reusable in both the Zod schema and any error message.
+const JOB_STATUSES = ["scheduled", "confirmed", "in_progress", "completed", "cancelled"] as const;
+const JOB_PRIORITIES = ["low", "normal", "high", "urgent"] as const;
+const INVOICE_STATUSES = ["draft", "sent", "paid", "overdue", "cancelled"] as const;
+const RECURRENCE_INTERVALS = ["weekly", "monthly", "quarterly", "annual"] as const;
+
+// The roles an admin may assign. 'pending' is included so an admin can revoke
+// access by parking a user back at pending; 'admin' is included so an admin
+// can promote a co-owner. See src/lib/auth.ts for what each role means.
+const ASSIGNABLE_ROLES = ["admin", "office", "estimator", "technician", "pending"] as const;
+
+// ── Existence-check helper (referential sanity) ────────────────────
+// Creating a job/estimate/invoice with an FK id that doesn't exist would
+// otherwise surface as a raw 500 D1 constraint error (or, for SET NULL FKs,
+// silently succeed with a dangling reference). These helpers let a route
+// return a clean 400 "<thing> not found" instead. Each returns true if the id
+// exists (or is null/undefined, i.e. "not provided -- nothing to check").
+async function customerExists(db: ReturnType<typeof getDb>, id: number | null | undefined): Promise<boolean> {
+  if (id === null || id === undefined) return true;
+  const row = await db.select({ id: schema.customers.id }).from(schema.customers).where(eq(schema.customers.id, id)).get();
+  return !!row;
+}
+// Unlike the *Exists helpers above (which treat null as "not provided, OK"),
+// this requires the job to actually exist -- used by the job sub-resource
+// create routes (notes/checklist/materials) so a bad job_id path param 404s
+// cleanly instead of hitting an FK violation and surfacing as a raw 500.
+async function jobExists(db: ReturnType<typeof getDb>, id: number): Promise<boolean> {
+  const row = await db.select({ id: schema.jobs.id }).from(schema.jobs).where(eq(schema.jobs.id, id)).get();
+  return !!row;
+}
+async function technicianExists(db: ReturnType<typeof getDb>, id: number | null | undefined): Promise<boolean> {
+  if (id === null || id === undefined) return true;
+  const row = await db.select({ id: schema.technicians.id }).from(schema.technicians).where(eq(schema.technicians.id, id)).get();
+  return !!row;
+}
+async function serviceTypeExists(db: ReturnType<typeof getDb>, id: number | null | undefined): Promise<boolean> {
+  if (id === null || id === undefined) return true;
+  const row = await db.select({ id: schema.serviceTypes.id }).from(schema.serviceTypes).where(eq(schema.serviceTypes.id, id)).get();
+  return !!row;
+}
+async function brandExists(db: ReturnType<typeof getDb>, id: number | null | undefined): Promise<boolean> {
+  if (id === null || id === undefined) return true;
+  const row = await db.select({ id: schema.brands.id }).from(schema.brands).where(eq(schema.brands.id, id)).get();
+  return !!row;
+}
 
 // ── Auth ───────────────────────────────────────────────────────────
 // better-auth owns everything under /api/auth/* (sign-up, sign-in, sign-out,
 // session, etc). Mounted before the auth-required middleware below, and the
 // middleware explicitly skips this prefix, so these routes stay public.
-app.on(["GET", "POST"], "/api/auth/*", (c) => createAuth(c.env).handler(c.req.raw));
+//
+// FIRST-RUN BOOTSTRAP + rate-limit guard sit IN FRONT of the better-auth
+// handler for the two sensitive POST endpoints (sign-up, sign-in):
+//
+//   - Public sign-up is only allowed when the user table is EMPTY. That first
+//     account is the owner bootstrapping the system and is promoted to "admin"
+//     immediately after creation. Once any user exists, public sign-up is
+//     rejected 403 -- all further users are created by an admin via
+//     POST /api/users. (better-auth's role defaultValue is "pending", so even
+//     if this guard were bypassed the new user would have zero access.)
+//   - Basic D1-backed rate limiting by IP on both sign-in and sign-up (see
+//     checkAuthRateLimit) blunts brute-force / signup-spam. This is a coarse
+//     app-level backstop; production should ALSO enforce Cloudflare's
+//     dashboard rate-limiting rules / rate-limit binding at the edge.
+
+// Simple D1-backed fixed-window attempt counter keyed by "ip:bucket". Stored
+// in the _meta table (key/value) to avoid a schema migration for this chunk --
+// key is `ratelimit:<action>:<ip>:<windowStart>`, value is the count. Returns
+// true if the caller is over the limit for the current window. Failures here
+// are swallowed (fail-open) so a metadata hiccup never locks out real users.
+const RATE_LIMIT_MAX = 10; // attempts per window per IP per action
+const RATE_LIMIT_WINDOW_SECONDS = 300; // 5 minutes
+async function checkAuthRateLimit(db: ReturnType<typeof getDb>, action: string, ip: string): Promise<boolean> {
+  try {
+    const windowStart = Math.floor(Date.now() / 1000 / RATE_LIMIT_WINDOW_SECONDS);
+    const key = `ratelimit:${action}:${ip}:${windowStart}`;
+    const row = await db.select().from(schema.meta).where(eq(schema.meta.key, key)).get();
+    const count = row ? parseInt(row.value, 10) || 0 : 0;
+    if (count >= RATE_LIMIT_MAX) return true;
+    if (row) {
+      await db.update(schema.meta).set({ value: String(count + 1) }).where(eq(schema.meta.key, key));
+    } else {
+      await db.insert(schema.meta).values({ key, value: "1" });
+    }
+    return false;
+  } catch (err) {
+    console.error("Rate-limit check failed (failing open):", err);
+    return false;
+  }
+}
+
+app.on(["GET", "POST"], "/api/auth/*", async (c) => {
+  const path = c.req.path;
+  const method = c.req.method;
+  const db = getDb(c.env);
+  const ip = c.req.header("cf-connecting-ip") || c.req.header("x-forwarded-for") || "unknown";
+
+  // Rate-limit the two sensitive POST endpoints.
+  if (method === "POST" && (path.endsWith("/sign-up/email") || path.endsWith("/sign-in/email"))) {
+    const action = path.endsWith("/sign-up/email") ? "signup" : "signin";
+    if (await checkAuthRateLimit(db, action, ip)) {
+      return c.json({ error: "Too many attempts -- please wait a few minutes and try again." }, 429);
+    }
+  }
+
+  // First-run bootstrap gate on public sign-up.
+  if (method === "POST" && path.endsWith("/sign-up/email")) {
+    const userCount = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.user).get();
+    if ((userCount?.count || 0) > 0) {
+      // System already bootstrapped -- no open self-registration. Admins
+      // create users via POST /api/users.
+      return c.json({ error: "Public sign-up is disabled. Ask an administrator to create your account." }, 403);
+    }
+    // Empty user table: allow this one signup, then promote to admin. We must
+    // read the email out of the (JSON) body to find the just-created row --
+    // clone the request so better-auth still gets an unconsumed body.
+    let email: string | undefined;
+    try {
+      const cloned = c.req.raw.clone();
+      const body = (await cloned.json()) as { email?: string };
+      email = body?.email;
+    } catch {
+      // If we can't parse the body, let better-auth handle/reject it normally.
+    }
+    const res = await createAuth(c.env).handler(c.req.raw);
+    // Only promote if the signup actually succeeded and we know the email.
+    if (res.ok && email) {
+      await db.update(schema.user).set({ role: "admin" }).where(eq(schema.user.email, email.toLowerCase()));
+    }
+    return res;
+  }
+
+  return createAuth(c.env).handler(c.req.raw);
+});
 
 // All other /api/* routes require a session. Resolves the better-auth
 // session from the request cookie and attaches a normalized user onto
@@ -24,12 +216,22 @@ app.use("/api/*", async (c, next) => {
   if (!session) {
     return c.json({ error: "unauthorized" }, 401);
   }
+  // Default to "pending" (no access) rather than "office" if role is somehow
+  // missing -- a missing role must never fall through to a privileged one.
+  const role = (session.user as { role?: string }).role || "pending";
   c.set("user", {
     id: session.user.id,
-    role: (session.user as { role?: string }).role || "office",
+    role,
     name: session.user.name,
     email: session.user.email,
   });
+  // A "pending" user has been created but not yet granted a working role by an
+  // admin. They can hold a valid session (so the client can show a "your
+  // account is awaiting activation" state) but must be denied every data
+  // route. This is the safest possible default for an un-provisioned account.
+  if (role === "pending") {
+    return c.json({ error: "Your account is pending activation by an administrator." }, 403);
+  }
   await next();
 });
 
@@ -112,6 +314,17 @@ async function requireOwnJobOrForbid(c: Context<AppBindings>, db: ReturnType<typ
 function requireAdminOrOfficeOrForbid(c: Context<AppBindings>) {
   const role = c.get("user").role;
   if (role !== "admin" && role !== "office") {
+    return c.json({ error: "forbidden" }, 403);
+  }
+  return null;
+}
+
+// User management (create/list/change-role/deactivate) is the most sensitive
+// surface in the app -- it can hand out any role, including admin -- so it's
+// gated to admin ONLY (not office). Returns a Response to short-circuit with
+// (403 forbidden), or null if the caller may proceed.
+function requireAdminOrForbid(c: Context<AppBindings>) {
+  if (c.get("user").role !== "admin") {
     return c.json({ error: "forbidden" }, 403);
   }
   return null;
@@ -448,7 +661,9 @@ app.openapi(getStats, async (c) => {
   const customers = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.customers).get();
   const technicians = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.technicians).where(eq(schema.technicians.active, 1)).get();
   const serviceTypes = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.serviceTypes).get();
-  const today = new Date().toISOString().split("T")[0];
+  // "Today" in Tampa (America/New_York), NOT UTC -- a UTC today rolls over in
+  // the evening Tampa time and would miscount today's/upcoming jobs.
+  const today = todayInTampa();
   const todayJobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs).where(eq(schema.jobs.scheduledDate, today)).get();
   const upcomingJobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs)
     .where(and(inArray(schema.jobs.status, ["scheduled", "confirmed"]), sql`${schema.jobs.scheduledDate} >= ${today}`))
@@ -469,6 +684,184 @@ app.openapi(getStats, async (c) => {
     invoices_outstanding: invoicesOutstanding?.count || 0,
     invoices_overdue: invoicesOverdue?.count || 0,
   }, 200);
+});
+
+// ── Users (admin-only user management) ─────────────────────────────
+// Admin creates/lists/updates the auth users behind the app. All routes here
+// are admin-only (requireAdminOrForbid) -- NOT office. Users are created via
+// better-auth's server-side API (auth.api.signUpEmail) so the credential/
+// account rows and password hashing all go through the same code path as a
+// normal signup, then the chosen role is set directly on the user row (the
+// signup itself always lands at the "pending" default -- role has input:false).
+// Deactivation is a soft revoke: role is set back to "pending", which the
+// /api/* middleware 403s on -- avoids needing a schema column for "active".
+
+const UserSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  email: z.string(),
+  role: z.string(),
+  created_at: z.string().nullable(),
+}).openapi("User");
+
+const listUsers = createRoute({
+  method: "get",
+  path: "/api/users",
+  responses: {
+    200: { description: "All users", content: { "application/json": { schema: z.object({ users: z.array(UserSchema) }) } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(listUsers, async (c) => {
+  const forbidden = requireAdminOrForbid(c);
+  if (forbidden) return forbidden;
+  const db = getDb(c.env);
+  const rows = await db
+    .select({ id: schema.user.id, name: schema.user.name, email: schema.user.email, role: schema.user.role, createdAt: schema.user.createdAt })
+    .from(schema.user)
+    .orderBy(asc(schema.user.email))
+    .all();
+  const users = rows.map((u) => ({
+    id: u.id,
+    name: u.name,
+    email: u.email,
+    role: u.role ?? "pending",
+    // createdAt is a timestamp_ms integer in the auth schema -- surface it as
+    // an ISO string for the client.
+    created_at: u.createdAt ? new Date(u.createdAt as unknown as number).toISOString() : null,
+  }));
+  return c.json({ users }, 200);
+});
+
+const createUser = createRoute({
+  method: "post",
+  path: "/api/users",
+  request: {
+    body: { content: { "application/json": { schema: z.object({
+      name: zName,
+      email: z.string().trim().email({ message: "Invalid email address" }),
+      password: z.string().min(8, { message: "Password must be at least 8 characters" }),
+      role: z.enum(ASSIGNABLE_ROLES),
+    }) } } },
+  },
+  responses: {
+    201: { description: "Created", content: { "application/json": { schema: UserSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Email already in use", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(createUser, async (c) => {
+  const forbidden = requireAdminOrForbid(c);
+  if (forbidden) return forbidden;
+  const db = getDb(c.env);
+  const data = c.req.valid("json");
+  const email = data.email.toLowerCase();
+
+  // Reject a duplicate email up front with a clean 409 rather than letting
+  // better-auth throw its own error shape.
+  const existing = await db.select({ id: schema.user.id }).from(schema.user).where(eq(schema.user.email, email)).get();
+  if (existing) {
+    return c.json({ error: "A user with that email already exists." }, 409);
+  }
+
+  // Create the auth user through better-auth's server API so password hashing
+  // + the credential/account rows are handled identically to a real signup.
+  // The signup lands at the "pending" default (role has input:false); we set
+  // the chosen role immediately after.
+  try {
+    await createAuth(c.env).api.signUpEmail({ body: { name: data.name, email, password: data.password } });
+  } catch (err) {
+    console.error("Admin createUser signUpEmail failed:", err);
+    return c.json({ error: "Could not create user (email may already be in use)." }, 400);
+  }
+  await db.update(schema.user).set({ role: data.role }).where(eq(schema.user.email, email));
+
+  const row = await db
+    .select({ id: schema.user.id, name: schema.user.name, email: schema.user.email, role: schema.user.role, createdAt: schema.user.createdAt })
+    .from(schema.user)
+    .where(eq(schema.user.email, email))
+    .get();
+  return c.json({
+    id: row!.id,
+    name: row!.name,
+    email: row!.email,
+    role: row!.role ?? data.role,
+    created_at: row!.createdAt ? new Date(row!.createdAt as unknown as number).toISOString() : null,
+  }, 201);
+});
+
+const updateUserRole = createRoute({
+  method: "put",
+  path: "/api/users/{id}/role",
+  request: {
+    params: IdParam,
+    body: { content: { "application/json": { schema: z.object({ role: z.enum(ASSIGNABLE_ROLES) }) } } },
+  },
+  responses: {
+    200: { description: "Role updated", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(updateUserRole, async (c) => {
+  const forbidden = requireAdminOrForbid(c);
+  if (forbidden) return forbidden;
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const { role } = c.req.valid("json");
+  const existing = await db.select({ id: schema.user.id, role: schema.user.role }).from(schema.user).where(eq(schema.user.id, id)).get();
+  if (!existing) return c.json({ error: "User not found" }, 404);
+
+  // Guard against an admin demoting the last remaining admin and locking
+  // everyone out of user management.
+  if (existing.role === "admin" && role !== "admin") {
+    const adminCount = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.user).where(eq(schema.user.role, "admin")).get();
+    if ((adminCount?.count || 0) <= 1) {
+      return c.json({ error: "Cannot remove the last admin -- promote another user to admin first." }, 400);
+    }
+  }
+  await db.update(schema.user).set({ role }).where(eq(schema.user.id, id));
+  return c.json({ ok: true }, 200);
+});
+
+const deactivateUser = createRoute({
+  method: "delete",
+  path: "/api/users/{id}",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Deactivated", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(deactivateUser, async (c) => {
+  const forbidden = requireAdminOrForbid(c);
+  if (forbidden) return forbidden;
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const existing = await db.select({ id: schema.user.id, role: schema.user.role }).from(schema.user).where(eq(schema.user.id, id)).get();
+  if (!existing) return c.json({ error: "User not found" }, 404);
+
+  // Deactivate = park the user back at "pending" (denied everything by the
+  // /api/* middleware) AND kill their active sessions so they're logged out
+  // immediately rather than at next session refresh. Soft revoke -- avoids a
+  // schema column and keeps the row for audit/re-activation.
+  if (existing.role === "admin") {
+    const adminCount = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.user).where(eq(schema.user.role, "admin")).get();
+    if ((adminCount?.count || 0) <= 1) {
+      return c.json({ error: "Cannot deactivate the last admin." }, 400);
+    }
+  }
+  await db.update(schema.user).set({ role: "pending" }).where(eq(schema.user.id, id));
+  await db.delete(schema.session).where(eq(schema.session.userId, id));
+  return c.json({ ok: true }, 200);
 });
 
 // ── Jobs ───────────────────────────────────────────────────────────
@@ -601,28 +994,38 @@ const createJob = createRoute({
         customer_id: z.number().int(),
         technician_id: z.number().int().nullable().optional(),
         service_type_id: z.number().int().nullable().optional(),
-        status: z.string().optional(),
-        priority: z.string().optional(),
-        scheduled_date: z.string(),
-        scheduled_time: z.string().optional(),
-        duration: z.number().int().optional(),
-        price: z.number().optional(),
+        status: z.enum(JOB_STATUSES).optional(),
+        priority: z.enum(JOB_PRIORITIES).optional(),
+        scheduled_date: zDate,
+        scheduled_time: zTime.optional(),
+        duration: z.number().int().positive().optional(),
+        price: zMoney.optional(),
         address: z.string().optional(),
         notes: z.string().optional(),
         is_recurring: z.number().int().optional(),
-        recurrence_interval: z.string().optional(),
+        recurrence_interval: z.enum(RECURRENCE_INTERVALS).optional(),
         brand_id: z.number().int().nullable().optional(),
       }) } },
     },
   },
   responses: {
     201: { description: "Created", content: { "application/json": { schema: JobSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(createJob, async (c) => {
   const db = getDb(c.env);
   const data = c.req.valid("json");
+
+  // Referential sanity: reject dangling FK ids with a clean 400 rather than a
+  // raw D1 constraint 500 (customer_id) or a silent dangling reference
+  // (technician_id/service_type_id/brand_id are SET NULL FKs).
+  if (!(await customerExists(db, data.customer_id))) return c.json({ error: "Customer not found" }, 400);
+  if (!(await technicianExists(db, data.technician_id))) return c.json({ error: "Technician not found" }, 400);
+  if (!(await serviceTypeExists(db, data.service_type_id))) return c.json({ error: "Service type not found" }, 400);
+  if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
+
   const identifier = await nextIdentifier(db);
 
   // If address is empty, use customer address
@@ -688,23 +1091,26 @@ const updateJob = createRoute({
         customer_id: z.number().int().optional(),
         technician_id: z.number().int().nullable().optional(),
         service_type_id: z.number().int().nullable().optional(),
-        status: z.string().optional(),
-        priority: z.string().optional(),
-        scheduled_date: z.string().optional(),
-        scheduled_time: z.string().optional(),
-        duration: z.number().int().optional(),
-        price: z.number().optional(),
+        status: z.enum(JOB_STATUSES).optional(),
+        priority: z.enum(JOB_PRIORITIES).optional(),
+        scheduled_date: zDate.optional(),
+        scheduled_time: zTime.optional(),
+        duration: z.number().int().positive().optional(),
+        price: zMoney.optional(),
         address: z.string().optional(),
         notes: z.string().optional(),
         completion_notes: z.string().optional(),
         is_recurring: z.number().int().optional(),
-        recurrence_interval: z.string().optional(),
+        // Allow "" (not recurring) OR a valid interval -- the client's Job type
+        // carries recurrence_interval as a plain string that can be empty.
+        recurrence_interval: z.union([z.literal(""), z.enum(RECURRENCE_INTERVALS)]).optional(),
         brand_id: z.number().int().nullable().optional(),
       }) } },
     },
   },
   responses: {
     200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
     403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
     404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
   },
@@ -717,6 +1123,12 @@ app.openapi(updateJob, async (c) => {
   const data = c.req.valid("json");
   const existing = await db.select().from(schema.jobs).where(eq(schema.jobs.id, idNum)).get();
   if (!existing) return c.json({ error: "Job not found" }, 404);
+
+  // Referential sanity on any FK being changed.
+  if (!(await customerExists(db, data.customer_id))) return c.json({ error: "Customer not found" }, 400);
+  if (!(await technicianExists(db, data.technician_id))) return c.json({ error: "Technician not found" }, 400);
+  if (!(await serviceTypeExists(db, data.service_type_id))) return c.json({ error: "Service type not found" }, 400);
+  if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
 
   const user = c.get("user");
   const isTechnician = user.role === "technician";
@@ -796,6 +1208,7 @@ const addJobNote = createRoute({
   responses: {
     201: { description: "Note added", content: { "application/json": { schema: JobNoteSchema } } },
     403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Job not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -803,6 +1216,7 @@ app.openapi(addJobNote, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
   const idNum = toId(id);
+  if (!(await jobExists(db, idNum))) return c.json({ error: "Job not found" }, 404);
   if (c.get("user").role === "technician") {
     const forbidden = await requireOwnJobOrForbid(c, db, idNum);
     if (forbidden) return forbidden;
@@ -1184,7 +1598,7 @@ const createCustomer = createRoute({
   request: {
     body: {
       content: { "application/json": { schema: z.object({
-        name: z.string(),
+        name: zName,
         email: z.string().optional(),
         phone: z.string().optional(),
         address: z.string().optional(),
@@ -1237,7 +1651,9 @@ const updateCustomer = createRoute({
     params: IdParam,
     body: {
       content: { "application/json": { schema: z.object({
-        name: z.string().optional(),
+        // If name is sent at all it must be non-blank (can't blank out an
+        // existing customer's name); omitting it leaves the name unchanged.
+        name: zName.optional(),
         email: z.string().optional(),
         phone: z.string().optional(),
         address: z.string().optional(),
@@ -1250,6 +1666,7 @@ const updateCustomer = createRoute({
   },
   responses: {
     200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -1279,13 +1696,41 @@ const deleteCustomer = createRoute({
   request: { params: IdParam },
   responses: {
     200: { description: "Deleted", content: { "application/json": { schema: OkSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Has billing history", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(deleteCustomer, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
-  await db.delete(schema.customers).where(eq(schema.customers.id, toId(id)));
+  const idNum = toId(id);
+  const customer = await db.select({ id: schema.customers.id }).from(schema.customers).where(eq(schema.customers.id, idNum)).get();
+  if (!customer) return c.json({ error: "Customer not found" }, 404);
+
+  // Delete guard: never destroy financial records by cascade. A customer with
+  // any invoices (or payments against those invoices) has billing history that
+  // must be preserved for accounting/audit -- block the delete with a 409.
+  // Jobs alone don't block (jobs cascade-delete and carry no money on their
+  // own beyond the price snapshot); the financial trail is what we protect.
+  const invoiceRow = await db.select({ id: schema.invoices.id }).from(schema.invoices).where(eq(schema.invoices.customerId, idNum)).get();
+  if (invoiceRow) {
+    return c.json({ error: "Cannot delete a customer with billing history (invoices exist)." }, 409);
+  }
+  // Belt-and-suspenders: also block if any payment row exists against this
+  // customer's invoices (covers any orphaned/edge case where an invoice was
+  // removed but its payments weren't).
+  const paymentRow = await db
+    .select({ id: schema.payments.id })
+    .from(schema.payments)
+    .leftJoin(schema.invoices, eq(schema.payments.invoiceId, schema.invoices.id))
+    .where(eq(schema.invoices.customerId, idNum))
+    .get();
+  if (paymentRow) {
+    return c.json({ error: "Cannot delete a customer with billing history (payments exist)." }, 409);
+  }
+
+  await db.delete(schema.customers).where(eq(schema.customers.id, idNum));
   return c.json({ ok: true }, 200);
 });
 
@@ -1357,7 +1802,7 @@ const createTechnician = createRoute({
   request: {
     body: {
       content: { "application/json": { schema: z.object({
-        name: z.string(),
+        name: zName,
         email: z.string().optional(),
         phone: z.string().optional(),
         color: z.string().optional(),
@@ -1366,6 +1811,7 @@ const createTechnician = createRoute({
   },
   responses: {
     201: { description: "Created", content: { "application/json": { schema: TechnicianSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -1398,7 +1844,7 @@ const updateTechnician = createRoute({
     params: IdParam,
     body: {
       content: { "application/json": { schema: z.object({
-        name: z.string().optional(),
+        name: zName.optional(),
         email: z.string().optional(),
         phone: z.string().optional(),
         color: z.string().optional(),
@@ -1481,10 +1927,10 @@ const createServiceType = createRoute({
   request: {
     body: {
       content: { "application/json": { schema: z.object({
-        name: z.string(),
+        name: zName,
         description: z.string().optional(),
-        default_duration: z.number().int().optional(),
-        default_price: z.number().optional(),
+        default_duration: z.number().int().positive().optional(),
+        default_price: zMoney.optional(),
         color: z.string().optional(),
         brand_id: z.number().int().nullable().optional(),
       }) } },
@@ -1492,12 +1938,14 @@ const createServiceType = createRoute({
   },
   responses: {
     201: { description: "Created", content: { "application/json": { schema: ServiceTypeSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(createServiceType, async (c) => {
   const db = getDb(c.env);
   const data = c.req.valid("json");
+  if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
   await db.insert(schema.serviceTypes).values({
     name: data.name,
     description: data.description || "",
@@ -1527,10 +1975,10 @@ const updateServiceType = createRoute({
     params: IdParam,
     body: {
       content: { "application/json": { schema: z.object({
-        name: z.string().optional(),
+        name: zName.optional(),
         description: z.string().optional(),
-        default_duration: z.number().int().optional(),
-        default_price: z.number().optional(),
+        default_duration: z.number().int().positive().optional(),
+        default_price: zMoney.optional(),
         color: z.string().optional(),
         brand_id: z.number().int().nullable().optional(),
       }) } },
@@ -1538,6 +1986,7 @@ const updateServiceType = createRoute({
   },
   responses: {
     200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -1617,8 +2066,8 @@ const createBrand = createRoute({
   request: {
     body: {
       content: { "application/json": { schema: z.object({
-        name: z.string(),
-        slug: z.string(),
+        name: zName,
+        slug: zName,
         color_primary: z.string().optional(),
         color_secondary: z.string().optional(),
         active: z.number().int().optional(),
@@ -1627,6 +2076,7 @@ const createBrand = createRoute({
   },
   responses: {
     201: { description: "Created", content: { "application/json": { schema: BrandSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
     403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
@@ -1663,8 +2113,8 @@ const updateBrand = createRoute({
     params: IdParam,
     body: {
       content: { "application/json": { schema: z.object({
-        name: z.string().optional(),
-        slug: z.string().optional(),
+        name: zName.optional(),
+        slug: zName.optional(),
         color_primary: z.string().optional(),
         color_secondary: z.string().optional(),
         active: z.number().int().optional(),
@@ -1673,6 +2123,7 @@ const updateBrand = createRoute({
   },
   responses: {
     200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
     403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
@@ -1843,6 +2294,7 @@ const addChecklistItem = createRoute({
   responses: {
     201: { description: "Added", content: { "application/json": { schema: OkSchema } } },
     403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Job not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -1850,6 +2302,7 @@ app.openapi(addChecklistItem, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
   const idNum = toId(id);
+  if (!(await jobExists(db, idNum))) return c.json({ error: "Job not found" }, 404);
   if (c.get("user").role === "technician") {
     const forbidden = await requireOwnJobOrForbid(c, db, idNum);
     if (forbidden) return forbidden;
@@ -1959,14 +2412,15 @@ const createMaterial = createRoute({
   path: "/api/materials",
   request: {
     body: { content: { "application/json": { schema: z.object({
-      name: z.string(),
+      name: zName,
       unit: z.string().optional(),
-      unit_cost: z.number().optional(),
-      in_stock: z.number().optional(),
+      unit_cost: zMoney.optional(),
+      in_stock: zMoney.optional(),
     }) } } },
   },
   responses: {
     201: { description: "Created", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -1988,14 +2442,15 @@ const updateMaterial = createRoute({
   request: {
     params: IdParam,
     body: { content: { "application/json": { schema: z.object({
-      name: z.string().optional(),
+      name: zName.optional(),
       unit: z.string().optional(),
-      unit_cost: z.number().optional(),
-      in_stock: z.number().optional(),
+      unit_cost: zMoney.optional(),
+      in_stock: zMoney.optional(),
     }) } } },
   },
   responses: {
     200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -2039,13 +2494,15 @@ const addJobMaterial = createRoute({
     params: IdParam,
     body: { content: { "application/json": { schema: z.object({
       material_id: z.number().int(),
-      quantity: z.number(),
-      unit_cost: z.number().optional(),
+      quantity: zPositive,
+      unit_cost: zMoney.optional(),
     }) } } },
   },
   responses: {
     201: { description: "Added", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
     403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Job not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -2053,16 +2510,16 @@ app.openapi(addJobMaterial, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
   const idNum = toId(id);
+  if (!(await jobExists(db, idNum))) return c.json({ error: "Job not found" }, 404);
   if (c.get("user").role === "technician") {
     const forbidden = await requireOwnJobOrForbid(c, db, idNum);
     if (forbidden) return forbidden;
   }
   const data = c.req.valid("json");
-  let cost = data.unit_cost;
-  if (cost === undefined) {
-    const mat = await db.select({ unit_cost: schema.materials.unitCost }).from(schema.materials).where(eq(schema.materials.id, data.material_id)).get();
-    cost = mat?.unit_cost || 0;
-  }
+  // Reject a dangling material_id with a clean 400 rather than a raw FK 500.
+  const mat = await db.select({ unit_cost: schema.materials.unitCost }).from(schema.materials).where(eq(schema.materials.id, data.material_id)).get();
+  if (!mat) return c.json({ error: "Material not found" }, 400);
+  const cost = data.unit_cost ?? (mat.unit_cost || 0);
   await db.insert(schema.jobMaterials).values({
     jobId: idNum,
     materialId: data.material_id,
@@ -2261,25 +2718,37 @@ const createInvoice = createRoute({
     body: { content: { "application/json": { schema: z.object({
       customer_id: z.number().int(),
       job_id: z.number().int().nullable().optional(),
-      tax_rate: z.number().optional(),
+      tax_rate: zTaxRate.optional(),
       notes: z.string().optional(),
-      due_date: z.string().optional(),
+      // due_date is optional; if provided it must be a real calendar date.
+      // "" (empty) is NOT a valid date -- the client sends the field omitted
+      // (undefined) rather than "" when the user leaves it blank.
+      due_date: zDate.optional(),
       brand_id: z.number().int().nullable().optional(),
+      // At least one line item required on create.
       lines: z.array(z.object({
-        description: z.string(),
-        quantity: z.number(),
-        unit_price: z.number(),
-      })),
+        description: zName,
+        quantity: zPositive,
+        unit_price: zMoney,
+      })).min(1, { message: "An invoice must have at least one line item" }),
     }) } } },
   },
   responses: {
     201: { description: "Created", content: { "application/json": { schema: z.any() } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(createInvoice, async (c) => {
   const db = getDb(c.env);
   const data = c.req.valid("json");
+  // Referential sanity before we mint an identifier / insert.
+  if (!(await customerExists(db, data.customer_id))) return c.json({ error: "Customer not found" }, 400);
+  if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
+  if (data.job_id !== null && data.job_id !== undefined) {
+    const jobRow = await db.select({ id: schema.jobs.id }).from(schema.jobs).where(eq(schema.jobs.id, data.job_id)).get();
+    if (!jobRow) return c.json({ error: "Job not found" }, 400);
+  }
   const identifier = await nextInvoiceIdentifier(db);
   const taxRate = data.tax_rate || 0;
 
@@ -2352,15 +2821,18 @@ const updateInvoice = createRoute({
   request: {
     params: IdParam,
     body: { content: { "application/json": { schema: z.object({
-      status: z.string().optional(),
+      status: z.enum(INVOICE_STATUSES).optional(),
       notes: z.string().optional(),
-      due_date: z.string().optional(),
-      paid_date: z.string().optional(),
+      // "" clears the date (the date input sends "" when the user clears it);
+      // any non-empty value must be a real calendar date.
+      due_date: z.union([z.literal(""), zDate]).optional(),
+      paid_date: z.union([z.literal(""), zDate]).optional(),
       brand_id: z.number().int().nullable().optional(),
     }) } } },
   },
   responses: {
     200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -2368,6 +2840,7 @@ app.openapi(updateInvoice, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
   const data = c.req.valid("json");
+  if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
   const updates: Record<string, unknown> = {};
   if (data.status !== undefined) updates.status = data.status;
   if (data.notes !== undefined) updates.notes = data.notes;
@@ -2447,7 +2920,9 @@ const recordPayment = createRoute({
     params: IdParam,
     body: { content: { "application/json": { schema: z.object({
       method: z.enum(PAYMENT_METHODS),
-      amount: z.number().optional(),
+      // An explicit amount (partial/manual payment) must be strictly positive.
+      // Omit it to auto-compute the tier amount for the remaining balance.
+      amount: zPositive.optional(),
     }) } } },
   },
   responses: {
@@ -2477,6 +2952,18 @@ app.openapi(recordPayment, async (c) => {
     .from(schema.payments).where(and(eq(schema.payments.invoiceId, idNum), eq(schema.payments.status, "paid"))).all();
   const priorRawCredit = priorPayments.reduce((sum, p) => sum + ((p.amount || 0) - (p.surchargeAmount || 0)), 0);
   const remainingRaw = Math.max(0, invoiceTotal - priorRawCredit);
+
+  // Reject over-collection at the API. The raw balance owed is remainingRaw
+  // (invoice total minus prior raw credit). A manual amount that exceeds it --
+  // or any payment against an already-fully-paid invoice -- is rejected with a
+  // 400 that states the max allowed. The 0.005 epsilon absorbs float rounding
+  // on the tier math so a legitimate "pay the exact remainder" isn't tripped.
+  if (remainingRaw <= 0.005) {
+    return c.json({ error: "This invoice is already paid in full." }, 400);
+  }
+  if (data.amount !== undefined && data.amount > remainingRaw + 0.005) {
+    return c.json({ error: `Payment exceeds the balance owed. Maximum allowed is ${remainingRaw.toFixed(2)}.` }, 400);
+  }
 
   // amount defaults to the tier-computed amount for what's actually still
   // owed (not the full invoice total) -- so a second auto payment after a
@@ -2523,7 +3010,7 @@ app.openapi(recordPayment, async (c) => {
   let invoiceStatus = invoice.status;
   if (totalRawCredit >= invoiceTotal - 0.005) {
     invoiceStatus = "paid";
-    await db.update(schema.invoices).set({ status: "paid", paidDate: sql`(date('now'))`, updatedAt: sql`(datetime('now'))` }).where(eq(schema.invoices.id, idNum));
+    await db.update(schema.invoices).set({ status: "paid", paidDate: todayInTampa(), updatedAt: sql`(datetime('now'))` }).where(eq(schema.invoices.id, idNum));
   }
 
   return c.json({ payment: paymentOut(payment!), invoice_status: invoiceStatus }, 201);
@@ -2749,24 +3236,28 @@ const createEstimate = createRoute({
     body: { content: { "application/json": { schema: z.object({
       customer_id: z.number().int(),
       brand_id: z.number().int().nullable().optional(),
-      tax_rate: z.number().optional(),
-      valid_until: z.string().optional(),
+      tax_rate: zTaxRate.optional(),
+      valid_until: zDate.optional(),
       notes: z.string().optional(),
+      // At least one line item required on create.
       lines: z.array(z.object({
-        description: z.string(),
-        quantity: z.number(),
-        unit_price: z.number(),
-      })),
+        description: zName,
+        quantity: zPositive,
+        unit_price: zMoney,
+      })).min(1, { message: "An estimate must have at least one line item" }),
     }) } } },
   },
   responses: {
     201: { description: "Created", content: { "application/json": { schema: z.any() } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(createEstimate, async (c) => {
   const db = getDb(c.env);
   const data = c.req.valid("json");
+  if (!(await customerExists(db, data.customer_id))) return c.json({ error: "Customer not found" }, 400);
+  if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
   const identifier = await nextEstimateIdentifier(db);
   const taxRate = data.tax_rate || 0;
 
@@ -2818,13 +3309,15 @@ const updateEstimate = createRoute({
       // caller skip straight to "approved" (or resurrect a declined/
       // converted estimate) with none of those checks.
       notes: z.string().optional(),
-      valid_until: z.string().optional(),
-      tax_rate: z.number().optional(),
+      // "" clears the date; any non-empty value must be a real calendar date.
+      valid_until: z.union([z.literal(""), zDate]).optional(),
+      tax_rate: zTaxRate.optional(),
       brand_id: z.number().int().nullable().optional(),
     }) } } },
   },
   responses: {
     200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
     404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
@@ -2836,6 +3329,7 @@ app.openapi(updateEstimate, async (c) => {
   const data = c.req.valid("json");
   const existing = await db.select().from(schema.estimates).where(eq(schema.estimates.id, idNum)).get();
   if (!existing) return c.json({ error: "Estimate not found" }, 404);
+  if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
 
   const updates: Record<string, unknown> = {};
   if (data.notes !== undefined) updates.notes = data.notes;
@@ -2979,13 +3473,14 @@ const addEstimateLine = createRoute({
   request: {
     params: IdParam,
     body: { content: { "application/json": { schema: z.object({
-      description: z.string(),
-      quantity: z.number(),
-      unit_price: z.number(),
+      description: zName,
+      quantity: zPositive,
+      unit_price: zMoney,
     }) } } },
   },
   responses: {
     201: { description: "Line added", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
     404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
@@ -3067,7 +3562,8 @@ app.openapi(convertEstimate, async (c) => {
   // from -- office/dispatch can reschedule from the job detail view same
   // as any other job.
   const jobIdentifier = await nextIdentifier(db);
-  const today = new Date().toISOString().split("T")[0];
+  // Default the new job to today in Tampa (America/New_York), not UTC.
+  const today = todayInTampa();
   await db.insert(schema.jobs).values({
     identifier: jobIdentifier,
     customerId: estimate.customerId,
@@ -3180,19 +3676,23 @@ const createServiceAgreement = createRoute({
         brand_id: z.number().int().nullable().optional(),
         service_type_id: z.number().int().nullable().optional(),
         interval: z.enum(SERVICE_AGREEMENT_INTERVALS),
-        next_run_date: z.string(),
+        next_run_date: zDate,
         active: z.number().int().optional(),
       }) } },
     },
   },
   responses: {
     201: { description: "Created", content: { "application/json": { schema: ServiceAgreementSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(createServiceAgreement, async (c) => {
   const db = getDb(c.env);
   const data = c.req.valid("json");
+  if (!(await customerExists(db, data.customer_id))) return c.json({ error: "Customer not found" }, 400);
+  if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
+  if (!(await serviceTypeExists(db, data.service_type_id))) return c.json({ error: "Service type not found" }, 400);
   await db.insert(schema.serviceAgreements).values({
     customerId: data.customer_id,
     brandId: data.brand_id ?? null,
@@ -3221,13 +3721,14 @@ const updateServiceAgreement = createRoute({
         brand_id: z.number().int().nullable().optional(),
         service_type_id: z.number().int().nullable().optional(),
         interval: z.enum(SERVICE_AGREEMENT_INTERVALS).optional(),
-        next_run_date: z.string().optional(),
+        next_run_date: zDate.optional(),
         active: z.number().int().optional(),
       }) } },
     },
   },
   responses: {
     200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
     404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
@@ -3239,6 +3740,9 @@ app.openapi(updateServiceAgreement, async (c) => {
   const data = c.req.valid("json");
   const existing = await db.select({ id: schema.serviceAgreements.id }).from(schema.serviceAgreements).where(eq(schema.serviceAgreements.id, idNum)).get();
   if (!existing) return c.json({ error: "Service agreement not found" }, 404);
+  if (!(await customerExists(db, data.customer_id))) return c.json({ error: "Customer not found" }, 400);
+  if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
+  if (!(await serviceTypeExists(db, data.service_type_id))) return c.json({ error: "Service type not found" }, 400);
 
   const updates: Record<string, unknown> = {};
   if (data.customer_id !== undefined) updates.customerId = data.customer_id;
@@ -3327,10 +3831,15 @@ function advanceByInterval(dateStr: string, interval: (typeof SERVICE_AGREEMENT_
 // the manual route's response / cron log line.
 async function processDueServiceAgreements(env: AppBindings["Bindings"]): Promise<{ processed: number; created_job_ids: number[] }> {
   const db = getDb(env);
+  // Compute "today" in Tampa (America/New_York) in JS and pass it as a bound
+  // parameter, rather than SQLite's date('now') which is UTC -- the cron fires
+  // at 6am UTC (= 1am/2am Tampa), and a UTC cutoff would run agreements a day
+  // early relative to the Tampa calendar the business schedules against.
+  const today = todayInTampa();
   const due = await db
     .select()
     .from(schema.serviceAgreements)
-    .where(and(eq(schema.serviceAgreements.active, 1), sql`${schema.serviceAgreements.nextRunDate} <= (date('now'))`))
+    .where(and(eq(schema.serviceAgreements.active, 1), sql`${schema.serviceAgreements.nextRunDate} <= ${today}`))
     .all();
 
   const createdJobIds: number[] = [];
@@ -3420,6 +3929,66 @@ app.openapi(runDueServiceAgreementsNow, async (c) => {
   }
   const result = await processDueServiceAgreements(c.env);
   return c.json({ ok: true, ...result }, 200);
+});
+
+// ── Global error handler ───────────────────────────────────────────
+// Any error that bubbles out of a route (including Zod validation failures
+// that OpenAPIHono re-throws, and raw D1 constraint errors) lands here. We
+// return a clean JSON { error } shape and NEVER leak a stack trace or internal
+// SQL text to the client.
+//
+//   - D1 FK / constraint / NOT NULL failures -> 400 with a friendly message
+//     (these are almost always bad client input -- e.g. a dangling FK id that
+//     slipped past an existence check, or a uniqueness clash).
+//   - HTTPException / anything carrying an explicit status -> that status.
+//   - everything else -> 500 with a generic message.
+app.onError((err, c) => {
+  console.error(`[onError] ${c.req.method} ${c.req.path}:`, err);
+
+  // Hono's HTTPException (and better-call's APIError from better-auth) carry a
+  // status + a getResponse()/toResponse(). Respect an explicit status if one
+  // is present, but still scrub the body to our { error } shape.
+  const status = (err as { status?: number }).status;
+  if (typeof status === "number" && status >= 400 && status < 600) {
+    const message = (err as { message?: string }).message || "Request failed";
+    return c.json({ error: message }, status as 400);
+  }
+
+  // Map raw D1 constraint failures to a 400 rather than a 500. SQLite surfaces
+  // these as messages containing "FOREIGN KEY constraint failed", "UNIQUE
+  // constraint failed", "NOT NULL constraint failed", etc. Drizzle wraps the
+  // real error in a DrizzleQueryError whose top-level .message is just
+  // "Failed query: ..." -- the constraint text lives on err.cause (and
+  // sometimes err.cause.cause), so walk the whole cause chain, not just the
+  // top message.
+  let msg = "";
+  let e: unknown = err;
+  for (let i = 0; i < 5 && e; i++) {
+    msg += " " + String((e as { message?: string }).message || "");
+    e = (e as { cause?: unknown }).cause;
+  }
+  if (/constraint failed|SQLITE_CONSTRAINT/i.test(msg)) {
+    if (/FOREIGN KEY/i.test(msg)) {
+      return c.json({ error: "Referenced record does not exist." }, 400);
+    }
+    if (/UNIQUE/i.test(msg)) {
+      return c.json({ error: "That record already exists (duplicate value)." }, 400);
+    }
+    return c.json({ error: "Invalid data -- a required field is missing or invalid." }, 400);
+  }
+
+  // Unexpected: generic 500, no internal detail leaked.
+  return c.json({ error: "Internal server error" }, 500);
+});
+
+// 404 for any unmatched /api/* route -- a clean JSON shape rather than the
+// SPA-fallback HTML the ASSETS binding would otherwise serve.
+app.notFound((c) => {
+  if (c.req.path.startsWith("/api/")) {
+    return c.json({ error: "Not found" }, 404);
+  }
+  // Non-API paths fall through to the static-asset / SPA handler.
+  return c.env.ASSETS.fetch(c.req.raw);
 });
 
 export default {

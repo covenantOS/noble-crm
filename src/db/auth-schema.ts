@@ -16,7 +16,10 @@ export const user = sqliteTable("user", {
     .default(sql`(cast(unixepoch('subsecond') * 1000 as integer))`)
     .$onUpdate(() => /* @__PURE__ */ new Date())
     .notNull(),
-  role: text("role").default("office"),
+  // Powerless default: a new account is 'pending' (no access) until an admin
+  // grants a real role. Kept in sync with the additionalFields defaultValue in
+  // src/lib/auth.ts. See that file's ROLES comment for the full model.
+  role: text("role").default("pending"),
 });
 
 export const session = sqliteTable(
