@@ -15,6 +15,7 @@ import { CustomerDetail } from "./components/customer-detail";
 import { TechnicianList } from "./components/technician-list";
 import { ServiceTypeList } from "./components/service-type-list";
 import { MaterialList } from "./components/material-list";
+import { ProductList } from "./components/product-list";
 import { InvoiceList } from "./components/invoice-list";
 import { InvoiceDetail } from "./components/invoice-detail";
 import { EstimateList } from "./components/estimate-list";
@@ -87,6 +88,7 @@ function AuthenticatedApp({ isAgent, session }: { isAgent: boolean; session: Non
       case "technicians": return <TechnicianList />;
       case "services": return <ServiceTypeList />;
       case "materials": return <MaterialList />;
+      case "products": return <ProductList />;
       case "invoices": return <InvoiceList />;
       case "estimates": return <EstimateList />;
       case "brands": return <BrandList />;

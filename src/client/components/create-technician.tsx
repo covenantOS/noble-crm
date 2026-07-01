@@ -9,6 +9,7 @@ export function CreateTechnician({ onClose }: { onClose: () => void }) {
   const [email, setEmail] = useState("");
   const [phone, setPhone] = useState("");
   const [color, setColor] = useState("#16a34a");
+  const [isSubcontractor, setIsSubcontractor] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   const handleSubmit = async (e: Event) => {
@@ -16,7 +17,7 @@ export function CreateTechnician({ onClose }: { onClose: () => void }) {
     if (!name.trim()) { setError("Name is required"); return; }
     setSubmitting(true);
     try {
-      await addTechnician({ name: name.trim(), email, phone, color });
+      await addTechnician({ name: name.trim(), email, phone, color, is_subcontractor: isSubcontractor ? 1 : 0 });
       onClose();
     } catch (err) {
       setError((err as Error).message);
@@ -49,6 +50,12 @@ export function CreateTechnician({ onClose }: { onClose: () => void }) {
             <div class="form-group">
               <label>Color</label>
               <input type="color" value={color} onChange={(e) => setColor((e.target as HTMLInputElement).value)} />
+            </div>
+            <div class="form-group full-width">
+              <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <input type="checkbox" checked={isSubcontractor} onChange={(e) => setIsSubcontractor((e.target as HTMLInputElement).checked)} style={{ width: "auto" }} />
+                1099 Subcontractor
+              </label>
             </div>
           </div>
           <div class="modal-footer">

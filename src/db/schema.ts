@@ -16,7 +16,7 @@
 // Money stays REAL (decimal) to match the original. Move to integer cents
 // only in a deliberate migration, not silently.
 
-import { sqliteTable, integer, text, real, index } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, integer, text, real, index, uniqueIndex } from 'drizzle-orm/sqlite-core';
 import { sql } from 'drizzle-orm';
 
 const nowTimestamp = () => sql`(datetime('now'))`;
@@ -60,6 +60,10 @@ export const technicians = sqliteTable('technicians', {
   createdAt: text('created_at').default(nowTimestamp()),
   // NEW (Phase 2): link a crew member to their better-auth user (string id).
   userId: text('user_id'),
+  // NEW (crews/1099 pass): purely informational/reporting flag -- whether this
+  // technician is a 1099 subcontractor rather than a W-2 employee. No access-
+  // control implications; it's a badge on technician list/job-detail only.
+  isSubcontractor: integer('is_subcontractor').notNull().default(0),
 });
 
 export const serviceTypes = sqliteTable('service_types', {
@@ -96,12 +100,40 @@ export const jobs = sqliteTable('jobs', {
   updatedAt: text('updated_at').default(nowTimestamp()),
   // NEW (Phase 3): brand tag for reporting + customer-facing docs.
   brandId: integer('brand_id').references(() => brands.id),
+  // NEW (multi-day jobs pass): nullable end date for a job that spans more
+  // than one calendar day. Null (or equal to scheduled_date) means a normal
+  // single-day job -- fully backward compatible, existing jobs never need to
+  // set this. When present, must be >= scheduled_date (validated server-side).
+  endDate: text('end_date'),
+  // NEW (warranty pass): optional warranty term set at job completion.
+  // warrantyMonths is the raw input (nullable, > 0 when set);
+  // warrantyExpiresAt is the derived completion-date + N-calendar-months
+  // value, computed server-side (see advanceMonthsCalendarSafe in index.ts)
+  // so callers never have to re-derive month-length-safe math themselves.
+  warrantyMonths: integer('warranty_months'),
+  warrantyExpiresAt: text('warranty_expires_at'),
 }, (table) => [
   index('idx_jobs_customer').on(table.customerId),
   index('idx_jobs_technician').on(table.technicianId),
   index('idx_jobs_service_type').on(table.serviceTypeId),
   index('idx_jobs_status').on(table.status),
   index('idx_jobs_scheduled_date').on(table.scheduledDate),
+]);
+
+// NEW (crews pass): many-to-many job<->technician "crew" membership. The
+// lead technician stays jobs.technicianId (unchanged, backward compatible
+// with every existing route/UI) -- this table is ADDITIONAL crew beyond the
+// lead. role is free text (e.g. "lead"/"helper"), nullable, not a rigid enum.
+// UNIQUE(job_id, technician_id) prevents double-adding the same tech.
+export const jobCrew = sqliteTable('job_crew', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  jobId: integer('job_id').notNull().references(() => jobs.id, { onDelete: 'cascade' }),
+  technicianId: integer('technician_id').notNull().references(() => technicians.id, { onDelete: 'cascade' }),
+  role: text('role'),
+}, (table) => [
+  index('idx_job_crew_job').on(table.jobId),
+  index('idx_job_crew_technician').on(table.technicianId),
+  uniqueIndex('idx_job_crew_unique').on(table.jobId, table.technicianId),
 ]);
 
 export const jobNotes = sqliteTable('job_notes', {
@@ -196,6 +228,10 @@ export const brands = sqliteTable('brands', {
   colorSecondary: text('color_secondary'),
   logoR2Key: text('logo_r2_key'),
   active: integer('active').notNull().default(1),
+  // NEW (review-request pass): review-site URL (Google/Yelp/Facebook/etc) this
+  // brand wants customers pointed to after a completed job. Nullable --
+  // request-review honestly no-ops when unset. Validated as a URL when present.
+  reviewUrl: text('review_url'),
 });
 
 export const estimates = sqliteTable('estimates', {
@@ -349,6 +385,26 @@ export const serviceAgreements = sqliteTable('service_agreements', {
   anchorDay: integer('anchor_day'),
   active: integer('active').notNull().default(1),
 });
+
+// NEW (TKC product catalog pass): a product catalog distinct from the
+// painting `materials` table above -- Tampa Kitchen Cabinets (a second brand
+// on this platform) sells door styles/hardware/countertops, not paint
+// materials. brandId is nullable (a product usable across brands, or not yet
+// tagged) rather than required. CRUD mirrors the materials routes' pattern
+// exactly (list open to all incl. technicians, mutations admin/office only).
+export const products = sqliteTable('products', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  brandId: integer('brand_id').references(() => brands.id),
+  name: text('name').notNull(),
+  sku: text('sku'),
+  // Free text, not a rigid enum -- e.g. "door style" | "hardware" | "countertop".
+  category: text('category'),
+  unitCost: real('unit_cost').notNull().default(0),
+  unit: text('unit').notNull().default('ea'),
+  active: integer('active').notNull().default(1),
+}, (table) => [
+  index('idx_products_brand').on(table.brandId),
+]);
 
 /* =========================================================================
  * AUTH (Phase 2)

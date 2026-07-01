@@ -1,9 +1,19 @@
-export type View = "dashboard" | "schedule" | "jobs" | "customers" | "technicians" | "services" | "invoices" | "estimates" | "materials" | "brands" | "service-agreements";
+export type View = "dashboard" | "schedule" | "jobs" | "customers" | "technicians" | "services" | "invoices" | "estimates" | "materials" | "products" | "brands" | "service-agreements";
 
 export type JobStatus = "scheduled" | "confirmed" | "in_progress" | "completed" | "cancelled";
 export type Priority = "low" | "normal" | "high" | "urgent";
 export type InvoiceStatus = "draft" | "sent" | "paid" | "overdue" | "cancelled";
 export type EstimateStatus = "draft" | "sent" | "approved" | "declined" | "expired" | "converted";
+
+export interface JobCrewMember {
+  id: number;
+  job_id: number;
+  technician_id: number;
+  role: string | null;
+  technician_name?: string | null;
+  technician_color?: string | null;
+  is_subcontractor?: number | null;
+}
 
 export interface Job {
   id: number;
@@ -24,6 +34,12 @@ export interface Job {
   recurrence_interval: string;
   next_recurrence_date: string;
   brand_id?: number | null;
+  // NEW (multi-day jobs): nullable -- null/equal to scheduled_date means a
+  // normal single-day job.
+  end_date?: string | null;
+  // NEW (warranty pass): nullable warranty term + derived expiry date.
+  warranty_months?: number | null;
+  warranty_expires_at?: string | null;
   customer_name?: string;
   customer_phone?: string;
   technician_name?: string | null;
@@ -36,6 +52,7 @@ export interface Job {
   job_notes?: JobNote[];
   checklist?: ChecklistItem[];
   job_materials?: JobMaterial[];
+  crew?: JobCrewMember[];
   created_at: string;
   updated_at: string;
 }
@@ -68,6 +85,9 @@ export interface Technician {
   color: string;
   active: number;
   job_count?: number;
+  // NEW (1099 pass): 1 if this technician is a 1099 subcontractor rather
+  // than a W-2 employee. Purely informational -- no access-control effect.
+  is_subcontractor: number;
   created_at: string;
 }
 
@@ -90,6 +110,8 @@ export interface Brand {
   color_secondary: string | null;
   logo_r2_key: string | null;
   active: number;
+  // NEW (review-request pass): nullable review-site URL.
+  review_url?: string | null;
 }
 
 export interface JobNote {
@@ -124,6 +146,20 @@ export interface JobMaterial {
   material_unit?: string;
   quantity: number;
   unit_cost: number;
+}
+
+// NEW (TKC product catalog pass): distinct from Material above -- door
+// styles/hardware/countertops rather than paint materials.
+export interface Product {
+  id: number;
+  brand_id: number | null;
+  name: string;
+  sku: string | null;
+  category: string | null;
+  unit_cost: number;
+  unit: string;
+  active: number;
+  brand_name?: string | null;
 }
 
 export interface Invoice {

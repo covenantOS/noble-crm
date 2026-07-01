@@ -12,6 +12,7 @@ export function CreateJob({ onClose }: { onClose: () => void }) {
   const [serviceTypeId, setServiceTypeId] = useState("");
   const [brandId, setBrandId] = useState("");
   const [scheduledDate, setScheduledDate] = useState(today);
+  const [endDate, setEndDate] = useState("");
   const [scheduledTime, setScheduledTime] = useState("09:00");
   const [priority, setPriority] = useState("normal");
   const [price, setPrice] = useState("");
@@ -24,6 +25,7 @@ export function CreateJob({ onClose }: { onClose: () => void }) {
     e.preventDefault();
     if (!customerId) { setError("Please select a customer"); return; }
     if (!scheduledDate) { setError("Please select a date"); return; }
+    if (endDate && endDate < scheduledDate) { setError("End date cannot be before the scheduled date"); return; }
     setSubmitting(true);
     try {
       await addJob({
@@ -32,6 +34,7 @@ export function CreateJob({ onClose }: { onClose: () => void }) {
         service_type_id: serviceTypeId ? parseInt(serviceTypeId, 10) : null,
         brand_id: brandId ? parseInt(brandId, 10) : null,
         scheduled_date: scheduledDate,
+        end_date: endDate || null,
         scheduled_time: scheduledTime,
         priority: priority as "low" | "normal" | "high" | "urgent",
         // Only send price/duration when the user entered them -- leaving them
@@ -106,6 +109,10 @@ export function CreateJob({ onClose }: { onClose: () => void }) {
             <div class="form-group">
               <label>Date *</label>
               <input type="date" value={scheduledDate} onChange={(e) => setScheduledDate((e.target as HTMLInputElement).value)} required />
+            </div>
+            <div class="form-group">
+              <label>End Date (multi-day, optional)</label>
+              <input type="date" min={scheduledDate || undefined} value={endDate} onChange={(e) => setEndDate((e.target as HTMLInputElement).value)} />
             </div>
             <div class="form-group">
               <label>Time</label>

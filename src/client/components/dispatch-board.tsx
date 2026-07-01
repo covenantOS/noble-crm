@@ -30,6 +30,34 @@ import { ChevronLeft, ChevronRight } from "lucide-preact";
 //     JavaScript/TypeScript with an imperative DOM API and literally zero
 //     npm dependencies, which is a more natural fit for this Preact
 //     (non-Svelte) codebase than pulling in a Svelte runtime bundle.
+//
+// DAY/WEEK/MONTH TOGGLE (multi-day jobs pass), verified against the actual
+// installed package's .d.ts (daypilot-javascript.min.d.ts), not assumed:
+//   - `DayPilot.Calendar.viewType` DOES support "Day" | "Days" | "Week" |
+//     "WorkWeek" | "Resources" -- but "Resources" (the per-technician column
+//     board this component uses) is its OWN distinct viewType, mutually
+//     exclusive with Day/Days/Week. There's no combined "resources x
+//     multi-day-scale" mode in Calendar -- switching viewType away from
+//     "Resources" drops the per-technician columns entirely and switches to
+//     a plain single/multi-day time-grid instead.
+//   - `DayPilot.Scheduler` (a separate class, also present in Lite, not
+//     Pro-gated) DOES support `scale: "Day" | "Week"` with resource ROWS
+//     (not columns) and natively spans multi-day events as a single bar --
+//     this is the "next tier up" component that would give a proper
+//     week/month resource view with real multi-day bars. Swapping Calendar
+//     for Scheduler is a real rewrite of this component (different event/
+//     resource API shape, row- instead of column-oriented), which is more
+//     than a "toggle" -- out of scope for this pass.
+//   - `DayPilot.Month` exists too, but has no resource/column concept at
+//     all (a plain month grid), so it can't replace the per-technician
+//     board either.
+//   - Net: no clean Day/Week/Month toggle was added to the Resources board
+//     in this pass. Multi-day jobs are instead made visually distinct here
+//     (an end-date badge on the event card + tooltip, see
+//     onBeforeEventRender/the events-building effect below) and in the List
+//     view (schedule-view.tsx), which is the "next best thing" the build
+//     instructions call for when a clean multi-scale resources view isn't
+//     available in the Lite tier.
 
 // Business-hours window the board renders (clamped from the full 24h span so
 // early-morning/overnight dead hours don't waste vertical room).
@@ -98,7 +126,7 @@ export function DispatchBoard() {
       // 3-line html body (time · customer · service). The tech/brand color
       // travels on the event's `tags`.
       onBeforeEventRender: (args) => {
-        const tags = (args.data.tags || {}) as { color?: string; time?: string; customer?: string; service?: string };
+        const tags = (args.data.tags || {}) as { color?: string; time?: string; customer?: string; service?: string; endDateLabel?: string };
         const color = tags.color || "#1a2b4a";
         args.data.backColor = tint(color, 0.14);
         args.data.borderColor = tint(color, 0.34);
@@ -110,10 +138,18 @@ export function DispatchBoard() {
         const time = tags.time ? escapeHtml(tags.time) : "";
         const customer = tags.customer ? escapeHtml(tags.customer) : "";
         const service = tags.service ? escapeHtml(tags.service) : "";
+        // DayPilot Lite's Resources view is a single-day board (see the
+        // module comment below for what Lite does/doesn't support here) --
+        // a multi-day job still only renders on its start day, so it gets a
+        // small "through <end date>" badge instead of a spanning bar.
+        const endBadge = tags.endDateLabel
+          ? `<div style="font-weight:700;font-size:9.5px;color:${color};text-transform:uppercase;letter-spacing:0.02em;">↦ through ${escapeHtml(tags.endDateLabel)}</div>`
+          : "";
         args.data.html =
           `<div style="font-weight:700;font-size:11px;color:#5a6472;font-variant-numeric:tabular-nums;">${time}</div>` +
           `<div style="font-weight:600;font-size:12.5px;color:#1c2536;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${customer}</div>` +
-          (service ? `<div style="font-size:11px;color:#5a6472;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${service}</div>` : "");
+          (service ? `<div style="font-size:11px;color:#5a6472;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${service}</div>` : "") +
+          endBadge;
       },
       // Fires after a drag completes. newResource is the technician column
       // id (technician id or "unassigned") the card was dropped on;
@@ -173,7 +209,13 @@ export function DispatchBoard() {
     setScheduleRange(day, day);
   }, [day]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Render jobs for the visible day as calendar events.
+  // Render jobs for the visible day as calendar events. Multi-day jobs
+  // (end_date set and after scheduled_date) only render on their START day
+  // -- DayPilot Lite's Resources view is a single-day board with no native
+  // "span N days" concept (see the module comment above), so a spanning bar
+  // isn't possible here. They get an end-date badge instead (see
+  // onBeforeEventRender's endDateLabel handling) rather than silently
+  // disappearing from the board on their later days.
   useEffect(() => {
     const calendar = calendarRef.current;
     if (!calendar) return;
@@ -182,6 +224,7 @@ export function DispatchBoard() {
       const start = new DayPilot.Date(`${j.scheduled_date}T${(j.scheduled_time || "09:00").padEnd(5, "0")}:00`);
       const end = start.addMinutes(j.duration || 60);
       const color = j.technician_color || j.service_type_color || "#1a2b4a";
+      const isMultiDay = !!j.end_date && j.end_date !== j.scheduled_date;
       return {
         id: j.id,
         text: `${j.customer_name || "—"}${j.service_type_name ? " · " + j.service_type_name : ""}`,
@@ -195,8 +238,9 @@ export function DispatchBoard() {
           time: formatTime(j.scheduled_time),
           customer: j.customer_name || "—",
           service: j.service_type_name || "",
+          endDateLabel: isMultiDay ? j.end_date! : undefined,
         },
-        toolTip: `${j.identifier} — ${j.customer_name || ""} (${j.status})`,
+        toolTip: `${j.identifier} — ${j.customer_name || ""} (${j.status})${isMultiDay ? ` — multi-day, through ${j.end_date}` : ""}`,
       };
     });
     calendar.update({ events });

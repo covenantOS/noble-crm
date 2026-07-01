@@ -4,7 +4,7 @@ import type {
   Job, Customer, Technician, ServiceType, Material, Invoice, Stats, PaginatedState,
   CustomerLookup, TechnicianLookup, Priority, Brand, Estimate,
   Attachment, AttachmentEntityType, AttachmentKind, Payment, PaymentMethod,
-  ServiceAgreement, EstimateRoom, ChangeOrder,
+  ServiceAgreement, EstimateRoom, ChangeOrder, JobCrewMember, Product,
 } from "./types";
 
 export interface CurrentUser {
@@ -45,6 +45,7 @@ export interface AppContextValue {
     is_recurring?: number;
     recurrence_interval?: string;
     brand_id?: number | null;
+    end_date?: string | null;
   }) => Promise<void>;
   updateJob: (id: number, data: Partial<Job>) => Promise<void>;
   deleteJob: (id: number) => Promise<void>;
@@ -73,6 +74,13 @@ export interface AppContextValue {
   addChangeOrder: (jobId: number, data: { description: string; amount: number }) => Promise<void>;
   approveChangeOrder: (id: number, jobId: number) => Promise<void>;
   rejectChangeOrder: (id: number, jobId: number) => Promise<void>;
+
+  // Job crew (many-to-many job<->technician, admin/office/estimator only)
+  addJobCrewMember: (jobId: number, technicianId: number, role?: string) => Promise<void>;
+  removeJobCrewMember: (jobId: number, crewId: number) => Promise<void>;
+
+  // Review request (admin/office/estimator only) -- honest { sent, reason }.
+  requestJobReview: (jobId: number) => Promise<{ sent: boolean; reason?: string }>;
 
   // Customers
   customers: Customer[];
@@ -110,9 +118,16 @@ export interface AppContextValue {
   updateMaterial: (id: number, data: Partial<Material>) => Promise<void>;
   deleteMaterial: (id: number) => Promise<void>;
 
+  // Products (TKC catalog) -- list open to all incl. technicians, mutations
+  // admin/office only (server-enforced; mirrors materials).
+  products: Product[];
+  addProduct: (data: Partial<Product>) => Promise<void>;
+  updateProduct: (id: number, data: Partial<Product>) => Promise<void>;
+  deleteProduct: (id: number) => Promise<void>;
+
   // Brands
   brands: Brand[];
-  addBrand: (data: { name: string; slug: string; color_primary?: string; color_secondary?: string; active?: number }) => Promise<void>;
+  addBrand: (data: { name: string; slug: string; color_primary?: string; color_secondary?: string; active?: number; review_url?: string }) => Promise<void>;
   updateBrand: (id: number, data: Partial<Brand>) => Promise<void>;
   uploadBrandLogo: (id: number, file: File) => Promise<void>;
 

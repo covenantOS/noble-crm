@@ -10,7 +10,7 @@ export function EstimateDetail() {
   const {
     selectedEstimate: estimate, navigate, updateEstimate, deleteEstimate,
     sendEstimate, approveEstimate, declineEstimate, addEstimateLine, deleteEstimateLine,
-    convertEstimate, brands, setError,
+    convertEstimate, brands, setError, products,
     estimateAttachments, fetchEstimateAttachments, uploadAttachment, deleteAttachment,
     setEstimateDeposit,
     estimateRooms, fetchEstimateRooms, addEstimateRoom, updateEstimateRoom, deleteEstimateRoom,
@@ -20,6 +20,9 @@ export function EstimateDetail() {
   const [lineDesc, setLineDesc] = useState("");
   const [lineQty, setLineQty] = useState("1");
   const [linePrice, setLinePrice] = useState("0");
+  // Product-picker convenience: selecting a product prefills description +
+  // unit_price. Purely additive -- a line can still be typed freehand.
+  const [linePickedProductId, setLinePickedProductId] = useState("");
   const [converting, setConverting] = useState(false);
   const [convertResult, setConvertResult] = useState<{ job_id: number; invoice_id: number; deposit_invoice_id: number | null } | null>(null);
   const photoFileInput = useRef<HTMLInputElement>(null);
@@ -110,7 +113,20 @@ export function EstimateDetail() {
     setLineDesc("");
     setLineQty("1");
     setLinePrice("0");
+    setLinePickedProductId("");
     setShowAddLine(false);
+  };
+
+  // Product-picker convenience: prefills description + unit_price from the
+  // selected product. Additive only -- doesn't stop the fields being
+  // hand-edited afterward.
+  const handlePickProduct = (productId: string) => {
+    setLinePickedProductId(productId);
+    const product = products.find((p) => String(p.id) === productId);
+    if (product) {
+      setLineDesc(product.name);
+      setLinePrice(String(product.unit_cost));
+    }
   };
 
   const handleConvert = async () => {
@@ -360,12 +376,24 @@ export function EstimateDetail() {
             </div>
 
             {showAddLine ? (
-              <div class="note-input-row" style={{ marginTop: 12 }}>
-                <input type="text" value={lineDesc} onInput={(e) => setLineDesc((e.target as HTMLInputElement).value)} placeholder="Description" style={{ flex: 2 }} />
-                <input type="number" step="0.01" min="0" value={lineQty} onInput={(e) => setLineQty((e.target as HTMLInputElement).value)} style={{ width: 70 }} placeholder="Qty" />
-                <input type="number" step="0.01" min="0" value={linePrice} onInput={(e) => setLinePrice((e.target as HTMLInputElement).value)} style={{ width: 90 }} placeholder="Unit Price" />
-                <button class="btn btn-primary btn-sm" onClick={handleAddLine}>Add</button>
-                <button class="btn btn-sm" onClick={() => setShowAddLine(false)}>Cancel</button>
+              <div style={{ marginTop: 12 }}>
+                {products.length > 0 && (
+                  <div class="note-input-row" style={{ marginBottom: 6 }}>
+                    <select value={linePickedProductId} onChange={(e) => handlePickProduct((e.target as HTMLSelectElement).value)} style={{ flex: 1 }}>
+                      <option value="">Prefill from product catalog (optional)...</option>
+                      {products.map((p) => (
+                        <option key={p.id} value={p.id}>{p.name}{p.brand_name ? ` (${p.brand_name})` : ""} — {formatMoney(p.unit_cost)}/{p.unit}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+                <div class="note-input-row">
+                  <input type="text" value={lineDesc} onInput={(e) => setLineDesc((e.target as HTMLInputElement).value)} placeholder="Description" style={{ flex: 2 }} />
+                  <input type="number" step="0.01" min="0" value={lineQty} onInput={(e) => setLineQty((e.target as HTMLInputElement).value)} style={{ width: 70 }} placeholder="Qty" />
+                  <input type="number" step="0.01" min="0" value={linePrice} onInput={(e) => setLinePrice((e.target as HTMLInputElement).value)} style={{ width: 90 }} placeholder="Unit Price" />
+                  <button class="btn btn-primary btn-sm" onClick={handleAddLine}>Add</button>
+                  <button class="btn btn-sm" onClick={() => setShowAddLine(false)}>Cancel</button>
+                </div>
               </div>
             ) : (
               <button class="btn btn-sm" onClick={() => setShowAddLine(true)} style={{ marginTop: 8 }}>

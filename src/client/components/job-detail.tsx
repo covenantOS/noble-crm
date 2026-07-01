@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import { useApp } from "../context";
 import { StatusBadge, PriorityBadge } from "./status-badge";
 import { formatDate, formatTime, formatDuration, formatDateTime, formatMoney } from "../format";
-import { ArrowLeft, Trash2, Send, MapPin, Clock, DollarSign, User, Wrench, Plus, X, CheckSquare, Square, Package, FileText, Palette, Camera, Edit3, Save, CheckCircle, Receipt, GitPullRequestArrow, Check, Ban } from "lucide-preact";
+import { ArrowLeft, Trash2, Send, MapPin, Clock, DollarSign, User, Wrench, Plus, X, CheckSquare, Square, Package, FileText, Palette, Camera, Edit3, Save, CheckCircle, Receipt, GitPullRequestArrow, Check, Ban, Users, ShieldCheck, Star } from "lucide-preact";
 import type { AttachmentKind, JobStatus, Priority } from "../types";
 
 const PRIORITIES: Priority[] = ["low", "normal", "high", "urgent"];
@@ -24,6 +24,7 @@ export function JobDetail() {
     jobAttachments, fetchJobAttachments, uploadAttachment, deleteAttachment,
     jobInvoices, fetchJobInvoices, addJobProgressInvoice,
     jobChangeOrders, fetchJobChangeOrders, addChangeOrder, approveChangeOrder, rejectChangeOrder,
+    addJobCrewMember, removeJobCrewMember, requestJobReview,
   } = useApp();
   // Technicians only have ownership of their own job's working fields
   // server-side -- reassignment (customer_id/technician_id), invoicing, and
@@ -42,13 +43,24 @@ export function JobDetail() {
   // Editable job-details panel (price/date/time/duration/priority/service).
   const [editingDetails, setEditingDetails] = useState(false);
   const [detailsForm, setDetailsForm] = useState({
-    price: "", scheduled_date: "", scheduled_time: "", duration: "", priority: "normal", service_type_id: "",
+    price: "", scheduled_date: "", scheduled_time: "", duration: "", priority: "normal", service_type_id: "", end_date: "",
   });
 
   // Completion flow.
   const [showComplete, setShowComplete] = useState(false);
   const [completionNotesInput, setCompletionNotesInput] = useState("");
+  const [warrantyMonthsInput, setWarrantyMonthsInput] = useState("");
   const [completing, setCompleting] = useState(false);
+
+  // Crew (many-to-many job<->technician, admin/office/estimator only).
+  const [showAddCrew, setShowAddCrew] = useState(false);
+  const [crewTechnicianId, setCrewTechnicianId] = useState("");
+  const [crewRole, setCrewRole] = useState("");
+  const [addingCrew, setAddingCrew] = useState(false);
+
+  // Review request.
+  const [reviewNotice, setReviewNotice] = useState<string | null>(null);
+  const [requestingReview, setRequestingReview] = useState(false);
 
   // Progress billing (additional invoices).
   const [showAddProgressInvoice, setShowAddProgressInvoice] = useState(false);
@@ -83,6 +95,7 @@ export function JobDetail() {
       duration: String(job.duration ?? ""),
       priority: job.priority || "normal",
       service_type_id: job.service_type_id != null ? String(job.service_type_id) : "",
+      end_date: job.end_date || "",
     });
     setEditingDetails(true);
   };
@@ -95,6 +108,7 @@ export function JobDetail() {
       duration: parseInt(detailsForm.duration, 10) || 60,
       priority: detailsForm.priority as Priority,
       service_type_id: detailsForm.service_type_id ? parseInt(detailsForm.service_type_id, 10) : null,
+      end_date: detailsForm.end_date || null,
     });
     setEditingDetails(false);
   };
@@ -102,15 +116,53 @@ export function JobDetail() {
   const handleComplete = async () => {
     setCompleting(true);
     try {
-      await updateJob(job.id, { status: "completed", completion_notes: completionNotesInput.trim() });
+      const months = parseInt(warrantyMonthsInput, 10);
+      await updateJob(job.id, {
+        status: "completed",
+        completion_notes: completionNotesInput.trim(),
+        ...(months > 0 ? { warranty_months: months } : {}),
+      });
       setShowComplete(false);
       setCompletionNotesInput("");
+      setWarrantyMonthsInput("");
     } finally {
       setCompleting(false);
     }
   };
 
   const canComplete = job.status !== "completed" && job.status !== "cancelled";
+
+  // Multi-day badge: shown whenever end_date is set and differs from
+  // scheduled_date -- null/equal-to-scheduled_date is a normal single-day job.
+  const isMultiDay = !!job.end_date && job.end_date !== job.scheduled_date;
+
+  const handleAddCrew = async () => {
+    if (!crewTechnicianId) return;
+    setAddingCrew(true);
+    try {
+      await addJobCrewMember(job.id, parseInt(crewTechnicianId, 10), crewRole.trim() || undefined);
+      setCrewTechnicianId("");
+      setCrewRole("");
+      setShowAddCrew(false);
+    } finally {
+      setAddingCrew(false);
+    }
+  };
+
+  const handleRequestReview = async () => {
+    setRequestingReview(true);
+    setReviewNotice(null);
+    try {
+      const res = await requestJobReview(job.id);
+      setReviewNotice(
+        res.sent
+          ? "Review request sent — the customer was emailed a link to leave a review."
+          : `Not sent (${res.reason || "unknown reason"}).`,
+      );
+    } finally {
+      setRequestingReview(false);
+    }
+  };
 
   const handlePhotoSelected = async (kind: AttachmentKind, e: Event) => {
     const input = e.target as HTMLInputElement;
@@ -185,6 +237,11 @@ export function JobDetail() {
               <CheckCircle size={14} /> Complete Job
             </button>
           )}
+          {canManageJob && job.status === "completed" && (
+            <button class="btn" onClick={handleRequestReview} disabled={requestingReview}>
+              <Star size={14} /> {requestingReview ? "Sending..." : "Request Review"}
+            </button>
+          )}
           {canManageJob && (
             <button class="btn" onClick={() => createInvoiceFromJob(job.id)}>
               <FileText size={14} /> Create Invoice
@@ -198,6 +255,12 @@ export function JobDetail() {
         </div>
       </div>
 
+      {reviewNotice && (
+        <div class="card" style={{ padding: 12, marginBottom: 16, borderColor: "var(--gold)" }}>
+          {reviewNotice}
+        </div>
+      )}
+
       {showComplete && (
         <div class="card" style={{ padding: 14, marginBottom: 16, borderColor: "var(--success)" }}>
           <h3 style={{ marginTop: 0 }}><CheckCircle size={16} style={{ verticalAlign: "text-bottom" }} /> Complete Job</h3>
@@ -209,6 +272,20 @@ export function JobDetail() {
             onInput={(e) => setCompletionNotesInput((e.target as HTMLTextAreaElement).value)}
             placeholder="Completion notes (work performed, results, follow-ups)..."
           />
+          <div style={{ marginTop: 10 }}>
+            <label class="detail-meta-label" style={{ display: "block", marginBottom: 4 }}>
+              <ShieldCheck size={13} style={{ verticalAlign: "text-bottom" }} /> Warranty (months, optional)
+            </label>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              style={{ width: 120 }}
+              value={warrantyMonthsInput}
+              onInput={(e) => setWarrantyMonthsInput((e.target as HTMLInputElement).value)}
+              placeholder="e.g. 12"
+            />
+          </div>
           <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
             <button class="btn btn-primary" onClick={handleComplete} disabled={completing}>
               {completing ? "Saving..." : "Mark Completed"}
@@ -224,6 +301,11 @@ export function JobDetail() {
             <span class="identifier-lg">{job.identifier}</span>
             <StatusBadge status={job.status} />
             <PriorityBadge priority={job.priority} />
+            {isMultiDay && (
+              <span class="service-pill" title={`Runs ${formatDate(job.scheduled_date)} – ${formatDate(job.end_date)}`}>
+                <Clock size={12} /> Multi-day: through {formatDate(job.end_date)}
+              </span>
+            )}
           </div>
 
           <div class="detail-meta-grid">
@@ -249,6 +331,13 @@ export function JobDetail() {
               <span class="detail-meta-label">Price</span>
               <span class="money">{formatMoney(job.price)}</span>
             </div>
+            {job.warranty_expires_at && (
+              <div class="detail-meta-item">
+                <ShieldCheck size={14} />
+                <span class="detail-meta-label">Warranty</span>
+                <span>Warranty until {formatDate(job.warranty_expires_at)}</span>
+              </div>
+            )}
             {job.service_type_name && (
               <div class="detail-meta-item">
                 <Wrench size={14} />
@@ -370,6 +459,65 @@ export function JobDetail() {
               <button class="btn btn-sm" onClick={() => setShowAddMaterial(true)}>
                 <Plus size={14} /> Add Material
               </button>
+            )}
+          </div>
+
+          {/* Crew -- many-to-many job<->technician. jobs.technician_id (shown
+              above under "Technician") stays the lead; this is ADDITIONAL
+              crew. Add/remove is admin/office/estimator only (mirrors the
+              server-side gate on reassigning the lead technician) --
+              technicians can see this list (it's how they know who else is on
+              their job) but never get the add/remove controls. */}
+          <div class="detail-section">
+            <h3><Users size={16} style={{ verticalAlign: "text-bottom" }} /> Crew</h3>
+            {(job.crew || []).length > 0 ? (
+              <div class="card" style={{ marginBottom: 12 }}>
+                <table class="table">
+                  <thead>
+                    <tr><th>Technician</th><th>Role</th>{canManageJob && <th></th>}</tr>
+                  </thead>
+                  <tbody>
+                    {(job.crew || []).map((cm) => (
+                      <tr key={cm.id} class="table-row">
+                        <td>
+                          <span class="tech-pill" style={{ borderColor: cm.technician_color || "#ccc" }}>
+                            <span class="tech-dot" style={{ background: cm.technician_color || "#ccc" }} />
+                            {cm.technician_name || "—"}
+                          </span>
+                          {!!cm.is_subcontractor && <span class="text-muted" style={{ marginLeft: 6, fontSize: 12 }}>1099</span>}
+                        </td>
+                        <td class="text-muted">{cm.role || "—"}</td>
+                        {canManageJob && (
+                          <td><button class="btn-icon danger" onClick={() => removeJobCrewMember(job.id, cm.id)}><Trash2 size={12} /></button></td>
+                        )}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p class="text-muted" style={{ marginTop: 0 }}>No additional crew on this job.</p>
+            )}
+            {canManageJob && (
+              showAddCrew ? (
+                <div class="note-input-row">
+                  <select value={crewTechnicianId} onChange={(e) => setCrewTechnicianId((e.target as HTMLSelectElement).value)} style={{ flex: 2 }}>
+                    <option value="">Select technician...</option>
+                    {technicianLookup
+                      .filter((t) => t.id !== job.technician_id && !(job.crew || []).some((cm) => cm.technician_id === t.id))
+                      .map((t) => (
+                        <option key={t.id} value={t.id}>{t.name}</option>
+                      ))}
+                  </select>
+                  <input type="text" value={crewRole} onInput={(e) => setCrewRole((e.target as HTMLInputElement).value)} placeholder="Role (optional, e.g. helper)" style={{ flex: 1 }} />
+                  <button class="btn btn-primary btn-sm" onClick={handleAddCrew} disabled={addingCrew || !crewTechnicianId}>{addingCrew ? "Adding..." : "Add"}</button>
+                  <button class="btn btn-sm" onClick={() => setShowAddCrew(false)}>Cancel</button>
+                </div>
+              ) : (
+                <button class="btn btn-sm" onClick={() => setShowAddCrew(true)}>
+                  <Plus size={14} /> Add Crew Member
+                </button>
+              )
             )}
           </div>
 
@@ -566,6 +714,10 @@ export function JobDetail() {
                   <input type="date" value={detailsForm.scheduled_date} onChange={(e) => setDetailsForm({ ...detailsForm, scheduled_date: (e.target as HTMLInputElement).value })} />
                 </div>
                 <div class="form-group full-width">
+                  <label>End Date (multi-day, optional)</label>
+                  <input type="date" min={detailsForm.scheduled_date || undefined} value={detailsForm.end_date} onChange={(e) => setDetailsForm({ ...detailsForm, end_date: (e.target as HTMLInputElement).value })} />
+                </div>
+                <div class="form-group full-width">
                   <label>Time</label>
                   <input type="time" value={detailsForm.scheduled_time} onChange={(e) => setDetailsForm({ ...detailsForm, scheduled_time: (e.target as HTMLInputElement).value })} />
                 </div>
@@ -591,6 +743,9 @@ export function JobDetail() {
               <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 10 }}>
                 <div class="detail-meta-item"><span class="detail-meta-label">Price</span><span class="money">{formatMoney(job.price)}</span></div>
                 <div class="detail-meta-item"><span class="detail-meta-label">Date</span><span>{formatDate(job.scheduled_date)}</span></div>
+                {isMultiDay && (
+                  <div class="detail-meta-item"><span class="detail-meta-label">End Date</span><span>{formatDate(job.end_date)}</span></div>
+                )}
                 <div class="detail-meta-item"><span class="detail-meta-label">Time</span><span>{formatTime(job.scheduled_time)}</span></div>
                 <div class="detail-meta-item"><span class="detail-meta-label">Duration</span><span>{formatDuration(job.duration)}</span></div>
                 <div class="detail-meta-item"><span class="detail-meta-label">Priority</span><span style={{ textTransform: "capitalize" }}>{job.priority}</span></div>

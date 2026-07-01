@@ -7,10 +7,10 @@ export function TechnicianList() {
   const { technicians, updateTechnician, deleteTechnician, isAgent } = useApp();
   const [showCreate, setShowCreate] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
-  const [editForm, setEditForm] = useState({ name: "", email: "", phone: "", color: "" });
+  const [editForm, setEditForm] = useState({ name: "", email: "", phone: "", color: "", is_subcontractor: 0 });
 
   const startEdit = (t: typeof technicians[0]) => {
-    setEditForm({ name: t.name, email: t.email, phone: t.phone, color: t.color });
+    setEditForm({ name: t.name, email: t.email, phone: t.phone, color: t.color, is_subcontractor: t.is_subcontractor || 0 });
     setEditingId(t.id);
   };
 
@@ -44,6 +44,7 @@ export function TechnicianList() {
                 <th>Name</th>
                 <th>Email</th>
                 <th>Phone</th>
+                <th>Type</th>
                 <th>Active Jobs</th>
                 <th>Status</th>
                 <th>Actions</th>
@@ -60,6 +61,12 @@ export function TechnicianList() {
                       <td><input type="text" value={editForm.name} onInput={(e) => setEditForm({ ...editForm, name: (e.target as HTMLInputElement).value })} class="inline-input" /></td>
                       <td><input type="email" value={editForm.email} onInput={(e) => setEditForm({ ...editForm, email: (e.target as HTMLInputElement).value })} class="inline-input" /></td>
                       <td><input type="tel" value={editForm.phone} onInput={(e) => setEditForm({ ...editForm, phone: (e.target as HTMLInputElement).value })} class="inline-input" /></td>
+                      <td>
+                        <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12 }}>
+                          <input type="checkbox" checked={!!editForm.is_subcontractor} onChange={(e) => setEditForm({ ...editForm, is_subcontractor: (e.target as HTMLInputElement).checked ? 1 : 0 })} style={{ width: "auto" }} />
+                          1099
+                        </label>
+                      </td>
                       <td>{t.job_count || 0}</td>
                       <td>
                         <span class="status-badge" data-status={t.active ? "active" : "inactive"}>
@@ -80,6 +87,7 @@ export function TechnicianList() {
                       <td class="text-bold">{t.name}</td>
                       <td class="text-muted">{t.email || "—"}</td>
                       <td class="text-muted">{t.phone || "—"}</td>
+                      <td class="text-muted">{t.is_subcontractor ? "1099" : "W-2"}</td>
                       <td>{t.job_count || 0}</td>
                       <td>
                         <button

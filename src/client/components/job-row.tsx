@@ -1,11 +1,12 @@
 import { useApp } from "../context";
 import { StatusBadge } from "./status-badge";
 import { formatDate, formatTime, formatMoney } from "../format";
-import { Trash2 } from "lucide-preact";
+import { Trash2, CalendarRange } from "lucide-preact";
 import type { Job } from "../types";
 
 export function JobRow({ job }: { job: Job }) {
   const { navigate, deleteJob, isAgent } = useApp();
+  const isMultiDay = !!job.end_date && job.end_date !== job.scheduled_date;
 
   return (
     <tr class="table-row clickable" onClick={() => navigate(`/jobs/${job.id}`)}>
@@ -18,7 +19,14 @@ export function JobRow({ job }: { job: Job }) {
           </span>
         )}
       </td>
-      <td>{formatDate(job.scheduled_date)}</td>
+      <td>
+        {formatDate(job.scheduled_date)}
+        {isMultiDay && (
+          <span class="text-muted" style={{ display: "inline-flex", alignItems: "center", gap: 3, marginLeft: 6, fontSize: 11 }} title={`Runs through ${formatDate(job.end_date)}`}>
+            <CalendarRange size={11} /> → {formatDate(job.end_date)}
+          </span>
+        )}
+      </td>
       <td class="text-muted">{formatTime(job.scheduled_time)}</td>
       <td>{job.customer_name || "—"}</td>
       <td>

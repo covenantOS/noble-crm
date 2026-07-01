@@ -1,5 +1,5 @@
 import { useApp } from "../context";
-import { LayoutDashboard, Briefcase, Users, Wrench, Settings, CalendarDays, FileText, ClipboardList, Package, LogOut, Palette, Repeat } from "lucide-preact";
+import { LayoutDashboard, Briefcase, Users, Wrench, Settings, CalendarDays, FileText, ClipboardList, Package, LogOut, Palette, Repeat, Hammer } from "lucide-preact";
 import { NobleMark } from "./noble-mark";
 import type { View } from "../types";
 
@@ -13,13 +13,16 @@ const navItems: { view: View; path: string; label: string; icon: typeof LayoutDa
   { view: "invoices", path: "/invoices", label: "Invoices", icon: FileText },
   { view: "service-agreements", path: "/service-agreements", label: "Recurring", icon: Repeat },
   { view: "materials", path: "/materials", label: "Materials", icon: Package },
+  { view: "products", path: "/products", label: "Products (TKC)", icon: Hammer },
   { view: "services", path: "/services", label: "Service Types", icon: Settings },
   { view: "brands", path: "/brands", label: "Brands", icon: Palette },
 ];
 
 // Resource families that the backend forbids technicians from (see the
 // blanket role-gate middleware in src/server/index.ts). Hidden from the nav
-// so a technician's UI never dead-ends into a 403.
+// so a technician's UI never dead-ends into a 403. products' mutations are
+// technician-blocked but its list (GET) is technician-readable, same as
+// materials -- kept visible in nav for parity with materials, not hidden.
 const TECHNICIAN_HIDDEN_VIEWS: View[] = ["customers", "technicians", "invoices", "estimates", "materials", "services", "brands", "service-agreements"];
 
 // Brand identity/colors/logo management is an office/admin task, not a

@@ -12,7 +12,9 @@
     "db:seed:local": "wrangler d1 execute westchase-fieldservice --local --file=src/server/seed.sql",
     "db:seed:remote": "wrangler d1 execute westchase-fieldservice --remote --file=src/server/seed.sql",
     "db:seed-brands:local": "wrangler d1 execute westchase-fieldservice --local --file=src/server/seed-brands.sql",
-    "db:seed-brands:remote": "wrangler d1 execute westchase-fieldservice --remote --file=src/server/seed-brands.sql"
+    "db:seed-brands:remote": "wrangler d1 execute westchase-fieldservice --remote --file=src/server/seed-brands.sql",
+    "db:seed-products:local": "wrangler d1 execute westchase-fieldservice --local --file=src/server/seed-products.sql",
+    "db:seed-products:remote": "wrangler d1 execute westchase-fieldservice --remote --file=src/server/seed-products.sql"
   },
   "dependencies": {
     "@daypilot/daypilot-lite-javascript": "^5.9.0",

@@ -59,6 +59,27 @@ function isValidCalendarDate(s: string): boolean {
 // z.string() that must be a real calendar date. Use .optional() at the call
 // site where the field is optional.
 const zDate = z.string().refine(isValidCalendarDate, { message: "Invalid date -- must be a real YYYY-MM-DD calendar date" });
+
+// Adds N calendar months to a "YYYY-MM-DD" date, clamping the day to the
+// target month's actual last day (e.g. Jan 31 + 1 month -> Feb 28, or Feb 29
+// in a leap year) instead of overflowing into the following month the way a
+// naive setMonth/setDate(31) would. Mirrors the same clamp-the-target-month
+// approach as advanceByInterval further down (used for service-agreement
+// recurrence) -- kept as its own small helper here rather than reusing
+// advanceByInterval directly, since that one is keyed on a fixed
+// "anchorDay" concept specific to recurring agreements, whereas warranty math
+// just needs "N months from THIS date" with no re-clamping anchor to track.
+// Used by updateJob's warranty_expires_at computation.
+function addCalendarMonths(dateStr: string, months: number): string {
+  const [y, m, d] = dateStr.split("-").map((n) => parseInt(n, 10));
+  const totalMonths = (m - 1) + months;
+  const targetYear = y + Math.floor(totalMonths / 12);
+  const targetMonth = ((totalMonths % 12) + 12) % 12; // 0-indexed, safe for negative months too
+  const daysInTargetMonth = new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate();
+  const targetDay = Math.min(d, daysInTargetMonth);
+  const dt = new Date(Date.UTC(targetYear, targetMonth, targetDay));
+  return dt.toISOString().split("T")[0];
+}
 // 24-hour HH:MM time.
 const zTime = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, { message: "Invalid time -- must be HH:MM (24-hour)" });
 // A required human-readable name: trimmed, non-empty.
@@ -78,6 +99,10 @@ const zMoney = z.number().nonnegative({ message: "Must not be negative" });
 const zPositive = z.number().positive({ message: "Must be greater than zero" });
 // Tax rate as a percentage 0..100.
 const zTaxRate = z.number().min(0, { message: "Tax rate cannot be negative" }).max(100, { message: "Tax rate cannot exceed 100" });
+
+// A review-site URL (Google/Yelp/Facebook/etc). Only validated as a URL when
+// present -- brands.review_url is nullable/optional (see /api/jobs/{id}/request-review).
+const zUrl = z.string().url({ message: "Must be a valid URL" });
 
 // Allowed value sets for previously-free-string status/enum fields. Kept as
 // consts so they're reusable in both the Zod schema and any error message.
@@ -326,7 +351,9 @@ app.use("/api/*", async (c, next) => {
   if (path.startsWith("/api/service-agreements")) {
     return c.json({ error: "forbidden" }, 403);
   }
-  if (isMutating && (path.startsWith("/api/materials") || path.startsWith("/api/service-types"))) {
+  // products (TKC catalog) mirrors materials exactly: read open to
+  // technicians, mutations admin/office only.
+  if (isMutating && (path.startsWith("/api/materials") || path.startsWith("/api/service-types") || path.startsWith("/api/products"))) {
     return c.json({ error: "forbidden" }, 403);
   }
   // Job creation assigns customer_id/technician_id arbitrarily -- the same
@@ -347,14 +374,36 @@ async function getOwnTechnicianId(db: ReturnType<typeof getDb>, userId: string):
   return tech?.id ?? null;
 }
 
+// SECURITY-CRITICAL (crews pass): "is this technician allowed to see/act on
+// this job" now has TWO ways to be true -- they're jobs.technician_id (the
+// "lead", unchanged/backward compatible) OR they're a row in job_crew for
+// this job (added crew member). This helper is the single predicate every
+// ownership check below is built on (requireOwnJobOrForbid, the job list/
+// schedule filters, getJob) -- extending it here, rather than duplicating the
+// "OR crew" logic at each call site, is what keeps every one of those call
+// sites consistent. Returns true iff ownTechId is non-null AND is either the
+// job's lead technician or listed in job_crew for that job.
+async function isJobOwnerOrCrew(db: ReturnType<typeof getDb>, jobId: number, ownTechId: number | null): Promise<boolean> {
+  if (ownTechId === null) return false;
+  const job = await db.select({ technicianId: schema.jobs.technicianId }).from(schema.jobs).where(eq(schema.jobs.id, jobId)).get();
+  if (!job) return false;
+  if (job.technicianId === ownTechId) return true;
+  const crewRow = await db
+    .select({ id: schema.jobCrew.id })
+    .from(schema.jobCrew)
+    .where(and(eq(schema.jobCrew.jobId, jobId), eq(schema.jobCrew.technicianId, ownTechId)))
+    .get();
+  return !!crewRow;
+}
+
 // For technician-restricted mutating routes: confirms the job identified by
-// jobId belongs to the requester's own technician. Returns a Response to
-// short-circuit with (403 forbidden) if not, or null if the caller may proceed.
+// jobId belongs to the requester's own technician (lead OR crew -- see
+// isJobOwnerOrCrew). Returns a Response to short-circuit with (403 forbidden)
+// if not, or null if the caller may proceed.
 async function requireOwnJobOrForbid(c: Context<AppBindings>, db: ReturnType<typeof getDb>, jobId: number) {
   const user = c.get("user");
   const ownTechId = await getOwnTechnicianId(db, user.id);
-  const job = await db.select({ technicianId: schema.jobs.technicianId }).from(schema.jobs).where(eq(schema.jobs.id, jobId)).get();
-  if (!job || ownTechId === null || job.technicianId !== ownTechId) {
+  if (!(await isJobOwnerOrCrew(db, jobId, ownTechId))) {
     return c.json({ error: "forbidden" }, 403);
   }
   return null;
@@ -368,6 +417,20 @@ async function requireOwnJobOrForbid(c: Context<AppBindings>, db: ReturnType<typ
 function requireAdminOrOfficeOrForbid(c: Context<AppBindings>) {
   const role = c.get("user").role;
   if (role !== "admin" && role !== "office") {
+    return c.json({ error: "forbidden" }, 403);
+  }
+  return null;
+}
+
+// Job-crew add/remove (and other admin/office/estimator, not-technician
+// surfaces) -- mirrors the existing gate on reassigning jobs.technician_id in
+// updateJob, which is simply "not technician" (the blanket technician
+// role-gate middleware already blocks every other role from reaching /api/*
+// at all, so this is equivalent to admin|office|estimator). Returns a
+// Response to short-circuit with (403 forbidden), or null if the caller may
+// proceed.
+function requireAdminOrOfficeOrEstimatorOrForbid(c: Context<AppBindings>) {
+  if (c.get("user").role === "technician") {
     return c.json({ error: "forbidden" }, 403);
   }
   return null;
@@ -457,6 +520,9 @@ const TechnicianSchema = z.object({
   color: z.string(),
   active: z.number().int(),
   job_count: z.number().int().optional(),
+  // NEW (1099 pass): purely informational/reporting flag -- no access-control
+  // implications. Defaults to 0 (W-2/employee) when not provided.
+  is_subcontractor: z.number().int(),
   created_at: z.string(),
 }).openapi("Technician");
 
@@ -479,6 +545,9 @@ const BrandSchema = z.object({
   color_secondary: z.string().nullable(),
   logo_r2_key: z.string().nullable(),
   active: z.number().int(),
+  // NEW (review-request pass): nullable review-site URL. See
+  // /api/jobs/{id}/request-review.
+  review_url: z.string().nullable().optional(),
 }).openapi("Brand");
 
 const EstimateSchema = z.object({
@@ -556,6 +625,19 @@ const JobNoteSchema = z.object({
   created_at: z.string(),
 }).openapi("JobNote");
 
+// NEW (crews pass): a job_crew row, with the technician's name/color/
+// is_subcontractor denormalized in for display (avatars/badges on job-detail)
+// without a second round-trip.
+const JobCrewMemberSchema = z.object({
+  id: z.number().int(),
+  job_id: z.number().int(),
+  technician_id: z.number().int(),
+  role: z.string().nullable(),
+  technician_name: z.string().nullable().optional(),
+  technician_color: z.string().nullable().optional(),
+  is_subcontractor: z.number().int().nullable().optional(),
+}).openapi("JobCrewMember");
+
 const AttachmentSchema = z.object({
   id: z.number().int(),
   entity_type: z.string(),
@@ -609,6 +691,13 @@ const JobSchema = z.object({
   brand_color_primary: z.string().nullable().optional(),
   brand_color_secondary: z.string().nullable().optional(),
   job_notes: z.array(JobNoteSchema).optional(),
+  crew: z.array(JobCrewMemberSchema).optional(),
+  // NEW (multi-day jobs): nullable end_date -- null/equal to scheduled_date
+  // means a normal single-day job.
+  end_date: z.string().nullable().optional(),
+  // NEW (warranty pass): nullable warranty term + derived expiry date.
+  warranty_months: z.number().int().nullable().optional(),
+  warranty_expires_at: z.string().nullable().optional(),
   created_at: z.string(),
   updated_at: z.string(),
 }).openapi("Job");
@@ -689,6 +778,9 @@ function jobJoinedSelect(db: ReturnType<typeof getDb>) {
       recurrence_interval: sql<string>`COALESCE(${schema.jobs.recurrenceInterval}, '')`,
       next_recurrence_date: sql<string>`COALESCE(${schema.jobs.nextRecurrenceDate}, '')`,
       brand_id: schema.jobs.brandId,
+      end_date: schema.jobs.endDate,
+      warranty_months: schema.jobs.warrantyMonths,
+      warranty_expires_at: schema.jobs.warrantyExpiresAt,
       created_at: sql<string>`COALESCE(${schema.jobs.createdAt}, '')`,
       updated_at: sql<string>`COALESCE(${schema.jobs.updatedAt}, '')`,
       customer_name: sql<string | undefined>`${schema.customers.name}`,
@@ -1015,13 +1107,19 @@ app.openapi(listJobs, async (c) => {
     conditions.push(eq(schema.jobs.status, q.status));
   }
   if (user.role === "technician") {
-    // Force-filter to the requester's own technician id, overriding any
-    // technician_id query param -- a technician may only ever see their own jobs.
+    // Force-filter to jobs the requester's own technician owns, overriding
+    // any technician_id query param -- a technician may only ever see their
+    // own jobs. "Own" now means lead (jobs.technician_id) OR crew member
+    // (job_crew), same broadened predicate as isJobOwnerOrCrew/
+    // requireOwnJobOrForbid -- an id-only IN-subquery is used here (rather
+    // than isJobOwnerOrCrew's per-job lookup) since this filters a list, not
+    // a single job.
     const ownTechId = await getOwnTechnicianId(db, user.id);
     if (ownTechId === null) {
       return c.json({ jobs: [], total: 0 }, 200);
     }
-    conditions.push(eq(schema.jobs.technicianId, ownTechId));
+    const crewJobIds = db.select({ jobId: schema.jobCrew.jobId }).from(schema.jobCrew).where(eq(schema.jobCrew.technicianId, ownTechId));
+    conditions.push(or(eq(schema.jobs.technicianId, ownTechId), inArray(schema.jobs.id, crewJobIds)));
   } else if (q.technician_id) {
     conditions.push(eq(schema.jobs.technicianId, parseInt(q.technician_id, 10)));
   }
@@ -1066,7 +1164,8 @@ app.openapi(getJob, async (c) => {
   const user = c.get("user");
   if (user.role === "technician") {
     const ownTechId = await getOwnTechnicianId(db, user.id);
-    if (ownTechId === null || job.technician_id !== ownTechId) {
+    // Lead (job.technician_id) OR crew member -- see isJobOwnerOrCrew.
+    if (!(await isJobOwnerOrCrew(db, idNum, ownTechId))) {
       return c.json({ error: "Job not found" }, 404);
     }
   }
@@ -1087,9 +1186,24 @@ app.openapi(getJob, async (c) => {
     .where(eq(schema.jobMaterials.jobId, idNum))
     .orderBy(asc(schema.jobMaterials.id))
     .all();
+  const crewRows = await db
+    .select({
+      id: schema.jobCrew.id,
+      jobId: schema.jobCrew.jobId,
+      technicianId: schema.jobCrew.technicianId,
+      role: schema.jobCrew.role,
+      technicianName: schema.technicians.name,
+      technicianColor: schema.technicians.color,
+      isSubcontractor: schema.technicians.isSubcontractor,
+    })
+    .from(schema.jobCrew)
+    .leftJoin(schema.technicians, eq(schema.jobCrew.technicianId, schema.technicians.id))
+    .where(eq(schema.jobCrew.jobId, idNum))
+    .orderBy(asc(schema.jobCrew.id))
+    .all();
   const notesOut = notes.map((n) => ({ id: n.id, job_id: n.jobId, content: n.content, created_at: n.createdAt ?? "" }));
   const checklistOut = checklist.map((ch) => ({ id: ch.id, job_id: ch.jobId, label: ch.label, checked: ch.checked, sort_order: ch.sortOrder }));
-  return c.json({ job: { ...job, job_notes: notesOut, checklist: checklistOut, job_materials: jobMaterials } }, 200);
+  return c.json({ job: { ...job, job_notes: notesOut, checklist: checklistOut, job_materials: jobMaterials, crew: crewRows.map(jobCrewOut) } }, 200);
 });
 
 const createJob = createRoute({
@@ -1112,6 +1226,10 @@ const createJob = createRoute({
         is_recurring: z.number().int().optional(),
         recurrence_interval: z.enum(RECURRENCE_INTERVALS).optional(),
         brand_id: z.number().int().nullable().optional(),
+        // NEW (multi-day jobs): nullable -- null/omitted means a normal
+        // single-day job. Cross-field (>= scheduled_date) validated below,
+        // not in the Zod schema, since it needs scheduled_date's own value.
+        end_date: zDate.nullable().optional(),
       }) } },
     },
   },
@@ -1132,6 +1250,9 @@ app.openapi(createJob, async (c) => {
   if (!(await technicianExists(db, data.technician_id))) return c.json({ error: "Technician not found" }, 400);
   if (!(await serviceTypeExists(db, data.service_type_id))) return c.json({ error: "Service type not found" }, 400);
   if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
+  if (data.end_date != null && data.end_date < data.scheduled_date) {
+    return c.json({ error: "end_date cannot be before scheduled_date" }, 400);
+  }
 
   const identifier = await nextIdentifier(db);
 
@@ -1179,6 +1300,7 @@ app.openapi(createJob, async (c) => {
     isRecurring: data.is_recurring || 0,
     recurrenceInterval: data.recurrence_interval || "",
     brandId: data.brand_id ?? null,
+    endDate: data.end_date ?? null,
   });
 
   const job = await jobJoinedSelect(db).where(eq(schema.jobs.identifier, identifier)).get();
@@ -1212,6 +1334,13 @@ const updateJob = createRoute({
         // carries recurrence_interval as a plain string that can be empty.
         recurrence_interval: z.union([z.literal(""), z.enum(RECURRENCE_INTERVALS)]).optional(),
         brand_id: z.number().int().nullable().optional(),
+        // NEW (multi-day jobs): nullable -- see createJob's comment.
+        end_date: zDate.nullable().optional(),
+        // NEW (warranty pass): optionally accepted alongside status:"completed"
+        // (or any update once the job is already completed) -- when provided
+        // and > 0, warranty_expires_at is computed server-side from the
+        // completion date. 0/omitted leaves warranty untouched.
+        warranty_months: z.number().int().positive().nullable().optional(),
       }) } },
     },
   },
@@ -1236,6 +1365,12 @@ app.openapi(updateJob, async (c) => {
   if (!(await technicianExists(db, data.technician_id))) return c.json({ error: "Technician not found" }, 400);
   if (!(await serviceTypeExists(db, data.service_type_id))) return c.json({ error: "Service type not found" }, 400);
   if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
+  if (data.end_date != null) {
+    const scheduledDate = data.scheduled_date ?? existing.scheduledDate;
+    if (data.end_date < scheduledDate) {
+      return c.json({ error: "end_date cannot be before scheduled_date" }, 400);
+    }
+  }
 
   const user = c.get("user");
   const isTechnician = user.role === "technician";
@@ -1267,6 +1402,25 @@ app.openapi(updateJob, async (c) => {
   if (data.is_recurring !== undefined) updates.isRecurring = data.is_recurring;
   if (data.recurrence_interval !== undefined) updates.recurrenceInterval = data.recurrence_interval;
   if (data.brand_id !== undefined) updates.brandId = data.brand_id;
+  if (data.end_date !== undefined) updates.endDate = data.end_date;
+
+  // Warranty: only computed when warranty_months is provided AND > 0 (the
+  // Zod schema already enforces positive-or-null/undefined, but 0 can't
+  // occur -- z.number().int().positive() rejects 0). Uses the completion
+  // date -- the job's status AFTER this update (either being set to
+  // "completed" right now, or already completed) -- as the anchor for
+  // warranty_expires_at, via addCalendarMonths for month-length-safe math.
+  // A job going to "completed" without an updated_at yet still has today's
+  // date as its effective completion day, so today (Tampa) is used as the
+  // anchor rather than reading back updated_at.
+  if (data.warranty_months != null) {
+    const resultingStatus = data.status ?? existing.status;
+    if (resultingStatus !== "completed") {
+      return c.json({ error: "warranty_months can only be set when the job is completed" }, 400);
+    }
+    updates.warrantyMonths = data.warranty_months;
+    updates.warrantyExpiresAt = addCalendarMonths(todayInTampa(), data.warranty_months);
+  }
 
   if (Object.keys(updates).length > 0) {
     updates.updatedAt = sql`(datetime('now'))`;
@@ -1301,6 +1455,200 @@ app.openapi(deleteJob, async (c) => {
   const { id } = c.req.valid("param");
   await db.delete(schema.jobs).where(eq(schema.jobs.id, toId(id)));
   return c.json({ ok: true }, 200);
+});
+
+// ── Job Crew (many-to-many job<->technician) ──────────────────────
+// jobs.technician_id remains the "lead" technician, unchanged -- job_crew is
+// ADDITIONAL crew beyond the lead. Adding/removing crew is admin/office/
+// estimator only (mirrors the existing gate on reassigning technician_id via
+// updateJob, which is also blocked for technicians) -- NOT technicians, even
+// for their own job, since this changes who else can act on it (an access
+// grant), not a working-field edit.
+function jobCrewOut(row: { id: number; jobId: number; technicianId: number; role: string | null; technicianName?: string | null; technicianColor?: string | null; isSubcontractor?: number | null }) {
+  return {
+    id: row.id,
+    job_id: row.jobId,
+    technician_id: row.technicianId,
+    role: row.role,
+    technician_name: row.technicianName ?? null,
+    technician_color: row.technicianColor ?? null,
+    is_subcontractor: row.isSubcontractor ?? null,
+  };
+}
+
+const listJobCrew = createRoute({
+  method: "get",
+  path: "/api/jobs/{id}/crew",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Crew for a job", content: { "application/json": { schema: z.object({ crew: z.array(JobCrewMemberSchema) }) } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(listJobCrew, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  if (!(await jobExists(db, idNum))) return c.json({ error: "Job not found" }, 404);
+  // Technicians may read crew for jobs they own (lead or crew) -- same
+  // ownership predicate as everywhere else; not a blanket technician block
+  // since crew membership is exactly what job-detail needs to render for them.
+  if (c.get("user").role === "technician") {
+    const forbidden = await requireOwnJobOrForbid(c, db, idNum);
+    if (forbidden) return forbidden;
+  }
+  const rows = await db
+    .select({
+      id: schema.jobCrew.id,
+      jobId: schema.jobCrew.jobId,
+      technicianId: schema.jobCrew.technicianId,
+      role: schema.jobCrew.role,
+      technicianName: schema.technicians.name,
+      technicianColor: schema.technicians.color,
+      isSubcontractor: schema.technicians.isSubcontractor,
+    })
+    .from(schema.jobCrew)
+    .leftJoin(schema.technicians, eq(schema.jobCrew.technicianId, schema.technicians.id))
+    .where(eq(schema.jobCrew.jobId, idNum))
+    .orderBy(asc(schema.jobCrew.id))
+    .all();
+  return c.json({ crew: rows.map(jobCrewOut) }, 200);
+});
+
+const addJobCrew = createRoute({
+  method: "post",
+  path: "/api/jobs/{id}/crew",
+  request: {
+    params: IdParam,
+    body: { content: { "application/json": { schema: z.object({
+      technician_id: z.number().int(),
+      role: z.string().trim().optional(),
+    }) } } },
+  },
+  responses: {
+    201: { description: "Added", content: { "application/json": { schema: JobCrewMemberSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Job not found", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Already on crew", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(addJobCrew, async (c) => {
+  const forbidden = requireAdminOrOfficeOrEstimatorOrForbid(c);
+  if (forbidden) return forbidden;
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  if (!(await jobExists(db, idNum))) return c.json({ error: "Job not found" }, 404);
+  const data = c.req.valid("json");
+  if (!(await technicianExists(db, data.technician_id))) return c.json({ error: "Technician not found" }, 400);
+  const existing = await db
+    .select({ id: schema.jobCrew.id })
+    .from(schema.jobCrew)
+    .where(and(eq(schema.jobCrew.jobId, idNum), eq(schema.jobCrew.technicianId, data.technician_id)))
+    .get();
+  if (existing) return c.json({ error: "Technician is already on this job's crew" }, 409);
+  await db.insert(schema.jobCrew).values({ jobId: idNum, technicianId: data.technician_id, role: data.role || null });
+  const row = await db
+    .select({
+      id: schema.jobCrew.id,
+      jobId: schema.jobCrew.jobId,
+      technicianId: schema.jobCrew.technicianId,
+      role: schema.jobCrew.role,
+      technicianName: schema.technicians.name,
+      technicianColor: schema.technicians.color,
+      isSubcontractor: schema.technicians.isSubcontractor,
+    })
+    .from(schema.jobCrew)
+    .leftJoin(schema.technicians, eq(schema.jobCrew.technicianId, schema.technicians.id))
+    .where(and(eq(schema.jobCrew.jobId, idNum), eq(schema.jobCrew.technicianId, data.technician_id)))
+    .get();
+  return c.json(jobCrewOut(row!), 201);
+});
+
+const deleteJobCrew = createRoute({
+  method: "delete",
+  path: "/api/jobs/{id}/crew/{crewId}",
+  request: { params: z.object({ id: z.string(), crewId: z.string() }) },
+  responses: {
+    200: { description: "Removed", content: { "application/json": { schema: OkSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(deleteJobCrew, async (c) => {
+  const forbidden = requireAdminOrOfficeOrEstimatorOrForbid(c);
+  if (forbidden) return forbidden;
+  const db = getDb(c.env);
+  const { id, crewId } = c.req.valid("param");
+  const idNum = toId(id);
+  const crewIdNum = toId(crewId);
+  const row = await db.select({ id: schema.jobCrew.id }).from(schema.jobCrew).where(and(eq(schema.jobCrew.id, crewIdNum), eq(schema.jobCrew.jobId, idNum))).get();
+  if (!row) return c.json({ error: "Crew member not found" }, 404);
+  await db.delete(schema.jobCrew).where(eq(schema.jobCrew.id, crewIdNum));
+  return c.json({ ok: true }, 200);
+});
+
+// ── Review request ──────────────────────────────────────────────────
+// admin/office/estimator only (not technicians -- same gate as job crew
+// above). Honest { sent, reason } shape, same contract as sendEmail/the
+// estimate-send flow -- never a fake success when unconfigured/no key/no
+// review_url/no customer email. Reuses the EXISTING sendEmail() from
+// src/lib/notify.ts rather than reinventing delivery.
+const requestJobReview = createRoute({
+  method: "post",
+  path: "/api/jobs/{id}/request-review",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Attempted", content: { "application/json": { schema: z.object({ sent: z.boolean(), reason: z.string().optional() }) } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(requestJobReview, async (c) => {
+  const forbidden = requireAdminOrOfficeOrEstimatorOrForbid(c);
+  if (forbidden) return forbidden;
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const job = await db
+    .select({ id: schema.jobs.id, brandId: schema.jobs.brandId, customerId: schema.jobs.customerId })
+    .from(schema.jobs)
+    .where(eq(schema.jobs.id, idNum))
+    .get();
+  if (!job) return c.json({ error: "Job not found" }, 404);
+
+  if (!job.brandId) {
+    return c.json({ sent: false, reason: "job has no brand" }, 200);
+  }
+  const brand = await db.select({ name: schema.brands.name, reviewUrl: schema.brands.reviewUrl }).from(schema.brands).where(eq(schema.brands.id, job.brandId)).get();
+  if (!brand?.reviewUrl) {
+    return c.json({ sent: false, reason: "brand has no review_url configured" }, 200);
+  }
+  const customer = await db.select({ name: schema.customers.name, email: schema.customers.email }).from(schema.customers).where(eq(schema.customers.id, job.customerId)).get();
+  if (!customer?.email) {
+    return c.json({ sent: false, reason: "customer has no email on file" }, 200);
+  }
+
+  const result = await sendEmail(c.env, {
+    to: customer.email,
+    subject: `How did we do, ${customer.name || "there"}?`,
+    html:
+      `<div style="font-family:Georgia,serif;color:#1a2b4a">` +
+      `<p>Hi ${escapeHtml(customer.name || "there")},</p>` +
+      `<p>Thank you for choosing ${escapeHtml(brand.name)}! We'd love to hear about your experience.</p>` +
+      `<p><a href="${brand.reviewUrl}" style="display:inline-block;padding:10px 18px;background:#1a2b4a;color:#fff;text-decoration:none;border-radius:6px">Leave us a review</a></p>` +
+      `<p style="font-size:13px;color:#5a6478">Or paste this link into your browser:<br>${escapeHtml(brand.reviewUrl)}</p>` +
+      `<p style="font-size:13px;color:#5a6478">Thank you,<br>${escapeHtml(brand.name)} — Tampa, FL</p>` +
+      `</div>`,
+    text: `Thank you for choosing ${brand.name}! We'd love your feedback: ${brand.reviewUrl}`,
+  });
+  return c.json({ sent: result.sent, reason: result.reason }, 200);
 });
 
 // ── Job Notes ──────────────────────────────────────────────────────
@@ -1955,6 +2303,7 @@ app.openapi(listTechnicians, async (c) => {
       phone: schema.technicians.phone,
       color: schema.technicians.color,
       active: schema.technicians.active,
+      is_subcontractor: schema.technicians.isSubcontractor,
       created_at: sql<string>`COALESCE(${schema.technicians.createdAt}, '')`,
       job_count: sql<number>`COALESCE(${jobCountSub.cnt}, 0)`,
     })
@@ -1997,6 +2346,7 @@ const createTechnician = createRoute({
         email: z.string().optional(),
         phone: z.string().optional(),
         color: z.string().optional(),
+        is_subcontractor: z.number().int().optional(),
       }) } },
     },
   },
@@ -2014,6 +2364,7 @@ app.openapi(createTechnician, async (c) => {
     email: data.email || "",
     phone: data.phone || "",
     color: data.color || "#16a34a",
+    isSubcontractor: data.is_subcontractor || 0,
   });
   const tech = await db.select().from(schema.technicians).orderBy(desc(schema.technicians.id)).limit(1).get();
   const techOut = {
@@ -2023,6 +2374,7 @@ app.openapi(createTechnician, async (c) => {
     phone: tech!.phone,
     color: tech!.color,
     active: tech!.active,
+    is_subcontractor: tech!.isSubcontractor,
     created_at: tech!.createdAt ?? "",
   };
   return c.json(techOut, 201);
@@ -2040,6 +2392,7 @@ const updateTechnician = createRoute({
         phone: z.string().optional(),
         color: z.string().optional(),
         active: z.number().int().optional(),
+        is_subcontractor: z.number().int().optional(),
       }) } },
     },
   },
@@ -2058,6 +2411,7 @@ app.openapi(updateTechnician, async (c) => {
   if (data.phone !== undefined) updates.phone = data.phone;
   if (data.color !== undefined) updates.color = data.color;
   if (data.active !== undefined) updates.active = data.active;
+  if (data.is_subcontractor !== undefined) updates.isSubcontractor = data.is_subcontractor;
   if (Object.keys(updates).length > 0) {
     await db.update(schema.technicians).set(updates).where(eq(schema.technicians.id, toId(id)));
   }
@@ -2244,12 +2598,18 @@ app.openapi(listBrands, async (c) => {
       color_secondary: schema.brands.colorSecondary,
       logo_r2_key: schema.brands.logoR2Key,
       active: schema.brands.active,
+      review_url: schema.brands.reviewUrl,
     })
     .from(schema.brands)
     .orderBy(asc(schema.brands.name))
     .all();
   return c.json({ brands }, 200);
 });
+
+// review_url: accepts a real URL, "" (explicitly clear it), or omitted --
+// only validated as a URL when a non-empty value is present, matching the
+// build instruction ("validated as a URL when present").
+const zReviewUrl = z.union([zUrl, z.literal("")]).optional();
 
 const createBrand = createRoute({
   method: "post",
@@ -2262,6 +2622,7 @@ const createBrand = createRoute({
         color_primary: zHexColor.optional(),
         color_secondary: zHexColor.optional(),
         active: z.number().int().optional(),
+        review_url: zReviewUrl,
       }) } },
     },
   },
@@ -2283,6 +2644,7 @@ app.openapi(createBrand, async (c) => {
     colorPrimary: data.color_primary ?? null,
     colorSecondary: data.color_secondary ?? null,
     active: data.active ?? 1,
+    reviewUrl: data.review_url || null,
   });
   const brand = await db.select().from(schema.brands).orderBy(desc(schema.brands.id)).limit(1).get();
   const brandOut = {
@@ -2293,6 +2655,7 @@ app.openapi(createBrand, async (c) => {
     color_secondary: brand!.colorSecondary,
     logo_r2_key: brand!.logoR2Key,
     active: brand!.active,
+    review_url: brand!.reviewUrl,
   };
   return c.json(brandOut, 201);
 });
@@ -2309,6 +2672,7 @@ const updateBrand = createRoute({
         color_primary: zHexColor.optional(),
         color_secondary: zHexColor.optional(),
         active: z.number().int().optional(),
+        review_url: zReviewUrl,
       }) } },
     },
   },
@@ -2331,6 +2695,7 @@ app.openapi(updateBrand, async (c) => {
   if (data.color_primary !== undefined) updates.colorPrimary = data.color_primary;
   if (data.color_secondary !== undefined) updates.colorSecondary = data.color_secondary;
   if (data.active !== undefined) updates.active = data.active;
+  if (data.review_url !== undefined) updates.reviewUrl = data.review_url || null;
   if (Object.keys(updates).length > 0) {
     await db.update(schema.brands).set(updates).where(eq(schema.brands.id, toId(id)));
   }
@@ -2464,13 +2829,16 @@ app.openapi(getSchedule, async (c) => {
   const user = c.get("user");
   const conditions = [sql`${schema.jobs.scheduledDate} >= ${q.start}`, sql`${schema.jobs.scheduledDate} <= ${q.end}`];
   if (user.role === "technician") {
-    // Force-filter to the requester's own technician id, overriding any
-    // technician_id query param.
+    // Force-filter to the requester's own technician (lead OR crew -- see
+    // isJobOwnerOrCrew/listJobs), overriding any technician_id query param.
     const ownTechId = await getOwnTechnicianId(db, user.id);
     if (ownTechId === null) {
       return c.json({ jobs: [] }, 200);
     }
-    conditions.push(eq(schema.jobs.technicianId, ownTechId));
+    const crewJobIds = db.select({ jobId: schema.jobCrew.jobId }).from(schema.jobCrew).where(eq(schema.jobCrew.technicianId, ownTechId));
+    // Non-null assert: or() is only undefined when called with zero
+    // arguments, and it's always given exactly two here.
+    conditions.push(or(eq(schema.jobs.technicianId, ownTechId), inArray(schema.jobs.id, crewJobIds))!);
   } else if (q.technician_id) {
     conditions.push(eq(schema.jobs.technicianId, parseInt(q.technician_id, 10)));
   }
@@ -2681,6 +3049,158 @@ app.openapi(deleteMaterial, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
   await db.delete(schema.materials).where(eq(schema.materials.id, toId(id)));
+  return c.json({ ok: true }, 200);
+});
+
+// ── Products (TKC catalog) ────────────────────────────────────────
+// A product catalog distinct from the painting `materials` table above --
+// Tampa Kitchen Cabinets (a second brand on this platform) sells door
+// styles/hardware/countertops, not paint materials. CRUD mirrors the
+// materials routes' pattern exactly: list is readable by everyone incl.
+// technicians (no role check in the handler, gated only by the general
+// auth-required middleware), mutations are blocked for technicians by the
+// same blanket "isMutating && /api/materials" style rule in the technician
+// role-gate middleware above (extended to /api/products alongside it).
+
+const ProductSchema = z.object({
+  id: z.number().int(),
+  brand_id: z.number().int().nullable(),
+  name: z.string(),
+  sku: z.string().nullable(),
+  category: z.string().nullable(),
+  unit_cost: z.number(),
+  unit: z.string(),
+  active: z.number().int(),
+  brand_name: z.string().nullable().optional(),
+}).openapi("Product");
+
+const listProducts = createRoute({
+  method: "get",
+  path: "/api/products",
+  request: { query: z.object({ brand_id: z.string().optional() }) },
+  responses: {
+    200: {
+      description: "All products",
+      content: { "application/json": { schema: z.object({ products: z.array(ProductSchema) }) } },
+    },
+  },
+});
+
+app.openapi(listProducts, async (c) => {
+  const db = getDb(c.env);
+  const q = c.req.valid("query");
+  const conditions = [];
+  if (q.brand_id) conditions.push(eq(schema.products.brandId, parseInt(q.brand_id, 10)));
+  const where = conditions.length > 0 ? and(...conditions) : undefined;
+  const products = await db
+    .select({
+      id: schema.products.id,
+      brand_id: schema.products.brandId,
+      name: schema.products.name,
+      sku: schema.products.sku,
+      category: schema.products.category,
+      unit_cost: schema.products.unitCost,
+      unit: schema.products.unit,
+      active: schema.products.active,
+      brand_name: schema.brands.name,
+    })
+    .from(schema.products)
+    .leftJoin(schema.brands, eq(schema.products.brandId, schema.brands.id))
+    .where(where)
+    .orderBy(asc(schema.products.name))
+    .all();
+  return c.json({ products }, 200);
+});
+
+const createProduct = createRoute({
+  method: "post",
+  path: "/api/products",
+  request: {
+    body: { content: { "application/json": { schema: z.object({
+      brand_id: z.number().int().nullable().optional(),
+      name: zName,
+      sku: z.string().optional(),
+      category: z.string().optional(),
+      unit_cost: zMoney.optional(),
+      unit: z.string().optional(),
+      active: z.number().int().optional(),
+    }) } } },
+  },
+  responses: {
+    201: { description: "Created", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(createProduct, async (c) => {
+  const db = getDb(c.env);
+  const data = c.req.valid("json");
+  if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
+  await db.insert(schema.products).values({
+    brandId: data.brand_id ?? null,
+    name: data.name,
+    sku: data.sku || null,
+    category: data.category || null,
+    unitCost: data.unit_cost || 0,
+    unit: data.unit || "ea",
+    active: data.active ?? 1,
+  });
+  return c.json({ ok: true }, 201);
+});
+
+const updateProduct = createRoute({
+  method: "put",
+  path: "/api/products/{id}",
+  request: {
+    params: IdParam,
+    body: { content: { "application/json": { schema: z.object({
+      brand_id: z.number().int().nullable().optional(),
+      name: zName.optional(),
+      sku: z.string().optional(),
+      category: z.string().optional(),
+      unit_cost: zMoney.optional(),
+      unit: z.string().optional(),
+      active: z.number().int().optional(),
+    }) } } },
+  },
+  responses: {
+    200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(updateProduct, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const data = c.req.valid("json");
+  if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
+  const updates: Record<string, unknown> = {};
+  if (data.brand_id !== undefined) updates.brandId = data.brand_id;
+  if (data.name !== undefined) updates.name = data.name;
+  if (data.sku !== undefined) updates.sku = data.sku;
+  if (data.category !== undefined) updates.category = data.category;
+  if (data.unit_cost !== undefined) updates.unitCost = data.unit_cost;
+  if (data.unit !== undefined) updates.unit = data.unit;
+  if (data.active !== undefined) updates.active = data.active;
+  if (Object.keys(updates).length > 0) {
+    await db.update(schema.products).set(updates).where(eq(schema.products.id, toId(id)));
+  }
+  return c.json({ ok: true }, 200);
+});
+
+const deleteProduct = createRoute({
+  method: "delete",
+  path: "/api/products/{id}",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Deleted", content: { "application/json": { schema: OkSchema } } },
+  },
+});
+
+app.openapi(deleteProduct, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  await db.delete(schema.products).where(eq(schema.products.id, toId(id)));
   return c.json({ ok: true }, 200);
 });
 

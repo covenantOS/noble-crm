@@ -18,6 +18,7 @@ export function CreateBrand({ onClose }: { onClose: () => void }) {
   const [slugTouched, setSlugTouched] = useState(false);
   const [colorPrimary, setColorPrimary] = useState("#1a2b4a");
   const [colorSecondary, setColorSecondary] = useState("#c9a227");
+  const [reviewUrl, setReviewUrl] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
   const handleNameInput = (value: string) => {
@@ -36,6 +37,7 @@ export function CreateBrand({ onClose }: { onClose: () => void }) {
         slug: slug.trim(),
         color_primary: colorPrimary,
         color_secondary: colorSecondary,
+        ...(reviewUrl.trim() ? { review_url: reviewUrl.trim() } : {}),
       });
       onClose();
     } catch (err) {
@@ -75,6 +77,10 @@ export function CreateBrand({ onClose }: { onClose: () => void }) {
             <div class="form-group">
               <label>Secondary Color</label>
               <input type="color" value={colorSecondary} onChange={(e) => setColorSecondary((e.target as HTMLInputElement).value)} />
+            </div>
+            <div class="form-group full-width">
+              <label>Review Link (optional)</label>
+              <input type="url" value={reviewUrl} onInput={(e) => setReviewUrl((e.target as HTMLInputElement).value)} placeholder="https://g.page/r/.../review" />
             </div>
           </div>
           <div class="modal-footer">

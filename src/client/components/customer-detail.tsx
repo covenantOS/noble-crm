@@ -188,7 +188,7 @@ export function CustomerDetail() {
               <div class="card">
                 <table class="table">
                   <thead>
-                    <tr><th>ID</th><th>Date</th><th>Service</th><th>Technician</th><th>Status</th><th>Price</th></tr>
+                    <tr><th>ID</th><th>Date</th><th>Service</th><th>Technician</th><th>Status</th><th>Warranty</th><th>Price</th></tr>
                   </thead>
                   <tbody>
                     {jobs.map((j) => (
@@ -198,6 +198,7 @@ export function CustomerDetail() {
                         <td>{j.service_type_name || "—"}</td>
                         <td>{j.technician_name || "Unassigned"}</td>
                         <td><StatusBadge status={j.status} /></td>
+                        <td class="text-muted">{j.warranty_expires_at ? `Warranty until ${formatDate(j.warranty_expires_at)}` : "—"}</td>
                         <td class="text-right money">{formatMoney(j.price)}</td>
                       </tr>
                     ))}

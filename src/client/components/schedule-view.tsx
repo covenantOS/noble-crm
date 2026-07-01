@@ -1,8 +1,9 @@
 import { useState } from "preact/hooks";
 import { useApp } from "../context";
-import { formatTime } from "../format";
-import { ChevronLeft, ChevronRight, List, LayoutGrid } from "lucide-preact";
+import { formatTime, formatDate } from "../format";
+import { ChevronLeft, ChevronRight, List, LayoutGrid, CalendarRange } from "lucide-preact";
 import { DispatchBoard } from "./dispatch-board";
+import type { Job } from "../types";
 
 function getDaysInRange(start: string, end: string): string[] {
   const days: string[] = [];
@@ -13,6 +14,18 @@ function getDaysInRange(start: string, end: string): string[] {
     d.setDate(d.getDate() + 1);
   }
   return days;
+}
+
+// A job "occupies" a calendar day if the day falls within
+// [scheduled_date, end_date] inclusive. Jobs with no end_date (or an
+// end_date equal to scheduled_date) are normal single-day jobs and only
+// occupy their one day, same as before this multi-day support was added.
+function jobOccupiesDay(job: Job, day: string): boolean {
+  if (job.scheduled_date === day) return true;
+  if (job.end_date && job.end_date !== job.scheduled_date) {
+    return day >= job.scheduled_date && day <= job.end_date;
+  }
+  return false;
 }
 
 const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -92,7 +105,7 @@ export function ScheduleView() {
       ) : (
       <div class="schedule-grid">
         {days.map((day) => {
-          const dayJobs = scheduleJobs.filter((j) => j.scheduled_date === day);
+          const dayJobs = scheduleJobs.filter((j) => jobOccupiesDay(j, day));
           const dateObj = new Date(day + "T00:00:00");
           const isToday = day === todayStr;
           return (
@@ -102,19 +115,27 @@ export function ScheduleView() {
                 <span class={`schedule-day-num ${isToday ? "today" : ""}`}>{dateObj.getDate()}</span>
               </div>
               <div class="schedule-day-jobs">
-                {dayJobs.map((job) => (
-                  <button
-                    key={job.id}
-                    class="schedule-job"
-                    style={{ borderLeftColor: job.technician_color || job.service_type_color || "#16a34a" }}
-                    onClick={() => navigate(`/jobs/${job.id}`)}
-                  >
-                    <div class="schedule-job-time">{formatTime(job.scheduled_time)}</div>
-                    <div class="schedule-job-title">{job.customer_name}</div>
-                    {job.service_type_name && <div class="schedule-job-service">{job.service_type_name}</div>}
-                    {job.technician_name && <div class="schedule-job-tech">{job.technician_name}</div>}
-                  </button>
-                ))}
+                {dayJobs.map((job) => {
+                  const isMultiDay = !!job.end_date && job.end_date !== job.scheduled_date;
+                  return (
+                    <button
+                      key={job.id}
+                      class="schedule-job"
+                      style={{ borderLeftColor: job.technician_color || job.service_type_color || "#16a34a" }}
+                      onClick={() => navigate(`/jobs/${job.id}`)}
+                    >
+                      <div class="schedule-job-time">{formatTime(job.scheduled_time)}</div>
+                      <div class="schedule-job-title">{job.customer_name}</div>
+                      {job.service_type_name && <div class="schedule-job-service">{job.service_type_name}</div>}
+                      {job.technician_name && <div class="schedule-job-tech">{job.technician_name}</div>}
+                      {isMultiDay && (
+                        <div class="schedule-job-multiday" title={`Runs ${formatDate(job.scheduled_date)} – ${formatDate(job.end_date)}`}>
+                          <CalendarRange size={11} /> through {formatDate(job.end_date)}
+                        </div>
+                      )}
+                    </button>
+                  );
+                })}
                 {dayJobs.length === 0 && (
                   <div class="schedule-empty">No jobs</div>
                 )}

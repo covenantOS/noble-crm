@@ -5,7 +5,7 @@ import type {
   Job, Customer, Technician, ServiceType, Material, Invoice, Stats, PaginatedState,
   CustomerLookup, TechnicianLookup, Priority, Brand, Estimate,
   Attachment, AttachmentEntityType, AttachmentKind, Payment, PaymentMethod,
-  ServiceAgreement, EstimateRoom, ChangeOrder,
+  ServiceAgreement, EstimateRoom, ChangeOrder, Product,
 } from "../types";
 import type { AppContextValue, CurrentUser } from "../context";
 
@@ -36,6 +36,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   const [technicians, setTechnicians] = useState<Technician[]>([]);
   const [serviceTypes, setServiceTypes] = useState<ServiceType[]>([]);
   const [materials, setMaterials] = useState<Material[]>([]);
+  const [products, setProducts] = useState<Product[]>([]);
 
   // Brands
   const [brands, setBrands] = useState<Brand[]>([]);
@@ -121,6 +122,11 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     setMaterials(data.materials);
   }, []);
 
+  const fetchProducts = useCallback(async () => {
+    const data = await api<{ products: Product[] }>("GET", "/api/products");
+    setProducts(data.products);
+  }, []);
+
   const fetchBrands = useCallback(async () => {
     const data = await api<{ brands: Brand[] }>("GET", "/api/brands");
     setBrands(data.brands);
@@ -174,7 +180,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
       // Promise.all) so one unexpected failure doesn't blank out every
       // other widget on the page.
       const isTechnician = currentUser?.role === "technician";
-      const tasks = [fetchStats(), fetchJobs(jobsPag, "", ""), fetchServiceTypes(), fetchMaterials(), fetchSchedule(scheduleStart, scheduleEnd), fetchBrands()];
+      const tasks = [fetchStats(), fetchJobs(jobsPag, "", ""), fetchServiceTypes(), fetchMaterials(), fetchProducts(), fetchSchedule(scheduleStart, scheduleEnd), fetchBrands()];
       if (!isTechnician) {
         tasks.push(fetchCustomers(customersPag, ""), fetchTechnicians(), fetchInvoices(invoicesPag, ""), fetchEstimates(estimatesPag, "", ""), fetchLookups(), fetchServiceAgreements());
       }
@@ -222,7 +228,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     customer_id: number; technician_id?: number | null; service_type_id?: number | null;
     scheduled_date: string; scheduled_time?: string; duration?: number; price?: number;
     address?: string; notes?: string; priority?: Priority; is_recurring?: number; recurrence_interval?: string;
-    brand_id?: number | null;
+    brand_id?: number | null; end_date?: string | null;
   }) => {
     await api("POST", "/api/jobs", data);
     await fetchJobs(jobsPag, jobsSearch, jobsStatusFilter);
@@ -352,6 +358,27 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     await fetchJobChangeOrders(jobId);
   }, [fetchJobChangeOrders]);
 
+  // ── Job crew (many-to-many job<->technician) ──
+
+  const addJobCrewMember = useCallback(async (jobId: number, technicianId: number, role?: string) => {
+    await api("POST", `/api/jobs/${jobId}/crew`, { technician_id: technicianId, role });
+    const res = await api<{ job: Job }>("GET", `/api/jobs/${jobId}`);
+    setSelectedJob(res.job);
+  }, []);
+
+  const removeJobCrewMember = useCallback(async (jobId: number, crewId: number) => {
+    await api("DELETE", `/api/jobs/${jobId}/crew/${crewId}`);
+    const res = await api<{ job: Job }>("GET", `/api/jobs/${jobId}`);
+    setSelectedJob(res.job);
+  }, []);
+
+  // ── Review request ──
+
+  const requestJobReview = useCallback(async (jobId: number) => {
+    const res = await api<{ sent: boolean; reason?: string }>("POST", `/api/jobs/${jobId}/request-review`);
+    return { sent: res.sent, reason: res.reason };
+  }, []);
+
   // ── Customers CRUD ──
 
   const setCustomersPage = useCallback((page: number) => setCustomersPag((p) => ({ ...p, page })), []);
@@ -460,9 +487,26 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     await fetchMaterials();
   }, [fetchMaterials]);
 
+  // ── Products CRUD (TKC catalog) ──
+
+  const addProduct = useCallback(async (data: Partial<Product>) => {
+    await api("POST", "/api/products", data);
+    await fetchProducts();
+  }, [fetchProducts]);
+
+  const updateProduct = useCallback(async (id: number, data: Partial<Product>) => {
+    await api("PUT", `/api/products/${id}`, data);
+    await fetchProducts();
+  }, [fetchProducts]);
+
+  const deleteProduct = useCallback(async (id: number) => {
+    await api("DELETE", `/api/products/${id}`);
+    await fetchProducts();
+  }, [fetchProducts]);
+
   // ── Brands CRUD ──
 
-  const addBrand = useCallback(async (data: { name: string; slug: string; color_primary?: string; color_secondary?: string; active?: number }) => {
+  const addBrand = useCallback(async (data: { name: string; slug: string; color_primary?: string; color_secondary?: string; active?: number; review_url?: string }) => {
     await api("POST", "/api/brands", data);
     await fetchBrands();
   }, [fetchBrands]);
@@ -779,6 +823,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     addJobMaterial, deleteJobMaterial, createInvoiceFromJob,
     jobInvoices, fetchJobInvoices, addJobProgressInvoice,
     jobChangeOrders, fetchJobChangeOrders, addChangeOrder, approveChangeOrder, rejectChangeOrder,
+    addJobCrewMember, removeJobCrewMember, requestJobReview,
     customers, customersPag, setCustomersPage, customersSearch, setCustomersSearch,
     customersStatusFilter, setCustomersStatusFilter,
     addCustomer, updateCustomer, deleteCustomer,
@@ -787,6 +832,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     technicians, addTechnician, updateTechnician, deleteTechnician,
     serviceTypes, addServiceType, updateServiceType, deleteServiceType,
     materials, addMaterial, updateMaterial, deleteMaterial,
+    products, addProduct, updateProduct, deleteProduct,
     brands, addBrand, updateBrand, uploadBrandLogo,
     invoices, invoicesPag, setInvoicesPage, invoicesStatusFilter, setInvoicesStatusFilter,
     selectedInvoice, selectInvoice, addInvoice, updateInvoice, deleteInvoice,
