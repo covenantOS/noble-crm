@@ -15,6 +15,7 @@ import { ServiceTypeList } from "./components/service-type-list";
 import { MaterialList } from "./components/material-list";
 import { InvoiceList } from "./components/invoice-list";
 import { InvoiceDetail } from "./components/invoice-detail";
+import { BrandList } from "./components/brand-list";
 import { ErrorBanner } from "./components/error-banner";
 import { Login } from "./components/login";
 
@@ -76,6 +77,7 @@ function AuthenticatedApp({ isAgent, session }: { isAgent: boolean; session: Non
       case "services": return <ServiceTypeList />;
       case "materials": return <MaterialList />;
       case "invoices": return <InvoiceList />;
+      case "brands": return <BrandList />;
       default: return <Dashboard />;
     }
   };

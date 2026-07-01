@@ -8,7 +8,12 @@ export function JobRow({ job }: { job: Job }) {
 
   return (
     <tr class="table-row clickable" onClick={() => navigate(`/jobs/${job.id}`)}>
-      <td><span class="identifier">{job.identifier}</span></td>
+      <td>
+        <span class="identifier">{job.identifier}</span>
+        {job.brand_name && (
+          <span class="color-swatch" title={job.brand_name} style={{ background: job.brand_color_primary || "#ccc", marginLeft: 6 }} />
+        )}
+      </td>
       <td>{job.scheduled_date}</td>
       <td class="text-muted">{job.scheduled_time}</td>
       <td>{job.customer_name || "—"}</td>

@@ -13,7 +13,7 @@ const STATUS_COLORS: Record<InvoiceStatus, string> = {
 };
 
 export function InvoiceDetail() {
-  const { selectedInvoice: invoice, navigate, updateInvoice, deleteInvoice } = useApp();
+  const { selectedInvoice: invoice, navigate, updateInvoice, deleteInvoice, brands } = useApp();
 
   if (!invoice) return null;
 
@@ -51,6 +51,15 @@ export function InvoiceDetail() {
               <div class="detail-meta-item">
                 <span class="detail-meta-label">Job</span>
                 <span class="identifier">{invoice.job_identifier}</span>
+              </div>
+            )}
+            {invoice.brand_name && (
+              <div class="detail-meta-item">
+                <span class="detail-meta-label">Brand</span>
+                <span class="service-pill" style={{ borderColor: invoice.brand_color_primary || "#ccc" }}>
+                  <span class="service-dot" style={{ background: invoice.brand_color_primary || "#ccc" }} />
+                  {invoice.brand_name}
+                </span>
               </div>
             )}
             <div class="detail-meta-item">
@@ -135,6 +144,22 @@ export function InvoiceDetail() {
               onChange={(e) => updateInvoice(invoice.id, { due_date: (e.target as HTMLInputElement).value })}
               style={{ width: "100%", padding: "6px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", fontSize: 13 }}
             />
+          </div>
+
+          <div class="detail-sidebar-section">
+            <h4>Brand</h4>
+            <select
+              value={invoice.brand_id || ""}
+              onChange={(e) => {
+                const val = (e.target as HTMLSelectElement).value;
+                updateInvoice(invoice.id, { brand_id: val ? parseInt(val, 10) : null });
+              }}
+            >
+              <option value="">No brand</option>
+              {brands.map((b) => (
+                <option key={b.id} value={b.id}>{b.name}</option>
+              ))}
+            </select>
           </div>
         </div>
       </div>

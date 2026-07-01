@@ -71,7 +71,12 @@ export function InvoiceList() {
                 const color = STATUS_COLORS[(inv.status as InvoiceStatus)] || "#6b7280";
                 return (
                   <tr key={inv.id} class="table-row clickable" onClick={() => navigate(`/invoices/${inv.id}`)}>
-                    <td><span class="identifier">{inv.identifier}</span></td>
+                    <td>
+                      <span class="identifier">{inv.identifier}</span>
+                      {inv.brand_name && (
+                        <span class="color-swatch" title={inv.brand_name} style={{ background: inv.brand_color_primary || "#ccc", marginLeft: 6 }} />
+                      )}
+                    </td>
                     <td>{inv.customer_name || "—"}</td>
                     <td class="text-muted">{inv.job_identifier || "—"}</td>
                     <td>

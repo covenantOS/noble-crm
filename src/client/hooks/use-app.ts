@@ -3,7 +3,7 @@ import { api } from "../api";
 import { authClient } from "../auth-client";
 import type {
   Job, Customer, Technician, ServiceType, Material, Invoice, Stats, PaginatedState,
-  CustomerLookup, TechnicianLookup, Priority,
+  CustomerLookup, TechnicianLookup, Priority, Brand,
 } from "../types";
 import type { AppContextValue, CurrentUser } from "../context";
 
@@ -30,6 +30,9 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   const [technicians, setTechnicians] = useState<Technician[]>([]);
   const [serviceTypes, setServiceTypes] = useState<ServiceType[]>([]);
   const [materials, setMaterials] = useState<Material[]>([]);
+
+  // Brands
+  const [brands, setBrands] = useState<Brand[]>([]);
 
   // Invoices
   const [invoices, setInvoices] = useState<Invoice[]>([]);
@@ -90,6 +93,11 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     setMaterials(data.materials);
   }, []);
 
+  const fetchBrands = useCallback(async () => {
+    const data = await api<{ brands: Brand[] }>("GET", "/api/brands");
+    setBrands(data.brands);
+  }, []);
+
   const fetchInvoices = useCallback(async (pag: PaginatedState, status: string) => {
     const params = new URLSearchParams({ page: String(pag.page), limit: String(pag.limit) });
     if (status) params.set("status", status);
@@ -124,7 +132,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
       // Promise.all) so one unexpected failure doesn't blank out every
       // other widget on the page.
       const isTechnician = currentUser?.role === "technician";
-      const tasks = [fetchStats(), fetchJobs(jobsPag, "", ""), fetchServiceTypes(), fetchMaterials(), fetchSchedule(scheduleStart, scheduleEnd)];
+      const tasks = [fetchStats(), fetchJobs(jobsPag, "", ""), fetchServiceTypes(), fetchMaterials(), fetchSchedule(scheduleStart, scheduleEnd), fetchBrands()];
       if (!isTechnician) {
         tasks.push(fetchCustomers(customersPag, ""), fetchTechnicians(), fetchInvoices(invoicesPag, ""), fetchLookups());
       }
@@ -164,6 +172,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     customer_id: number; technician_id?: number | null; service_type_id?: number | null;
     scheduled_date: string; scheduled_time?: string; duration?: number; price?: number;
     address?: string; notes?: string; priority?: Priority; is_recurring?: number; recurrence_interval?: string;
+    brand_id?: number | null;
   }) => {
     await api("POST", "/api/jobs", data);
     await fetchJobs(jobsPag, jobsSearch, jobsStatusFilter);
@@ -351,11 +360,40 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     await fetchMaterials();
   }, [fetchMaterials]);
 
+  // ── Brands CRUD ──
+
+  const addBrand = useCallback(async (data: { name: string; slug: string; color_primary?: string; color_secondary?: string; active?: number }) => {
+    await api("POST", "/api/brands", data);
+    await fetchBrands();
+  }, [fetchBrands]);
+
+  const updateBrand = useCallback(async (id: number, data: Partial<Brand>) => {
+    await api("PUT", `/api/brands/${id}`, data);
+    await fetchBrands();
+  }, [fetchBrands]);
+
+  // Multipart upload -- bypasses the JSON-only api() helper since the body
+  // here is a File, not a JSON-serializable object.
+  const uploadBrandLogo = useCallback(async (id: number, file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    const r = await fetch(`/api/brands/${id}/logo`, { method: "POST", body: form, credentials: "include" });
+    const text = await r.text();
+    let data: unknown;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`Server error: ${r.status} ${r.statusText}`);
+    }
+    if (!r.ok) throw new Error((data as { error?: string }).error || "Upload failed");
+    await fetchBrands();
+  }, [fetchBrands]);
+
   // ── Invoices CRUD ──
 
   const setInvoicesPage = useCallback((page: number) => setInvoicesPag((p) => ({ ...p, page })), []);
 
-  const addInvoice = useCallback(async (data: { customer_id: number; job_id?: number | null; tax_rate?: number; notes?: string; due_date?: string; lines: { description: string; quantity: number; unit_price: number }[] }) => {
+  const addInvoice = useCallback(async (data: { customer_id: number; job_id?: number | null; tax_rate?: number; notes?: string; due_date?: string; brand_id?: number | null; lines: { description: string; quantity: number; unit_price: number }[] }) => {
     await api("POST", "/api/invoices", data);
     await fetchInvoices(invoicesPag, invoicesStatusFilter);
     await fetchStats();
@@ -411,6 +449,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     technicians, addTechnician, updateTechnician, deleteTechnician,
     serviceTypes, addServiceType, updateServiceType, deleteServiceType,
     materials, addMaterial, updateMaterial, deleteMaterial,
+    brands, addBrand, updateBrand, uploadBrandLogo,
     invoices, invoicesPag, setInvoicesPage, invoicesStatusFilter, setInvoicesStatusFilter,
     selectedInvoice, selectInvoice, addInvoice, updateInvoice, deleteInvoice,
     scheduleJobs, scheduleStart, scheduleEnd, setScheduleRange,

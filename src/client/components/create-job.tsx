@@ -3,12 +3,13 @@ import { useApp } from "../context";
 import { X } from "lucide-preact";
 
 export function CreateJob({ onClose }: { onClose: () => void }) {
-  const { addJob, customerLookup, technicianLookup, serviceTypes, setError } = useApp();
+  const { addJob, customerLookup, technicianLookup, serviceTypes, brands, setError } = useApp();
 
   const today = new Date().toISOString().split("T")[0];
   const [customerId, setCustomerId] = useState("");
   const [technicianId, setTechnicianId] = useState("");
   const [serviceTypeId, setServiceTypeId] = useState("");
+  const [brandId, setBrandId] = useState("");
   const [scheduledDate, setScheduledDate] = useState(today);
   const [scheduledTime, setScheduledTime] = useState("09:00");
   const [priority, setPriority] = useState("normal");
@@ -26,6 +27,7 @@ export function CreateJob({ onClose }: { onClose: () => void }) {
         customer_id: parseInt(customerId, 10),
         technician_id: technicianId ? parseInt(technicianId, 10) : null,
         service_type_id: serviceTypeId ? parseInt(serviceTypeId, 10) : null,
+        brand_id: brandId ? parseInt(brandId, 10) : null,
         scheduled_date: scheduledDate,
         scheduled_time: scheduledTime,
         priority: priority as "low" | "normal" | "high" | "urgent",
@@ -73,6 +75,15 @@ export function CreateJob({ onClose }: { onClose: () => void }) {
                 <option value="">Unassigned</option>
                 {technicianLookup.map((t) => (
                   <option key={t.id} value={t.id}>{t.name}</option>
+                ))}
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Brand</label>
+              <select value={brandId} onChange={(e) => setBrandId((e.target as HTMLSelectElement).value)}>
+                <option value="">No brand</option>
+                {brands.map((b) => (
+                  <option key={b.id} value={b.id}>{b.name}</option>
                 ))}
               </select>
             </div>

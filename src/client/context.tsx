@@ -2,7 +2,7 @@ import { createContext } from "preact";
 import { useContext } from "preact/hooks";
 import type {
   Job, Customer, Technician, ServiceType, Material, Invoice, Stats, PaginatedState,
-  CustomerLookup, TechnicianLookup, Priority,
+  CustomerLookup, TechnicianLookup, Priority, Brand,
 } from "./types";
 
 export interface CurrentUser {
@@ -42,6 +42,7 @@ export interface AppContextValue {
     priority?: Priority;
     is_recurring?: number;
     recurrence_interval?: string;
+    brand_id?: number | null;
   }) => Promise<void>;
   updateJob: (id: number, data: Partial<Job>) => Promise<void>;
   deleteJob: (id: number) => Promise<void>;
@@ -89,6 +90,12 @@ export interface AppContextValue {
   updateMaterial: (id: number, data: Partial<Material>) => Promise<void>;
   deleteMaterial: (id: number) => Promise<void>;
 
+  // Brands
+  brands: Brand[];
+  addBrand: (data: { name: string; slug: string; color_primary?: string; color_secondary?: string; active?: number }) => Promise<void>;
+  updateBrand: (id: number, data: Partial<Brand>) => Promise<void>;
+  uploadBrandLogo: (id: number, file: File) => Promise<void>;
+
   // Invoices
   invoices: Invoice[];
   invoicesPag: PaginatedState;
@@ -97,7 +104,7 @@ export interface AppContextValue {
   setInvoicesStatusFilter: (s: string) => void;
   selectedInvoice: Invoice | null;
   selectInvoice: (id: number | null) => Promise<void>;
-  addInvoice: (data: { customer_id: number; job_id?: number | null; tax_rate?: number; notes?: string; due_date?: string; lines: { description: string; quantity: number; unit_price: number }[] }) => Promise<void>;
+  addInvoice: (data: { customer_id: number; job_id?: number | null; tax_rate?: number; notes?: string; due_date?: string; brand_id?: number | null; lines: { description: string; quantity: number; unit_price: number }[] }) => Promise<void>;
   updateInvoice: (id: number, data: Partial<Invoice>) => Promise<void>;
   deleteInvoice: (id: number) => Promise<void>;
 

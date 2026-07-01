@@ -91,6 +91,19 @@ async function requireOwnJobOrForbid(c: Context<AppBindings>, db: ReturnType<typ
   return null;
 }
 
+// Brand identity/colors/logo management (create/update/logo upload) is an
+// office/admin task -- not sales (estimator) or field work (technician), so
+// both of those roles are blocked here in addition to the blanket
+// technician gate above. Returns a Response to short-circuit with (403
+// forbidden), or null if the caller may proceed.
+function requireAdminOrOfficeOrForbid(c: Context<AppBindings>) {
+  const role = c.get("user").role;
+  if (role !== "admin" && role !== "office") {
+    return c.json({ error: "forbidden" }, 403);
+  }
+  return null;
+}
+
 // ── Shared Schemas ─────────────────────────────────────────────────
 
 const ErrorSchema = z.object({ error: z.string() }).openapi("Error");
@@ -129,8 +142,19 @@ const ServiceTypeSchema = z.object({
   default_duration: z.number().int(),
   default_price: z.number(),
   color: z.string(),
+  brand_id: z.number().int().nullable().optional(),
   created_at: z.string(),
 }).openapi("ServiceType");
+
+const BrandSchema = z.object({
+  id: z.number().int(),
+  name: z.string(),
+  slug: z.string(),
+  color_primary: z.string().nullable(),
+  color_secondary: z.string().nullable(),
+  logo_r2_key: z.string().nullable(),
+  active: z.number().int(),
+}).openapi("Brand");
 
 const JobNoteSchema = z.object({
   id: z.number().int(),
@@ -157,12 +181,16 @@ const JobSchema = z.object({
   is_recurring: z.number().int(),
   recurrence_interval: z.string(),
   next_recurrence_date: z.string(),
+  brand_id: z.number().int().nullable().optional(),
   customer_name: z.string().optional(),
   customer_phone: z.string().optional(),
   technician_name: z.string().nullable().optional(),
   technician_color: z.string().nullable().optional(),
   service_type_name: z.string().nullable().optional(),
   service_type_color: z.string().nullable().optional(),
+  brand_name: z.string().nullable().optional(),
+  brand_color_primary: z.string().nullable().optional(),
+  brand_color_secondary: z.string().nullable().optional(),
   job_notes: z.array(JobNoteSchema).optional(),
   created_at: z.string(),
   updated_at: z.string(),
@@ -222,6 +250,7 @@ function jobJoinedSelect(db: ReturnType<typeof getDb>) {
       is_recurring: schema.jobs.isRecurring,
       recurrence_interval: sql<string>`COALESCE(${schema.jobs.recurrenceInterval}, '')`,
       next_recurrence_date: sql<string>`COALESCE(${schema.jobs.nextRecurrenceDate}, '')`,
+      brand_id: schema.jobs.brandId,
       created_at: sql<string>`COALESCE(${schema.jobs.createdAt}, '')`,
       updated_at: sql<string>`COALESCE(${schema.jobs.updatedAt}, '')`,
       customer_name: sql<string | undefined>`${schema.customers.name}`,
@@ -230,11 +259,15 @@ function jobJoinedSelect(db: ReturnType<typeof getDb>) {
       technician_color: schema.technicians.color,
       service_type_name: schema.serviceTypes.name,
       service_type_color: schema.serviceTypes.color,
+      brand_name: schema.brands.name,
+      brand_color_primary: schema.brands.colorPrimary,
+      brand_color_secondary: schema.brands.colorSecondary,
     })
     .from(schema.jobs)
     .leftJoin(schema.customers, eq(schema.jobs.customerId, schema.customers.id))
     .leftJoin(schema.technicians, eq(schema.jobs.technicianId, schema.technicians.id))
-    .leftJoin(schema.serviceTypes, eq(schema.jobs.serviceTypeId, schema.serviceTypes.id));
+    .leftJoin(schema.serviceTypes, eq(schema.jobs.serviceTypeId, schema.serviceTypes.id))
+    .leftJoin(schema.brands, eq(schema.jobs.brandId, schema.brands.id));
 }
 
 // ── Stats ──────────────────────────────────────────────────────────
@@ -430,6 +463,7 @@ const createJob = createRoute({
         notes: z.string().optional(),
         is_recurring: z.number().int().optional(),
         recurrence_interval: z.string().optional(),
+        brand_id: z.number().int().nullable().optional(),
       }) } },
     },
   },
@@ -486,6 +520,7 @@ app.openapi(createJob, async (c) => {
     notes: data.notes || "",
     isRecurring: data.is_recurring || 0,
     recurrenceInterval: data.recurrence_interval || "",
+    brandId: data.brand_id ?? null,
   });
 
   const job = await jobJoinedSelect(db).where(eq(schema.jobs.identifier, identifier)).get();
@@ -513,6 +548,7 @@ const updateJob = createRoute({
         completion_notes: z.string().optional(),
         is_recurring: z.number().int().optional(),
         recurrence_interval: z.string().optional(),
+        brand_id: z.number().int().nullable().optional(),
       }) } },
     },
   },
@@ -560,6 +596,7 @@ app.openapi(updateJob, async (c) => {
   if (data.completion_notes !== undefined) updates.completionNotes = data.completion_notes;
   if (data.is_recurring !== undefined) updates.isRecurring = data.is_recurring;
   if (data.recurrence_interval !== undefined) updates.recurrenceInterval = data.recurrence_interval;
+  if (data.brand_id !== undefined) updates.brandId = data.brand_id;
 
   if (Object.keys(updates).length > 0) {
     updates.updatedAt = sql`(datetime('now'))`;
@@ -785,16 +822,21 @@ app.openapi(getCustomer, async (c) => {
       is_recurring: schema.jobs.isRecurring,
       recurrence_interval: sql<string>`COALESCE(${schema.jobs.recurrenceInterval}, '')`,
       next_recurrence_date: sql<string>`COALESCE(${schema.jobs.nextRecurrenceDate}, '')`,
+      brand_id: schema.jobs.brandId,
       created_at: sql<string>`COALESCE(${schema.jobs.createdAt}, '')`,
       updated_at: sql<string>`COALESCE(${schema.jobs.updatedAt}, '')`,
       technician_name: schema.technicians.name,
       technician_color: schema.technicians.color,
       service_type_name: schema.serviceTypes.name,
       service_type_color: schema.serviceTypes.color,
+      brand_name: schema.brands.name,
+      brand_color_primary: schema.brands.colorPrimary,
+      brand_color_secondary: schema.brands.colorSecondary,
     })
     .from(schema.jobs)
     .leftJoin(schema.technicians, eq(schema.jobs.technicianId, schema.technicians.id))
     .leftJoin(schema.serviceTypes, eq(schema.jobs.serviceTypeId, schema.serviceTypes.id))
+    .leftJoin(schema.brands, eq(schema.jobs.brandId, schema.brands.id))
     .where(eq(schema.jobs.customerId, idNum))
     .orderBy(desc(schema.jobs.scheduledDate))
     .limit(50)
@@ -1090,6 +1132,7 @@ app.openapi(listServiceTypes, async (c) => {
       default_duration: schema.serviceTypes.defaultDuration,
       default_price: schema.serviceTypes.defaultPrice,
       color: schema.serviceTypes.color,
+      brand_id: schema.serviceTypes.brandId,
       created_at: sql<string>`COALESCE(${schema.serviceTypes.createdAt}, '')`,
     })
     .from(schema.serviceTypes)
@@ -1109,6 +1152,7 @@ const createServiceType = createRoute({
         default_duration: z.number().int().optional(),
         default_price: z.number().optional(),
         color: z.string().optional(),
+        brand_id: z.number().int().nullable().optional(),
       }) } },
     },
   },
@@ -1126,6 +1170,7 @@ app.openapi(createServiceType, async (c) => {
     defaultDuration: data.default_duration || 60,
     defaultPrice: data.default_price || 0,
     color: data.color || "#6b7280",
+    brandId: data.brand_id ?? null,
   });
   const st = await db.select().from(schema.serviceTypes).orderBy(desc(schema.serviceTypes.id)).limit(1).get();
   const stOut = {
@@ -1135,6 +1180,7 @@ app.openapi(createServiceType, async (c) => {
     default_duration: st!.defaultDuration,
     default_price: st!.defaultPrice,
     color: st!.color,
+    brand_id: st!.brandId,
     created_at: st!.createdAt ?? "",
   };
   return c.json(stOut, 201);
@@ -1152,6 +1198,7 @@ const updateServiceType = createRoute({
         default_duration: z.number().int().optional(),
         default_price: z.number().optional(),
         color: z.string().optional(),
+        brand_id: z.number().int().nullable().optional(),
       }) } },
     },
   },
@@ -1170,6 +1217,7 @@ app.openapi(updateServiceType, async (c) => {
   if (data.default_duration !== undefined) updates.defaultDuration = data.default_duration;
   if (data.default_price !== undefined) updates.defaultPrice = data.default_price;
   if (data.color !== undefined) updates.color = data.color;
+  if (data.brand_id !== undefined) updates.brandId = data.brand_id;
   if (Object.keys(updates).length > 0) {
     await db.update(schema.serviceTypes).set(updates).where(eq(schema.serviceTypes.id, toId(id)));
   }
@@ -1190,6 +1238,201 @@ app.openapi(deleteServiceType, async (c) => {
   const { id } = c.req.valid("param");
   await db.delete(schema.serviceTypes).where(eq(schema.serviceTypes.id, toId(id)));
   return c.json({ ok: true }, 200);
+});
+
+// ── Brands ─────────────────────────────────────────────────────────
+// Low-sensitivity read (GET) is open to all authenticated roles, including
+// technician, since brand-tagged UI (colored pills, logos) shows up
+// everywhere -- jobs, invoices, schedule. Mutations (create/update/logo
+// upload) are office/admin only via requireAdminOrOfficeOrForbid, since
+// brand identity management is neither a sales (estimator) nor field
+// (technician) task.
+
+const listBrands = createRoute({
+  method: "get",
+  path: "/api/brands",
+  responses: {
+    200: {
+      description: "All brands",
+      content: { "application/json": { schema: z.object({ brands: z.array(BrandSchema) }) } },
+    },
+  },
+});
+
+app.openapi(listBrands, async (c) => {
+  const db = getDb(c.env);
+  const brands = await db
+    .select({
+      id: schema.brands.id,
+      name: schema.brands.name,
+      slug: schema.brands.slug,
+      color_primary: schema.brands.colorPrimary,
+      color_secondary: schema.brands.colorSecondary,
+      logo_r2_key: schema.brands.logoR2Key,
+      active: schema.brands.active,
+    })
+    .from(schema.brands)
+    .orderBy(asc(schema.brands.name))
+    .all();
+  return c.json({ brands }, 200);
+});
+
+const createBrand = createRoute({
+  method: "post",
+  path: "/api/brands",
+  request: {
+    body: {
+      content: { "application/json": { schema: z.object({
+        name: z.string(),
+        slug: z.string(),
+        color_primary: z.string().optional(),
+        color_secondary: z.string().optional(),
+        active: z.number().int().optional(),
+      }) } },
+    },
+  },
+  responses: {
+    201: { description: "Created", content: { "application/json": { schema: BrandSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(createBrand, async (c) => {
+  const forbidden = requireAdminOrOfficeOrForbid(c);
+  if (forbidden) return forbidden;
+  const db = getDb(c.env);
+  const data = c.req.valid("json");
+  await db.insert(schema.brands).values({
+    name: data.name,
+    slug: data.slug,
+    colorPrimary: data.color_primary ?? null,
+    colorSecondary: data.color_secondary ?? null,
+    active: data.active ?? 1,
+  });
+  const brand = await db.select().from(schema.brands).orderBy(desc(schema.brands.id)).limit(1).get();
+  const brandOut = {
+    id: brand!.id,
+    name: brand!.name,
+    slug: brand!.slug,
+    color_primary: brand!.colorPrimary,
+    color_secondary: brand!.colorSecondary,
+    logo_r2_key: brand!.logoR2Key,
+    active: brand!.active,
+  };
+  return c.json(brandOut, 201);
+});
+
+const updateBrand = createRoute({
+  method: "put",
+  path: "/api/brands/{id}",
+  request: {
+    params: IdParam,
+    body: {
+      content: { "application/json": { schema: z.object({
+        name: z.string().optional(),
+        slug: z.string().optional(),
+        color_primary: z.string().optional(),
+        color_secondary: z.string().optional(),
+        active: z.number().int().optional(),
+      }) } },
+    },
+  },
+  responses: {
+    200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(updateBrand, async (c) => {
+  const forbidden = requireAdminOrOfficeOrForbid(c);
+  if (forbidden) return forbidden;
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const data = c.req.valid("json");
+  const updates: Record<string, unknown> = {};
+  if (data.name !== undefined) updates.name = data.name;
+  if (data.slug !== undefined) updates.slug = data.slug;
+  if (data.color_primary !== undefined) updates.colorPrimary = data.color_primary;
+  if (data.color_secondary !== undefined) updates.colorSecondary = data.color_secondary;
+  if (data.active !== undefined) updates.active = data.active;
+  if (Object.keys(updates).length > 0) {
+    await db.update(schema.brands).set(updates).where(eq(schema.brands.id, toId(id)));
+  }
+  return c.json({ ok: true }, 200);
+});
+
+// Logo upload/serve are plain Hono routes (not app.openapi/Zod) -- multipart
+// file bodies and binary streaming responses don't fit the JSON-schema
+// request/response shape the rest of this file uses, so these two
+// deliberately step outside that pattern rather than force a bad fit.
+//
+// Upload: multipart/form-data with a single "file" field (chosen over a raw
+// binary body + content-type header because c.req.parseBody() is Hono's
+// built-in, documented way to handle file uploads and keeps the filename's
+// extension available without a separate query param or header).
+app.post("/api/brands/:id/logo", async (c) => {
+  const forbidden = requireAdminOrOfficeOrForbid(c);
+  if (forbidden) return forbidden;
+  const db = getDb(c.env);
+  const idNum = toId(c.req.param("id"));
+  const brand = await db.select().from(schema.brands).where(eq(schema.brands.id, idNum)).get();
+  if (!brand) return c.json({ error: "Brand not found" }, 404);
+
+  const body = await c.req.parseBody();
+  const file = body["file"];
+  if (!(file instanceof File)) {
+    return c.json({ error: "Missing file upload (multipart field \"file\")" }, 400);
+  }
+
+  const extFromName = file.name.includes(".") ? file.name.split(".").pop()!.toLowerCase() : "";
+  const extFromType = file.type ? file.type.split("/").pop()!.toLowerCase() : "";
+  const ext = (extFromName || extFromType || "png").replace(/[^a-z0-9]/g, "") || "png";
+  const key = `brands/${brand.slug}-logo.${ext}`;
+
+  await c.env.BUCKET.put(key, await file.arrayBuffer(), {
+    httpMetadata: { contentType: file.type || "application/octet-stream" },
+  });
+  await db.update(schema.brands).set({ logoR2Key: key }).where(eq(schema.brands.id, idNum));
+
+  return c.json({ ok: true, logo_r2_key: key }, 200);
+});
+
+// General-purpose R2 read-through proxy, scoped to the "brands/" prefix so
+// it can't be used to read arbitrary bucket contents. This is what lets
+// <img src="/api/r2/brands/..."> render an uploaded logo -- R2 objects
+// aren't otherwise reachable from the browser (no public bucket domain
+// configured), and this keeps everything behind the same session-auth
+// middleware as the rest of the API rather than standing up a separate
+// public asset route.
+const EXT_CONTENT_TYPES: Record<string, string> = {
+  webp: "image/webp",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  svg: "image/svg+xml",
+};
+
+app.get("/api/r2/*", async (c) => {
+  const key = c.req.path.replace(/^\/api\/r2\//, "");
+  if (!key.startsWith("brands/")) {
+    return c.json({ error: "forbidden" }, 403);
+  }
+  const obj = await c.env.BUCKET.get(key);
+  if (!obj) return c.json({ error: "Not found" }, 404);
+  const headers = new Headers();
+  obj.writeHttpMetadata(headers);
+  headers.set("etag", obj.httpEtag);
+  if (!headers.get("content-type")) {
+    // Objects uploaded without httpMetadata.contentType (e.g. seeded
+    // directly via `wrangler r2 object put` rather than through the
+    // POST /api/brands/:id/logo route, which always sets it) fall back to
+    // an extension guess so <img> tags still render them instead of
+    // downloading as application/octet-stream.
+    const ext = key.includes(".") ? key.split(".").pop()!.toLowerCase() : "";
+    headers.set("content-type", EXT_CONTENT_TYPES[ext] || "application/octet-stream");
+  }
+  return new Response(obj.body, { headers });
 });
 
 // ── Schedule (calendar view) ───────────────────────────────────────
@@ -1568,12 +1811,17 @@ app.openapi(listInvoices, async (c) => {
       paid_date: schema.invoices.paidDate,
       created_at: schema.invoices.createdAt,
       updated_at: schema.invoices.updatedAt,
+      brand_id: schema.invoices.brandId,
       customer_name: schema.customers.name,
       job_identifier: schema.jobs.identifier,
+      brand_name: schema.brands.name,
+      brand_color_primary: schema.brands.colorPrimary,
+      brand_color_secondary: schema.brands.colorSecondary,
     })
     .from(schema.invoices)
     .leftJoin(schema.customers, eq(schema.invoices.customerId, schema.customers.id))
     .leftJoin(schema.jobs, eq(schema.invoices.jobId, schema.jobs.id))
+    .leftJoin(schema.brands, eq(schema.invoices.brandId, schema.brands.id))
     .where(where)
     .orderBy(desc(schema.invoices.createdAt))
     .limit(limit)
@@ -1613,12 +1861,17 @@ app.openapi(getInvoice, async (c) => {
       paid_date: schema.invoices.paidDate,
       created_at: schema.invoices.createdAt,
       updated_at: schema.invoices.updatedAt,
+      brand_id: schema.invoices.brandId,
       customer_name: schema.customers.name,
       job_identifier: schema.jobs.identifier,
+      brand_name: schema.brands.name,
+      brand_color_primary: schema.brands.colorPrimary,
+      brand_color_secondary: schema.brands.colorSecondary,
     })
     .from(schema.invoices)
     .leftJoin(schema.customers, eq(schema.invoices.customerId, schema.customers.id))
     .leftJoin(schema.jobs, eq(schema.invoices.jobId, schema.jobs.id))
+    .leftJoin(schema.brands, eq(schema.invoices.brandId, schema.brands.id))
     .where(eq(schema.invoices.id, idNum))
     .get();
   if (!invoice) return c.json({ error: "Invoice not found" }, 404);
@@ -1649,6 +1902,7 @@ const createInvoice = createRoute({
       tax_rate: z.number().optional(),
       notes: z.string().optional(),
       due_date: z.string().optional(),
+      brand_id: z.number().int().nullable().optional(),
       lines: z.array(z.object({
         description: z.string(),
         quantity: z.number(),
@@ -1685,6 +1939,7 @@ app.openapi(createInvoice, async (c) => {
     total,
     notes: data.notes || "",
     dueDate: data.due_date || "",
+    brandId: data.brand_id ?? null,
   });
 
   const invoice = await db.select({ id: schema.invoices.id }).from(schema.invoices).where(eq(schema.invoices.identifier, identifier)).get();
@@ -1715,10 +1970,15 @@ app.openapi(createInvoice, async (c) => {
       paid_date: schema.invoices.paidDate,
       created_at: schema.invoices.createdAt,
       updated_at: schema.invoices.updatedAt,
+      brand_id: schema.invoices.brandId,
       customer_name: schema.customers.name,
+      brand_name: schema.brands.name,
+      brand_color_primary: schema.brands.colorPrimary,
+      brand_color_secondary: schema.brands.colorSecondary,
     })
     .from(schema.invoices)
     .leftJoin(schema.customers, eq(schema.invoices.customerId, schema.customers.id))
+    .leftJoin(schema.brands, eq(schema.invoices.brandId, schema.brands.id))
     .where(eq(schema.invoices.id, invoice!.id))
     .get();
   return c.json(result!, 201);
@@ -1734,6 +1994,7 @@ const updateInvoice = createRoute({
       notes: z.string().optional(),
       due_date: z.string().optional(),
       paid_date: z.string().optional(),
+      brand_id: z.number().int().nullable().optional(),
     }) } } },
   },
   responses: {
@@ -1750,6 +2011,7 @@ app.openapi(updateInvoice, async (c) => {
   if (data.notes !== undefined) updates.notes = data.notes;
   if (data.due_date !== undefined) updates.dueDate = data.due_date;
   if (data.paid_date !== undefined) updates.paidDate = data.paid_date;
+  if (data.brand_id !== undefined) updates.brandId = data.brand_id;
   if (Object.keys(updates).length > 0) {
     updates.updatedAt = sql`(datetime('now'))`;
     await db.update(schema.invoices).set(updates).where(eq(schema.invoices.id, toId(id)));
@@ -1794,6 +2056,7 @@ app.openapi(invoiceFromJob, async (c) => {
       id: schema.jobs.id,
       customer_id: schema.jobs.customerId,
       price: schema.jobs.price,
+      brand_id: schema.jobs.brandId,
       service_type_name: schema.serviceTypes.name,
     })
     .from(schema.jobs)
@@ -1846,6 +2109,7 @@ app.openapi(invoiceFromJob, async (c) => {
     total: subtotal,
     notes: "",
     dueDate: "",
+    brandId: job.brand_id ?? null,
   });
 
   const inv = await db.select({ id: schema.invoices.id }).from(schema.invoices).where(eq(schema.invoices.identifier, identifier)).get();

@@ -1,7 +1,7 @@
 import { useState } from "preact/hooks";
 import { useApp } from "../context";
 import { StatusBadge, PriorityBadge } from "./status-badge";
-import { ArrowLeft, Trash2, Send, MapPin, Clock, DollarSign, User, Wrench, Plus, X, CheckSquare, Square, Package, FileText } from "lucide-preact";
+import { ArrowLeft, Trash2, Send, MapPin, Clock, DollarSign, User, Wrench, Plus, X, CheckSquare, Square, Package, FileText, Palette } from "lucide-preact";
 import type { JobStatus } from "../types";
 
 const ALL_STATUSES: JobStatus[] = ["scheduled", "confirmed", "in_progress", "completed", "cancelled"];
@@ -12,7 +12,7 @@ export function JobDetail() {
     addJobNote, deleteJobNote, technicianLookup, isAgent,
     addChecklistItem, toggleChecklistItem, deleteChecklistItem,
     addJobMaterial, deleteJobMaterial, materials, createInvoiceFromJob,
-    currentUser,
+    currentUser, brands,
   } = useApp();
   // Technicians only have ownership of their own job's working fields
   // server-side -- reassignment (customer_id/technician_id), invoicing, and
@@ -107,6 +107,16 @@ export function JobDetail() {
                 <span class="service-pill" style={{ borderColor: job.service_type_color || "#ccc" }}>
                   <span class="service-dot" style={{ background: job.service_type_color || "#ccc" }} />
                   {job.service_type_name}
+                </span>
+              </div>
+            )}
+            {job.brand_name && (
+              <div class="detail-meta-item">
+                <Palette size={14} />
+                <span class="detail-meta-label">Brand</span>
+                <span class="service-pill" style={{ borderColor: job.brand_color_primary || "#ccc" }}>
+                  <span class="service-dot" style={{ background: job.brand_color_primary || "#ccc" }} />
+                  {job.brand_name}
                 </span>
               </div>
             )}
@@ -269,6 +279,24 @@ export function JobDetail() {
                 <option value="">Unassigned</option>
                 {technicianLookup.map((t) => (
                   <option key={t.id} value={t.id}>{t.name}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {canManageJob && (
+            <div class="detail-sidebar-section">
+              <h4>Brand</h4>
+              <select
+                value={job.brand_id || ""}
+                onChange={(e) => {
+                  const val = (e.target as HTMLSelectElement).value;
+                  updateJob(job.id, { brand_id: val ? parseInt(val, 10) : null });
+                }}
+              >
+                <option value="">No brand</option>
+                {brands.map((b) => (
+                  <option key={b.id} value={b.id}>{b.name}</option>
                 ))}
               </select>
             </div>

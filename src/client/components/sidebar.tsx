@@ -1,5 +1,5 @@
 import { useApp } from "../context";
-import { CalendarClock, LayoutDashboard, Briefcase, Users, Wrench, Settings, CalendarDays, FileText, Package, LogOut } from "lucide-preact";
+import { CalendarClock, LayoutDashboard, Briefcase, Users, Wrench, Settings, CalendarDays, FileText, Package, LogOut, Palette } from "lucide-preact";
 import type { View } from "../types";
 
 const navItems: { view: View; path: string; label: string; icon: typeof LayoutDashboard }[] = [
@@ -11,19 +11,29 @@ const navItems: { view: View; path: string; label: string; icon: typeof LayoutDa
   { view: "invoices", path: "/invoices", label: "Invoices", icon: FileText },
   { view: "materials", path: "/materials", label: "Materials", icon: Package },
   { view: "services", path: "/services", label: "Service Types", icon: Settings },
+  { view: "brands", path: "/brands", label: "Brands", icon: Palette },
 ];
 
 // Resource families that the backend forbids technicians from (see the
 // blanket role-gate middleware in src/server/index.ts). Hidden from the nav
 // so a technician's UI never dead-ends into a 403.
-const TECHNICIAN_HIDDEN_VIEWS: View[] = ["customers", "technicians", "invoices", "materials", "services"];
+const TECHNICIAN_HIDDEN_VIEWS: View[] = ["customers", "technicians", "invoices", "materials", "services", "brands"];
+
+// Brand identity/colors/logo management is an office/admin task, not a
+// sales task -- mirrors requireAdminOrOfficeOrForbid on the brand mutation
+// routes in src/server/index.ts. Estimators can still see brand-tagged
+// pills elsewhere (jobs/invoices), just not the settings page.
+const ESTIMATOR_HIDDEN_VIEWS: View[] = ["brands"];
 
 export function Sidebar({ currentView }: { currentView: View }) {
   const { navigate, stats, currentUser, logout, jobsPag } = useApp();
   const isTechnician = currentUser?.role === "technician";
-  const visibleNavItems = isTechnician
-    ? navItems.filter((item) => !TECHNICIAN_HIDDEN_VIEWS.includes(item.view))
-    : navItems;
+  const isEstimator = currentUser?.role === "estimator";
+  const visibleNavItems = navItems.filter((item) => {
+    if (isTechnician && TECHNICIAN_HIDDEN_VIEWS.includes(item.view)) return false;
+    if (isEstimator && ESTIMATOR_HIDDEN_VIEWS.includes(item.view)) return false;
+    return true;
+  });
   // stats.jobs is a global, unscoped count (see /api/stats -- deliberately
   // left unrestricted for technicians). jobsPag.total, in contrast, reflects
   // the technician-scoped list they actually see, so use that for them.

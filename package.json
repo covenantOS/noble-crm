@@ -10,7 +10,9 @@
     "db:migrate:local": "wrangler d1 migrations apply westchase-fieldservice --local",
     "db:migrate:remote": "wrangler d1 migrations apply westchase-fieldservice --remote",
     "db:seed:local": "wrangler d1 execute westchase-fieldservice --local --file=src/server/seed.sql",
-    "db:seed:remote": "wrangler d1 execute westchase-fieldservice --remote --file=src/server/seed.sql"
+    "db:seed:remote": "wrangler d1 execute westchase-fieldservice --remote --file=src/server/seed.sql",
+    "db:seed-brands:local": "wrangler d1 execute westchase-fieldservice --local --file=src/server/seed-brands.sql",
+    "db:seed-brands:remote": "wrangler d1 execute westchase-fieldservice --remote --file=src/server/seed-brands.sql"
   },
   "dependencies": {
     "@hono/zod-openapi": "^0.18.0",

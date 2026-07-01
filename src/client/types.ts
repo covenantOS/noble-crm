@@ -1,4 +1,4 @@
-export type View = "dashboard" | "schedule" | "jobs" | "customers" | "technicians" | "services" | "invoices" | "materials";
+export type View = "dashboard" | "schedule" | "jobs" | "customers" | "technicians" | "services" | "invoices" | "materials" | "brands";
 
 export type JobStatus = "scheduled" | "confirmed" | "in_progress" | "completed" | "cancelled";
 export type Priority = "low" | "normal" | "high" | "urgent";
@@ -22,12 +22,16 @@ export interface Job {
   is_recurring: number;
   recurrence_interval: string;
   next_recurrence_date: string;
+  brand_id?: number | null;
   customer_name?: string;
   customer_phone?: string;
   technician_name?: string | null;
   technician_color?: string | null;
   service_type_name?: string | null;
   service_type_color?: string | null;
+  brand_name?: string | null;
+  brand_color_primary?: string | null;
+  brand_color_secondary?: string | null;
   job_notes?: JobNote[];
   checklist?: ChecklistItem[];
   job_materials?: JobMaterial[];
@@ -68,7 +72,18 @@ export interface ServiceType {
   default_duration: number;
   default_price: number;
   color: string;
+  brand_id?: number | null;
   created_at: string;
+}
+
+export interface Brand {
+  id: number;
+  name: string;
+  slug: string;
+  color_primary: string | null;
+  color_secondary: string | null;
+  logo_r2_key: string | null;
+  active: number;
 }
 
 export interface JobNote {
@@ -118,8 +133,12 @@ export interface Invoice {
   notes: string;
   due_date: string;
   paid_date: string;
+  brand_id?: number | null;
   customer_name?: string;
   job_identifier?: string;
+  brand_name?: string | null;
+  brand_color_primary?: string | null;
+  brand_color_secondary?: string | null;
   lines?: InvoiceLine[];
   created_at: string;
   updated_at: string;
