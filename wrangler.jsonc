@@ -2,7 +2,7 @@
   // Cloudflare Workers config for the Westchase Painting field service app.
   // Account: admin@goparadigmportal.com. Domain (my.nobletampa.com) added later.
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "westchase-fieldservice",
+  "name": "noble-crm",
   "main": "src/server/index.ts",
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
