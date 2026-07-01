@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "preact/hooks";
+import { useState, useCallback, useEffect, useRef } from "preact/hooks";
 import { api } from "../api";
 import { authClient } from "../auth-client";
 import type {
@@ -13,6 +13,40 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   const [stats, setStats] = useState<Stats>({ jobs: 0, customers: 0, technicians: 0, service_types: 0, today_jobs: 0, upcoming_jobs: 0, completed_jobs: 0, revenue: 0, invoices_outstanding: 0, invoices_overdue: 0 });
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // ── Active account (multi-account switcher) ──
+  // null = "All Accounts". Persisted per-user so Will's selection and Leo's
+  // selection never bleed into each other on a shared machine. Technicians
+  // never get an account scope (their data is ownership-scoped server-side
+  // and the switcher is hidden for them).
+  const brandStorageKey = `noble.activeBrand.${currentUser?.id ?? "anon"}`;
+  const [activeBrandId, setActiveBrandIdState] = useState<number | null>(() => {
+    if (!currentUser || currentUser.role === "technician") return null;
+    try {
+      const raw = localStorage.getItem(brandStorageKey);
+      const n = raw ? parseInt(raw, 10) : NaN;
+      return Number.isInteger(n) && n > 0 ? n : null;
+    } catch {
+      return null;
+    }
+  });
+  // Ref mirror so the stable fetch callbacks below (deliberately created with
+  // [] deps and reused everywhere) always read the CURRENT selection without
+  // re-creating every callback (and everything downstream of them) on switch.
+  const activeBrandRef = useRef<number | null>(activeBrandId);
+  const setActiveBrandId = useCallback((id: number | null) => {
+    activeBrandRef.current = id;
+    setActiveBrandIdState(id);
+    try {
+      if (id === null) localStorage.removeItem(brandStorageKey);
+      else localStorage.setItem(brandStorageKey, String(id));
+    } catch { /* storage unavailable -- selection just won't persist */ }
+  }, [brandStorageKey]);
+  // Appends the active account to a list/dashboard query string.
+  const withBrand = (params: URLSearchParams) => {
+    if (activeBrandRef.current !== null) params.set("brand_id", String(activeBrandRef.current));
+    return params;
+  };
 
   // Jobs
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -85,12 +119,14 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   // ── Fetch helpers ──
 
   const fetchStats = useCallback(async () => {
-    const data = await api<Stats>("GET", "/api/stats");
+    const params = withBrand(new URLSearchParams());
+    const qs = params.toString();
+    const data = await api<Stats>("GET", `/api/stats${qs ? `?${qs}` : ""}`);
     setStats(data);
   }, []);
 
   const fetchJobs = useCallback(async (pag: PaginatedState, search: string, status: string) => {
-    const params = new URLSearchParams({ page: String(pag.page), limit: String(pag.limit) });
+    const params = withBrand(new URLSearchParams({ page: String(pag.page), limit: String(pag.limit) }));
     if (search) params.set("search", search);
     if (status) params.set("status", status);
     const data = await api<{ jobs: Job[]; total: number }>("GET", `/api/jobs?${params}`);
@@ -99,7 +135,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   }, []);
 
   const fetchCustomers = useCallback(async (pag: PaginatedState, search: string, status = "") => {
-    const params = new URLSearchParams({ page: String(pag.page), limit: String(pag.limit) });
+    const params = withBrand(new URLSearchParams({ page: String(pag.page), limit: String(pag.limit) }));
     if (search) params.set("search", search);
     if (status) params.set("status", status);
     const data = await api<{ customers: Customer[]; total: number }>("GET", `/api/customers?${params}`);
@@ -133,12 +169,13 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   }, []);
 
   const fetchServiceAgreements = useCallback(async () => {
-    const data = await api<{ service_agreements: ServiceAgreement[] }>("GET", "/api/service-agreements");
+    const qs = withBrand(new URLSearchParams()).toString();
+    const data = await api<{ service_agreements: ServiceAgreement[] }>("GET", `/api/service-agreements${qs ? `?${qs}` : ""}`);
     setServiceAgreements(data.service_agreements);
   }, []);
 
   const fetchInvoices = useCallback(async (pag: PaginatedState, status: string) => {
-    const params = new URLSearchParams({ page: String(pag.page), limit: String(pag.limit) });
+    const params = withBrand(new URLSearchParams({ page: String(pag.page), limit: String(pag.limit) }));
     if (status) params.set("status", status);
     const data = await api<{ invoices: Invoice[]; total: number }>("GET", `/api/invoices?${params}`);
     setInvoices(data.invoices);
@@ -146,7 +183,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   }, []);
 
   const fetchEstimates = useCallback(async (pag: PaginatedState, search: string, status: string) => {
-    const params = new URLSearchParams({ page: String(pag.page), limit: String(pag.limit) });
+    const params = withBrand(new URLSearchParams({ page: String(pag.page), limit: String(pag.limit) }));
     if (search) params.set("search", search);
     if (status) params.set("status", status);
     const data = await api<{ estimates: Estimate[]; total: number }>("GET", `/api/estimates?${params}`);
@@ -155,13 +192,15 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   }, []);
 
   const fetchSchedule = useCallback(async (start: string, end: string) => {
-    const data = await api<{ jobs: Job[] }>("GET", `/api/schedule?start=${start}&end=${end}`);
+    const params = withBrand(new URLSearchParams({ start, end }));
+    const data = await api<{ jobs: Job[] }>("GET", `/api/schedule?${params}`);
     setScheduleJobs(data.jobs);
   }, []);
 
   const fetchLookups = useCallback(async () => {
+    const custQs = withBrand(new URLSearchParams()).toString();
     const [c, t] = await Promise.all([
-      api<{ customers: CustomerLookup[] }>("GET", "/api/customers/all"),
+      api<{ customers: CustomerLookup[] }>("GET", `/api/customers/all${custQs ? `?${custQs}` : ""}`),
       api<{ technicians: TechnicianLookup[] }>("GET", "/api/technicians/all"),
     ]);
     setCustomerLookup(c.customers);
@@ -193,7 +232,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
 
   useEffect(() => {
     fetchJobs(jobsPag, jobsSearch, jobsStatusFilter).catch((err) => setError((err as Error).message));
-  }, [jobsPag.page, jobsSearch, jobsStatusFilter]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [jobsPag.page, jobsSearch, jobsStatusFilter, activeBrandId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // These two also run on mount (a dependency array only skips *re-runs*
   // where nothing changed, not the first run) -- same 403-family the
@@ -201,12 +240,12 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   useEffect(() => {
     if (currentUser?.role === "technician") return;
     fetchCustomers(customersPag, customersSearch, customersStatusFilter).catch((err) => setError((err as Error).message));
-  }, [customersPag.page, customersSearch, customersStatusFilter]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [customersPag.page, customersSearch, customersStatusFilter, activeBrandId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (currentUser?.role === "technician") return;
     fetchInvoices(invoicesPag, invoicesStatusFilter).catch((err) => setError((err as Error).message));
-  }, [invoicesPag.page, invoicesStatusFilter]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [invoicesPag.page, invoicesStatusFilter, activeBrandId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Estimates are also part of the technician-forbidden resource family
   // (see the blanket role-gate middleware in src/server/index.ts) -- skip
@@ -214,11 +253,36 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   useEffect(() => {
     if (currentUser?.role === "technician") return;
     fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter).catch((err) => setError((err as Error).message));
-  }, [estimatesPag.page, estimatesSearch, estimatesStatusFilter]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [estimatesPag.page, estimatesSearch, estimatesStatusFilter, activeBrandId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     fetchSchedule(scheduleStart, scheduleEnd).catch((err) => setError((err as Error).message));
-  }, [scheduleStart, scheduleEnd]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [scheduleStart, scheduleEnd, activeBrandId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Account switch: refresh the surfaces the per-list effects above don't
+  // cover (dashboard stats, recurring agreements, customer dropdown lookup).
+  // Skipped on mount -- the initial-load effect already fetched everything.
+  const brandSwitchMounted = useRef(false);
+  useEffect(() => {
+    if (!brandSwitchMounted.current) { brandSwitchMounted.current = true; return; }
+    const tasks = [fetchStats()];
+    if (currentUser?.role !== "technician") {
+      tasks.push(fetchServiceAgreements(), fetchLookups());
+    }
+    Promise.allSettled(tasks).then((results) => {
+      const firstFailure = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+      if (firstFailure) setError((firstFailure.reason as Error).message);
+    });
+  }, [activeBrandId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // If the active account disappears (brand deleted / stale localStorage id
+  // from another environment), fall back to All Accounts rather than
+  // filtering everything down to nothing forever.
+  useEffect(() => {
+    if (activeBrandId !== null && brands.length > 0 && !brands.some((b) => b.id === activeBrandId)) {
+      setActiveBrandId(null);
+    }
+  }, [brands, activeBrandId, setActiveBrandId]);
 
   // ── Jobs CRUD ──
 
@@ -507,9 +571,29 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   // ── Brands CRUD ──
 
   const addBrand = useCallback(async (data: { name: string; slug: string; color_primary?: string; color_secondary?: string; active?: number; review_url?: string }) => {
-    await api("POST", "/api/brands", data);
+    const created = await api<Brand>("POST", "/api/brands", data);
     await fetchBrands();
+    return created;
   }, [fetchBrands]);
+
+  // ── Demo workspace (admin-only; the server 403s everyone else) ──
+  const resetDemo = useCallback(async () => {
+    const res = await api<{ ok: boolean; brand_id: number }>("POST", "/api/demo/reset");
+    // The demo cast touches every surface -- refresh all of it.
+    await fetchBrands();
+    const tasks = [
+      fetchStats(),
+      fetchJobs(jobsPag, jobsSearch, jobsStatusFilter),
+      fetchSchedule(scheduleStart, scheduleEnd),
+      fetchCustomers(customersPag, customersSearch, customersStatusFilter),
+      fetchInvoices(invoicesPag, invoicesStatusFilter),
+      fetchEstimates(estimatesPag, estimatesSearch, estimatesStatusFilter),
+      fetchLookups(),
+      fetchServiceAgreements(),
+    ];
+    await Promise.allSettled(tasks);
+    return { brand_id: res.brand_id };
+  }, [jobsPag, jobsSearch, jobsStatusFilter, scheduleStart, scheduleEnd, customersPag, customersSearch, customersStatusFilter, invoicesPag, invoicesStatusFilter, estimatesPag, estimatesSearch, estimatesStatusFilter, fetchBrands, fetchStats, fetchJobs, fetchSchedule, fetchCustomers, fetchInvoices, fetchEstimates, fetchLookups, fetchServiceAgreements]);
 
   const updateBrand = useCallback(async (id: number, data: Partial<Brand>) => {
     await api("PUT", `/api/brands/${id}`, data);
@@ -816,6 +900,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
   return {
     navigate, isAgent, stats,
     currentUser, logout,
+    activeBrandId, setActiveBrandId, resetDemo,
     jobs, jobsPag, setJobsPage, jobsSearch, setJobsSearch, jobsStatusFilter, setJobsStatusFilter,
     addJob, updateJob, deleteJob,
     selectedJob, selectJob, addJobNote, deleteJobNote,

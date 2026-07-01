@@ -57,8 +57,14 @@ export const customers = sqliteTable('customers', {
   updatedAt: text('updated_at').default(nowTimestamp()),
   // NEW (Phase 5): map to a Stripe customer once payments are live.
   stripeCustomerId: text('stripe_customer_id'),
+  // NEW (multi-account pass): which account/brand this customer belongs to.
+  // Nullable (a customer CAN be unassigned), but the 0008 migration backfills
+  // every pre-existing customer to the Westchase Painting brand, and the
+  // account switcher's create-customer flow defaults it to the active account.
+  brandId: integer('brand_id').references(() => brands.id),
 }, (table) => [
   index('idx_customers_name').on(table.name),
+  index('idx_customers_brand').on(table.brandId),
 ]);
 
 export const technicians = sqliteTable('technicians', {
@@ -256,6 +262,11 @@ export const brands = sqliteTable('brands', {
   // brand wants customers pointed to after a completed job. Nullable --
   // request-review honestly no-ops when unset. Validated as a URL when present.
   reviewUrl: text('review_url'),
+  // NEW (multi-account pass): 1 marks the throwaway demo workspace ("Sunshine
+  // Painting Co (Demo)"). POST /api/demo/reset refuses to wipe any brand whose
+  // is_demo != 1 -- this flag is the safety interlock that makes the reset
+  // architecturally incapable of touching real Westchase/TKC data.
+  isDemo: integer('is_demo').notNull().default(0),
 });
 
 export const estimates = sqliteTable('estimates', {

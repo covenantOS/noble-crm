@@ -1,6 +1,7 @@
 import { useState } from "preact/hooks";
 import { useApp } from "../context";
 import { X } from "lucide-preact";
+import type { Brand } from "../types";
 
 function slugify(name: string): string {
   return name
@@ -10,7 +11,7 @@ function slugify(name: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-export function CreateBrand({ onClose }: { onClose: () => void }) {
+export function CreateBrand({ onClose, onCreated }: { onClose: () => void; onCreated?: (brand: Brand) => void }) {
   const { addBrand, setError } = useApp();
 
   const [name, setName] = useState("");
@@ -32,13 +33,14 @@ export function CreateBrand({ onClose }: { onClose: () => void }) {
     if (!slug.trim()) { setError("Slug is required"); return; }
     setSubmitting(true);
     try {
-      await addBrand({
+      const created = await addBrand({
         name: name.trim(),
         slug: slug.trim(),
         color_primary: colorPrimary,
         color_secondary: colorSecondary,
         ...(reviewUrl.trim() ? { review_url: reviewUrl.trim() } : {}),
       });
+      onCreated?.(created);
       onClose();
     } catch (err) {
       setError((err as Error).message);

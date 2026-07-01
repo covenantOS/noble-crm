@@ -4,7 +4,7 @@ import { X } from "lucide-preact";
 import type { Customer } from "../types";
 
 export function CreateCustomer({ onClose }: { onClose: () => void }) {
-  const { addCustomer, setError } = useApp();
+  const { addCustomer, brands, activeBrandId, setError } = useApp();
 
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -16,6 +16,9 @@ export function CreateCustomer({ onClose }: { onClose: () => void }) {
   const [notes, setNotes] = useState("");
   const [status, setStatus] = useState("lead");
   const [source, setSource] = useState("");
+  // Defaults to the active account (still user-changeable). When All Accounts
+  // is active this starts blank, exactly as before the switcher existed.
+  const [brandId, setBrandId] = useState(activeBrandId !== null ? String(activeBrandId) : "");
   const [submitting, setSubmitting] = useState(false);
 
   const handleSubmit = async (e: Event) => {
@@ -28,6 +31,7 @@ export function CreateCustomer({ onClose }: { onClose: () => void }) {
         status: status as Customer["status"],
         // Empty source select => null (unknown), not "".
         source: source ? (source as Customer["source"]) : null,
+        brand_id: brandId ? parseInt(brandId, 10) : null,
       });
       onClose();
     } catch (err) {
@@ -91,6 +95,15 @@ export function CreateCustomer({ onClose }: { onClose: () => void }) {
                 <option value="repeat">Repeat</option>
                 <option value="website">Website</option>
                 <option value="other">Other</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Account</label>
+              <select value={brandId} onChange={(e) => setBrandId((e.target as HTMLSelectElement).value)}>
+                <option value="">Unassigned</option>
+                {brands.filter((b) => b.active === 1).map((b) => (
+                  <option key={b.id} value={b.id}>{b.name}{b.is_demo === 1 ? " (Demo)" : ""}</option>
+                ))}
               </select>
             </div>
             <div class="form-group full-width">

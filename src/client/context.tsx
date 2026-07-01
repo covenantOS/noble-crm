@@ -23,6 +23,18 @@ export interface AppContextValue {
   currentUser: CurrentUser | null;
   logout: () => Promise<void>;
 
+  // Active account (multi-account switcher). null = "All Accounts". Persisted
+  // per-user in localStorage; every list/dashboard fetch passes it as
+  // ?brand_id=. Always null for technicians (their data is ownership-scoped,
+  // not account-scoped -- the switcher is hidden for them).
+  activeBrandId: number | null;
+  setActiveBrandId: (id: number | null) => void;
+  // Admin-only demo workspace reset -- idempotently (re)creates the
+  // "Sunshine Painting Co (Demo)" account and its full dataset, then
+  // refreshes all loaded data. Resolves with the demo brand's id so the
+  // caller can switch straight into it.
+  resetDemo: () => Promise<{ brand_id: number }>;
+
   // Jobs
   jobs: Job[];
   jobsPag: PaginatedState;
@@ -127,7 +139,8 @@ export interface AppContextValue {
 
   // Brands
   brands: Brand[];
-  addBrand: (data: { name: string; slug: string; color_primary?: string; color_secondary?: string; active?: number; review_url?: string }) => Promise<void>;
+  // Returns the created brand so the account switcher can jump straight to it.
+  addBrand: (data: { name: string; slug: string; color_primary?: string; color_secondary?: string; active?: number; review_url?: string }) => Promise<Brand>;
   updateBrand: (id: number, data: Partial<Brand>) => Promise<void>;
   uploadBrandLogo: (id: number, file: File) => Promise<void>;
 

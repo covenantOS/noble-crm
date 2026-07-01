@@ -181,6 +181,112 @@ input, select, textarea, button { accent-color: var(--navy); }
   color: var(--gold-bright);
 }
 
+/* ── Account switcher (multi-account) ────────────────────────────────
+   Sits directly under the crest. The trigger is a full-width, softly inset
+   control on the navy sidebar; the popover is a light card floated over it —
+   deliberately the same register as Linear's workspace switcher, never a
+   native <select>. The active account's color arrives via --account-accent
+   (sanitized hex set on :root by the app shell) and is used only as a small
+   accent: the dot here and the active-nav tick below. */
+
+.account-switcher { position: relative; padding: 12px 12px 4px; }
+
+.account-trigger {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 8px 10px; border-radius: 9px; cursor: pointer;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  color: #eef1f6; font-family: var(--font); text-align: left;
+  transition: background 0.14s, border-color 0.14s, box-shadow 0.14s;
+}
+.account-trigger:hover { background: rgba(255, 255, 255, 0.09); border-color: rgba(255, 255, 255, 0.16); }
+.account-trigger.open { background: rgba(255, 255, 255, 0.09); border-color: rgba(201, 162, 39, 0.45); box-shadow: 0 0 0 3px rgba(201, 162, 39, 0.10); }
+.account-trigger:disabled { opacity: 0.6; cursor: default; }
+
+.account-dot {
+  width: 22px; height: 22px; border-radius: 7px; flex-shrink: 0;
+  background: var(--account-accent, var(--gold));
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22), 0 1px 3px rgba(0, 0, 0, 0.35);
+  display: inline-flex; align-items: center; justify-content: center; color: #fff;
+}
+.account-dot-all {
+  background: linear-gradient(135deg, var(--navy-500), var(--navy-700));
+  color: var(--gold-bright);
+}
+
+.account-trigger-label { display: flex; flex-direction: column; min-width: 0; flex: 1; line-height: 1.15; }
+.account-trigger-name {
+  font-size: 13px; font-weight: 600; color: #fff;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.account-trigger-sub {
+  font-size: 10px; font-weight: 600; letter-spacing: 0.09em; text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.42); margin-top: 1px;
+}
+.account-trigger-chevron { flex-shrink: 0; color: rgba(255, 255, 255, 0.45); }
+.account-trigger:hover .account-trigger-chevron { color: rgba(255, 255, 255, 0.75); }
+
+.account-menu {
+  position: absolute; left: 12px; right: 12px; top: calc(100% - 2px); z-index: 90;
+  background: var(--card-bg); border: 1px solid var(--border-strong);
+  border-radius: var(--radius); box-shadow: var(--shadow-lg);
+  padding: 6px; animation: pop 0.16s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+.account-menu-title {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--text-muted); padding: 6px 9px 4px;
+}
+.account-menu-divider { height: 1px; background: var(--border); margin: 6px 4px; }
+
+.account-item {
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  padding: 7px 9px; border: none; background: none; border-radius: var(--radius-sm);
+  font-family: var(--font); font-size: 13px; font-weight: 500; color: var(--text);
+  cursor: pointer; text-align: left; transition: background 0.12s;
+}
+.account-item:hover { background: var(--row-hover); }
+.account-item.selected { background: var(--primary-light); }
+.account-item.selected .account-item-name { font-weight: 600; color: var(--navy-deep); }
+.account-item .account-dot { width: 18px; height: 18px; border-radius: 6px; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.10); }
+.account-item .account-dot-all { color: var(--gold-bright); }
+.account-item-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.account-item-check { color: var(--gold-deep); flex-shrink: 0; }
+.account-item:disabled { opacity: 0.55; cursor: default; }
+
+.account-item-action { color: var(--text-secondary); font-weight: 500; }
+.account-item-action:hover { color: var(--navy-deep); }
+.account-action-icon {
+  width: 18px; height: 18px; border-radius: 6px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px dashed var(--border-strong); color: var(--text-secondary);
+}
+.account-item-action:hover .account-action-icon { border-color: var(--text-muted); color: var(--navy-deep); }
+
+/* Demo workspace badge — used in the switcher, context ribbon, brand list. */
+.demo-badge {
+  font-size: 9px; font-weight: 800; letter-spacing: 0.09em;
+  padding: 2px 6px; border-radius: 5px; flex-shrink: 0;
+  background: rgba(15, 118, 110, 0.12); color: #0f766e;
+  border: 1px solid rgba(15, 118, 110, 0.3);
+}
+
+/* Account context ribbon — pinned above every page while a specific account
+   is active, so page headers always carry the account name. */
+.account-context {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 34px; font-size: 12px; font-weight: 600; color: var(--text-secondary);
+  background: var(--bg-tint); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 50;
+}
+.account-context-dot { width: 8px; height: 8px; border-radius: 3px; flex-shrink: 0; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.10); }
+.account-context-name { color: var(--navy-deep); }
+.account-context-clear {
+  margin-left: auto; border: none; background: none; cursor: pointer;
+  font-family: var(--font); font-size: 11.5px; font-weight: 600; color: var(--text-muted);
+  padding: 2px 6px; border-radius: 5px; transition: color 0.12s, background 0.12s;
+}
+.account-context-clear:hover { color: var(--navy-deep); background: var(--row-hover); }
+
 .sidebar-nav { padding: 10px; flex: 1; }
 
 .sidebar-section-title {
@@ -207,7 +313,10 @@ input, select, textarea, button { accent-color: var(--navy); }
 .sidebar-item.active svg { opacity: 1; color: var(--gold-bright); }
 .sidebar-item.active::before {
   content: ""; position: absolute; left: 0; top: 6px; bottom: 6px; width: 3px;
-  border-radius: 0 3px 3px 0; background: var(--gold-bright);
+  border-radius: 0 3px 3px 0;
+  /* Subtle per-account accent: the active-nav tick picks up the active
+     account's color (falls back to Noble gold under All Accounts). */
+  background: var(--account-accent, var(--gold-bright));
 }
 
 .sidebar-badge {
@@ -756,6 +865,7 @@ input, select, textarea, button { accent-color: var(--navy); }
   .sidebar-overlay.open { opacity: 1; pointer-events: auto; }
 
   .page { padding: 18px 16px; }
+  .account-context { padding: 7px 16px; }
   .page-header h1 { font-size: 23px; }
   .page-header { flex-wrap: wrap; }
   /* Detail action rows wrap instead of clipping the last button off-screen */

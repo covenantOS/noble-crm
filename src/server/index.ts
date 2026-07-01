@@ -185,6 +185,36 @@ async function brandExists(db: ReturnType<typeof getDb>, id: number | null | und
   return !!row;
 }
 
+// ── Multi-account (brand) list scoping ─────────────────────────────
+// Every list/stats endpoint that returns account-ownable data (customers,
+// jobs, estimates, invoices, service agreements, schedule, dashboard stats)
+// accepts an optional ?brand_id= filter. Validation contract:
+//   - garbage ("abc", "-3", "1.5", "0") -> 400 via the Zod regex below
+//     (positive integers only; the defaultHook turns the failure into a
+//     clean 400 { error }),
+//   - a well-formed id for a brand that doesn't exist -> 404 via
+//     resolveBrandFilter,
+//   - absent -> null (no filtering -- "All Accounts").
+// COMPOSITION RULE (security-critical): the brand condition is always pushed
+// into the SAME conditions array as the technician ownership force-filter --
+// it composes with (never replaces) that scoping. A technician filtered to a
+// brand still only ever sees their own/crew jobs.
+const zBrandIdQuery = z.string().regex(/^[1-9]\d*$/, { message: "brand_id must be a positive integer" }).optional();
+
+// { ok:true, brandId:null } = no filter requested; { ok:false } = the id was
+// well-formed but no such brand exists (caller returns its own typed 404 --
+// OpenAPIHono's typed handlers reject a raw Response minted inside a helper).
+async function resolveBrandFilter(
+  db: ReturnType<typeof getDb>,
+  raw: string | undefined,
+): Promise<{ ok: true; brandId: number | null } | { ok: false; brandId?: never }> {
+  if (!raw) return { ok: true, brandId: null };
+  const brandId = parseInt(raw, 10);
+  const row = await db.select({ id: schema.brands.id }).from(schema.brands).where(eq(schema.brands.id, brandId)).get();
+  if (!row) return { ok: false };
+  return { ok: true, brandId };
+}
+
 // ── Auth ───────────────────────────────────────────────────────────
 // better-auth owns everything under /api/auth/* (sign-up, sign-in, sign-out,
 // session, etc). Mounted before the auth-required middleware below, and the
@@ -539,6 +569,10 @@ const CustomerSchema = z.object({
   notes: z.string(),
   status: z.string(),
   source: z.string().nullable(),
+  // NEW (multi-account pass): which account/brand owns this customer.
+  brand_id: z.number().int().nullable().optional(),
+  brand_name: z.string().nullable().optional(),
+  brand_color_primary: z.string().nullable().optional(),
   job_count: z.number().int().optional(),
   created_at: z.string(),
   updated_at: z.string(),
@@ -580,6 +614,9 @@ const BrandSchema = z.object({
   // NEW (review-request pass): nullable review-site URL. See
   // /api/jobs/{id}/request-review.
   review_url: z.string().nullable().optional(),
+  // NEW (multi-account pass): 1 marks the resettable demo workspace. Not
+  // settable through create/update -- only POST /api/demo/reset mints it.
+  is_demo: z.number().int().optional(),
 }).openapi("Brand");
 
 const EstimateSchema = z.object({
@@ -948,6 +985,13 @@ async function enqueueJobReminder(env: AppBindings["Bindings"], jobId: number, s
 const getStats = createRoute({
   method: "get",
   path: "/api/stats",
+  request: {
+    // Optional account scoping -- see zBrandIdQuery. When present, every
+    // brand-ownable number (jobs, customers, revenue, invoices) is computed
+    // for that account only. technicians stays global (crew is shared company
+    // data, not account-owned).
+    query: z.object({ brand_id: zBrandIdQuery }),
+  },
   responses: {
     200: {
       description: "Dashboard stats",
@@ -964,37 +1008,54 @@ const getStats = createRoute({
         invoices_overdue: z.number(),
       }) } },
     },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Brand not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(getStats, async (c) => {
   const db = getDb(c.env);
-  const jobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs).get();
-  const customers = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.customers).get();
+  const brandRes = await resolveBrandFilter(db, c.req.valid("query").brand_id);
+  if (!brandRes.ok) return c.json({ error: "Brand not found" }, 404);
+  const brandFilter = brandRes.brandId;
+  // Per-table brand conditions (undefined = unscoped). Composable via and()
+  // with each stat's own conditions below.
+  const jobBrand = brandFilter === null ? undefined : eq(schema.jobs.brandId, brandFilter);
+  const customerBrand = brandFilter === null ? undefined : eq(schema.customers.brandId, brandFilter);
+  const invoiceBrand = brandFilter === null ? undefined : eq(schema.invoices.brandId, brandFilter);
+  const serviceTypeBrand = brandFilter === null ? undefined : eq(schema.serviceTypes.brandId, brandFilter);
+
+  const jobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs).where(jobBrand).get();
+  const customers = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.customers).where(customerBrand).get();
   const technicians = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.technicians).where(eq(schema.technicians.active, 1)).get();
-  const serviceTypes = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.serviceTypes).get();
+  const serviceTypes = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.serviceTypes).where(serviceTypeBrand).get();
   // "Today" in Tampa (America/New_York), NOT UTC -- a UTC today rolls over in
   // the evening Tampa time and would miscount today's/upcoming jobs.
   const today = todayInTampa();
-  const todayJobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs).where(eq(schema.jobs.scheduledDate, today)).get();
+  const todayJobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs).where(and(eq(schema.jobs.scheduledDate, today), jobBrand)).get();
   const upcomingJobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs)
-    .where(and(inArray(schema.jobs.status, ["scheduled", "confirmed"]), sql`${schema.jobs.scheduledDate} >= ${today}`))
+    .where(and(inArray(schema.jobs.status, ["scheduled", "confirmed"]), sql`${schema.jobs.scheduledDate} >= ${today}`, jobBrand))
     .get();
-  const completedJobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs).where(eq(schema.jobs.status, "completed")).get();
+  const completedJobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs).where(and(eq(schema.jobs.status, "completed"), jobBrand)).get();
   // Revenue = money ACTUALLY collected: the sum of paid payments (net of
   // discounts/surcharges, i.e. the real cash received), NOT completed-job
   // prices (which are pre-invoice, tax-exclusive, and ignore whether anyone
-  // actually paid).
-  const revenue = await db.select({ total: sql<number>`COALESCE(SUM(${schema.payments.amount}), 0)` }).from(schema.payments).where(eq(schema.payments.status, "paid")).get();
+  // actually paid). Brand scoping goes through the payment's invoice (payments
+  // have no brand column of their own).
+  const revenue = await db.select({ total: sql<number>`COALESCE(SUM(${schema.payments.amount}), 0)` })
+    .from(schema.payments)
+    .leftJoin(schema.invoices, eq(schema.payments.invoiceId, schema.invoices.id))
+    .where(and(eq(schema.payments.status, "paid"), invoiceBrand))
+    .get();
   // Overdue = already flipped to "overdue" OR still "sent" but past its due
   // date. Computed as a pure COUNT here (no write) so a dashboard load stays
   // idempotent -- the actual status flip happens in the scheduled() cron via
   // updateOverdueInvoices(). Outstanding excludes those now-overdue sent ones.
   const invoicesOutstanding = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.invoices)
-    .where(and(eq(schema.invoices.status, "sent"), sql`NOT (${schema.invoices.dueDate} != '' AND ${schema.invoices.dueDate} < ${today})`))
+    .where(and(eq(schema.invoices.status, "sent"), sql`NOT (${schema.invoices.dueDate} != '' AND ${schema.invoices.dueDate} < ${today})`, invoiceBrand))
     .get();
   const invoicesOverdue = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.invoices)
-    .where(sql`${schema.invoices.status} = 'overdue' OR (${schema.invoices.status} = 'sent' AND ${schema.invoices.dueDate} != '' AND ${schema.invoices.dueDate} < ${today})`)
+    .where(and(sql`(${schema.invoices.status} = 'overdue' OR (${schema.invoices.status} = 'sent' AND ${schema.invoices.dueDate} != '' AND ${schema.invoices.dueDate} < ${today}))`, invoiceBrand))
     .get();
   return c.json({
     jobs: jobs?.count || 0,
@@ -1201,6 +1262,7 @@ const listJobs = createRoute({
       status: z.string().optional(),
       date: z.string().optional(),
       technician_id: z.string().optional(),
+      brand_id: zBrandIdQuery,
     }),
   },
   responses: {
@@ -1208,6 +1270,8 @@ const listJobs = createRoute({
       description: "Paginated job list",
       content: { "application/json": { schema: z.object({ jobs: z.array(JobSchema), total: z.number().int() }) } },
     },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Brand not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -1220,6 +1284,14 @@ app.openapi(listJobs, async (c) => {
 
   const user = c.get("user");
   const conditions = [];
+  // Account scoping COMPOSES with (never replaces) the technician ownership
+  // force-filter pushed below -- both land in the same AND'd conditions array.
+  const brandRes = await resolveBrandFilter(db, q.brand_id);
+  if (!brandRes.ok) return c.json({ error: "Brand not found" }, 404);
+  const brandFilter = brandRes.brandId;
+  if (brandFilter !== null) {
+    conditions.push(eq(schema.jobs.brandId, brandFilter));
+  }
   if (q.search) {
     conditions.push(or(
       likeEscaped(schema.jobs.identifier, q.search),
@@ -1379,6 +1451,15 @@ app.openapi(createJob, async (c) => {
     return c.json({ error: "end_date cannot be before scheduled_date" }, 400);
   }
 
+  // Multi-account default: when the caller doesn't mention brand_id at all,
+  // inherit the customer's account. An EXPLICIT null ("no brand") is
+  // respected unchanged -- only an omitted field defaults.
+  let brandId: number | null = data.brand_id ?? null;
+  if (data.brand_id === undefined) {
+    const custBrand = await db.select({ brandId: schema.customers.brandId }).from(schema.customers).where(eq(schema.customers.id, data.customer_id)).get();
+    brandId = custBrand?.brandId ?? null;
+  }
+
   const identifier = await nextIdentifier(db);
 
   // If address is empty, use customer address
@@ -1424,7 +1505,7 @@ app.openapi(createJob, async (c) => {
     notes: data.notes || "",
     isRecurring: data.is_recurring || 0,
     recurrenceInterval: data.recurrence_interval || "",
-    brandId: data.brand_id ?? null,
+    brandId,
     endDate: data.end_date ?? null,
   });
 
@@ -2086,6 +2167,7 @@ const listCustomers = createRoute({
       limit: z.string().optional(),
       search: z.string().optional(),
       status: z.string().optional(),
+      brand_id: zBrandIdQuery,
     }),
   },
   responses: {
@@ -2093,6 +2175,8 @@ const listCustomers = createRoute({
       description: "Paginated customer list",
       content: { "application/json": { schema: z.object({ customers: z.array(CustomerSchema), total: z.number().int() }) } },
     },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Brand not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -2104,6 +2188,12 @@ app.openapi(listCustomers, async (c) => {
   const offset = (page - 1) * limit;
 
   const conditions = [];
+  const brandRes = await resolveBrandFilter(db, q.brand_id);
+  if (!brandRes.ok) return c.json({ error: "Brand not found" }, 404);
+  const brandFilter = brandRes.brandId;
+  if (brandFilter !== null) {
+    conditions.push(eq(schema.customers.brandId, brandFilter));
+  }
   if (q.search) {
     conditions.push(or(
       likeEscaped(schema.customers.name, q.search),
@@ -2139,12 +2229,16 @@ app.openapi(listCustomers, async (c) => {
       notes: schema.customers.notes,
       status: schema.customers.status,
       source: schema.customers.source,
+      brand_id: schema.customers.brandId,
+      brand_name: schema.brands.name,
+      brand_color_primary: schema.brands.colorPrimary,
       created_at: sql<string>`COALESCE(${schema.customers.createdAt}, '')`,
       updated_at: sql<string>`COALESCE(${schema.customers.updatedAt}, '')`,
       job_count: sql<number>`COALESCE(${jobCountSub.cnt}, 0)`,
     })
     .from(schema.customers)
     .leftJoin(jobCountSub, eq(jobCountSub.customerId, schema.customers.id))
+    .leftJoin(schema.brands, eq(schema.customers.brandId, schema.brands.id))
     .where(where)
     .orderBy(asc(schema.customers.name))
     .limit(limit)
@@ -2157,19 +2251,28 @@ app.openapi(listCustomers, async (c) => {
 const listAllCustomers = createRoute({
   method: "get",
   path: "/api/customers/all",
+  request: {
+    query: z.object({ brand_id: zBrandIdQuery }),
+  },
   responses: {
     200: {
       description: "All customers (for dropdowns)",
-      content: { "application/json": { schema: z.object({ customers: z.array(z.object({ id: z.number().int(), name: z.string(), address: z.string() })) }) } },
+      content: { "application/json": { schema: z.object({ customers: z.array(z.object({ id: z.number().int(), name: z.string(), address: z.string(), brand_id: z.number().int().nullable() })) }) } },
     },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Brand not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(listAllCustomers, async (c) => {
   const db = getDb(c.env);
+  const brandRes = await resolveBrandFilter(db, c.req.valid("query").brand_id);
+  if (!brandRes.ok) return c.json({ error: "Brand not found" }, 404);
+  const brandFilter = brandRes.brandId;
   const customers = await db
-    .select({ id: schema.customers.id, name: schema.customers.name, address: schema.customers.address })
+    .select({ id: schema.customers.id, name: schema.customers.name, address: schema.customers.address, brand_id: schema.customers.brandId })
     .from(schema.customers)
+    .where(brandFilter === null ? undefined : eq(schema.customers.brandId, brandFilter))
     .orderBy(asc(schema.customers.name))
     .all();
   return c.json({ customers }, 200);
@@ -2197,6 +2300,9 @@ app.openapi(getCustomer, async (c) => {
   const idNum = toId(id);
   const customer = await db.select().from(schema.customers).where(eq(schema.customers.id, idNum)).get();
   if (!customer) return c.json({ error: "Customer not found" }, 404);
+  const customerBrand = customer.brandId
+    ? await db.select({ name: schema.brands.name, colorPrimary: schema.brands.colorPrimary }).from(schema.brands).where(eq(schema.brands.id, customer.brandId)).get()
+    : null;
   const customerOut = {
     id: customer.id,
     name: customer.name,
@@ -2209,6 +2315,9 @@ app.openapi(getCustomer, async (c) => {
     notes: customer.notes,
     status: customer.status,
     source: customer.source,
+    brand_id: customer.brandId,
+    brand_name: customerBrand?.name ?? null,
+    brand_color_primary: customerBrand?.colorPrimary ?? null,
     created_at: customer.createdAt ?? "",
     updated_at: customer.updatedAt ?? "",
   };
@@ -2345,17 +2454,22 @@ const createCustomer = createRoute({
         // optional and may be explicitly null (unknown).
         status: z.enum(CUSTOMER_STATUSES).optional(),
         source: z.enum(CUSTOMER_SOURCES).nullable().optional(),
+        // Multi-account: which account/brand owns this customer. Optional and
+        // nullable (an unassigned customer is legal); validated to exist below.
+        brand_id: z.number().int().nullable().optional(),
       }) } },
     },
   },
   responses: {
     201: { description: "Created", content: { "application/json": { schema: CustomerSchema } } },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(createCustomer, async (c) => {
   const db = getDb(c.env);
   const data = c.req.valid("json");
+  if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
   await db.insert(schema.customers).values({
     name: data.name,
     email: data.email || "",
@@ -2367,6 +2481,7 @@ app.openapi(createCustomer, async (c) => {
     notes: data.notes || "",
     status: data.status || "lead",
     source: data.source ?? null,
+    brandId: data.brand_id ?? null,
   });
   const customer = await db.select().from(schema.customers).orderBy(desc(schema.customers.id)).limit(1).get();
   const customerOut = {
@@ -2381,6 +2496,7 @@ app.openapi(createCustomer, async (c) => {
     notes: customer!.notes,
     status: customer!.status,
     source: customer!.source,
+    brand_id: customer!.brandId,
     created_at: customer!.createdAt ?? "",
     updated_at: customer!.updatedAt ?? "",
   };
@@ -2406,6 +2522,8 @@ const updateCustomer = createRoute({
         notes: z.string().optional(),
         status: z.enum(CUSTOMER_STATUSES).optional(),
         source: z.enum(CUSTOMER_SOURCES).nullable().optional(),
+        // Multi-account: reassign (or clear) the owning account.
+        brand_id: z.number().int().nullable().optional(),
       }) } },
     },
   },
@@ -2419,6 +2537,7 @@ app.openapi(updateCustomer, async (c) => {
   const db = getDb(c.env);
   const { id } = c.req.valid("param");
   const data = c.req.valid("json");
+  if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
   const updates: Record<string, unknown> = {};
   if (data.name !== undefined) updates.name = data.name;
   if (data.email !== undefined) updates.email = data.email;
@@ -2430,6 +2549,7 @@ app.openapi(updateCustomer, async (c) => {
   if (data.notes !== undefined) updates.notes = data.notes;
   if (data.status !== undefined) updates.status = data.status;
   if (data.source !== undefined) updates.source = data.source;
+  if (data.brand_id !== undefined) updates.brandId = data.brand_id;
   if (Object.keys(updates).length > 0) {
     updates.updatedAt = sql`(datetime('now'))`;
     await db.update(schema.customers).set(updates).where(eq(schema.customers.id, toId(id)));
@@ -2807,6 +2927,7 @@ app.openapi(listBrands, async (c) => {
       logo_r2_key: schema.brands.logoR2Key,
       active: schema.brands.active,
       review_url: schema.brands.reviewUrl,
+      is_demo: schema.brands.isDemo,
     })
     .from(schema.brands)
     .orderBy(asc(schema.brands.name))
@@ -2864,6 +2985,7 @@ app.openapi(createBrand, async (c) => {
     logo_r2_key: brand!.logoR2Key,
     active: brand!.active,
     review_url: brand!.reviewUrl,
+    is_demo: brand!.isDemo,
   };
   return c.json(brandOut, 201);
 });
@@ -3031,6 +3153,7 @@ const getSchedule = createRoute({
       start: z.string(),
       end: z.string(),
       technician_id: z.string().optional(),
+      brand_id: zBrandIdQuery,
     }),
   },
   responses: {
@@ -3038,6 +3161,8 @@ const getSchedule = createRoute({
       description: "Jobs within date range",
       content: { "application/json": { schema: z.object({ jobs: z.array(JobSchema) }) } },
     },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Brand not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -3045,7 +3170,15 @@ app.openapi(getSchedule, async (c) => {
   const db = getDb(c.env);
   const q = c.req.valid("query");
   const user = c.get("user");
-  const conditions = [sql`${schema.jobs.scheduledDate} >= ${q.start}`, sql`${schema.jobs.scheduledDate} <= ${q.end}`];
+  const conditions: SQL[] = [sql`${schema.jobs.scheduledDate} >= ${q.start}`, sql`${schema.jobs.scheduledDate} <= ${q.end}`];
+  // Account scoping composes with the technician force-filter below (same
+  // AND'd conditions array) -- it can never widen what a technician sees.
+  const brandRes = await resolveBrandFilter(db, q.brand_id);
+  if (!brandRes.ok) return c.json({ error: "Brand not found" }, 404);
+  const brandFilter = brandRes.brandId;
+  if (brandFilter !== null) {
+    conditions.push(eq(schema.jobs.brandId, brandFilter));
+  }
   if (user.role === "technician") {
     // Force-filter to the requester's own technician (lead OR crew -- see
     // isJobOwnerOrCrew/listJobs), overriding any technician_id query param.
@@ -3507,6 +3640,7 @@ const listInvoices = createRoute({
       limit: z.string().optional(),
       status: z.string().optional(),
       search: z.string().optional(),
+      brand_id: zBrandIdQuery,
     }),
   },
   responses: {
@@ -3517,6 +3651,8 @@ const listInvoices = createRoute({
         total: z.number().int(),
       }) } },
     },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Brand not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -3528,6 +3664,12 @@ app.openapi(listInvoices, async (c) => {
   const offset = (page - 1) * limit;
 
   const conditions = [];
+  const brandRes = await resolveBrandFilter(db, q.brand_id);
+  if (!brandRes.ok) return c.json({ error: "Brand not found" }, 404);
+  const brandFilter = brandRes.brandId;
+  if (brandFilter !== null) {
+    conditions.push(eq(schema.invoices.brandId, brandFilter));
+  }
   if (q.status) {
     conditions.push(eq(schema.invoices.status, q.status));
   }
@@ -3794,13 +3936,20 @@ app.openapi(createInvoice, async (c) => {
     const jobRow = await db.select({ id: schema.jobs.id }).from(schema.jobs).where(eq(schema.jobs.id, data.job_id)).get();
     if (!jobRow) return c.json({ error: "Job not found" }, 400);
   }
+  // Multi-account default: omitted brand_id inherits the customer's account
+  // (explicit null stays null) -- same rule as createJob/createEstimate.
+  let brandId: number | null = data.brand_id ?? null;
+  if (data.brand_id === undefined) {
+    const custBrand = await db.select({ brandId: schema.customers.brandId }).from(schema.customers).where(eq(schema.customers.id, data.customer_id)).get();
+    brandId = custBrand?.brandId ?? null;
+  }
   const invoiceId = await createInvoiceWithLines(db, {
     customerId: data.customer_id,
     jobId: data.job_id ?? null,
     taxRate: data.tax_rate || 0,
     notes: data.notes || "",
     dueDate: data.due_date || "",
-    brandId: data.brand_id ?? null,
+    brandId,
     lines: data.lines,
   });
   const result = await getInvoiceJoinedById(db, invoiceId);
@@ -4401,6 +4550,7 @@ const listEstimates = createRoute({
       limit: z.string().optional(),
       status: z.string().optional(),
       search: z.string().optional(),
+      brand_id: zBrandIdQuery,
     }),
   },
   responses: {
@@ -4408,6 +4558,8 @@ const listEstimates = createRoute({
       description: "Paginated estimate list",
       content: { "application/json": { schema: z.object({ estimates: z.array(EstimateSchema), total: z.number().int() }) } },
     },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Brand not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
@@ -4419,6 +4571,12 @@ app.openapi(listEstimates, async (c) => {
   const offset = (page - 1) * limit;
 
   const conditions = [];
+  const brandRes = await resolveBrandFilter(db, q.brand_id);
+  if (!brandRes.ok) return c.json({ error: "Brand not found" }, 404);
+  const brandFilter = brandRes.brandId;
+  if (brandFilter !== null) {
+    conditions.push(eq(schema.estimates.brandId, brandFilter));
+  }
   if (q.status) {
     conditions.push(eq(schema.estimates.status, q.status));
   }
@@ -4514,6 +4672,13 @@ app.openapi(createEstimate, async (c) => {
   const data = c.req.valid("json");
   if (!(await customerExists(db, data.customer_id))) return c.json({ error: "Customer not found" }, 400);
   if (!(await brandExists(db, data.brand_id))) return c.json({ error: "Brand not found" }, 400);
+  // Multi-account default: omitted brand_id inherits the customer's account
+  // (explicit null stays null) -- same rule as createJob/createInvoice.
+  let brandId: number | null = data.brand_id ?? null;
+  if (data.brand_id === undefined) {
+    const custBrand = await db.select({ brandId: schema.customers.brandId }).from(schema.customers).where(eq(schema.customers.id, data.customer_id)).get();
+    brandId = custBrand?.brandId ?? null;
+  }
   const identifier = await nextEstimateIdentifier(db);
   const taxRate = data.tax_rate || 0;
 
@@ -4527,7 +4692,7 @@ app.openapi(createEstimate, async (c) => {
   await db.insert(schema.estimates).values({
     identifier,
     customerId: data.customer_id,
-    brandId: data.brand_id ?? null,
+    brandId,
     status: "draft",
     subtotal: subtotalCents,
     taxRate,
@@ -5661,17 +5826,28 @@ function serviceAgreementJoinedSelect(db: ReturnType<typeof getDb>) {
 const listServiceAgreements = createRoute({
   method: "get",
   path: "/api/service-agreements",
+  request: {
+    query: z.object({ brand_id: zBrandIdQuery }),
+  },
   responses: {
     200: {
       description: "All service agreements",
       content: { "application/json": { schema: z.object({ service_agreements: z.array(ServiceAgreementSchema) }) } },
     },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Brand not found", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 
 app.openapi(listServiceAgreements, async (c) => {
   const db = getDb(c.env);
-  const agreements = await serviceAgreementJoinedSelect(db).orderBy(asc(schema.serviceAgreements.nextRunDate)).all();
+  const brandRes = await resolveBrandFilter(db, c.req.valid("query").brand_id);
+  if (!brandRes.ok) return c.json({ error: "Brand not found" }, 404);
+  const brandFilter = brandRes.brandId;
+  const agreements = await serviceAgreementJoinedSelect(db)
+    .where(brandFilter === null ? undefined : eq(schema.serviceAgreements.brandId, brandFilter))
+    .orderBy(asc(schema.serviceAgreements.nextRunDate))
+    .all();
   return c.json({ service_agreements: agreements }, 200);
 });
 
@@ -5962,6 +6138,501 @@ app.openapi(runDueServiceAgreementsNow, async (c) => {
   }
   const result = await processDueServiceAgreements(c.env);
   return c.json({ ok: true, ...result }, 200);
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// DEMO WORKSPACE ("Sunshine Painting Co (Demo)")
+// ═══════════════════════════════════════════════════════════════════
+// POST /api/demo/reset (admin-only) idempotently (re)creates a rich, alive
+// demo account so Will can walk prospects/new hires through the whole app
+// without touching Westchase/TKC data. SAFETY MODEL (this gets attacked):
+//   1. The demo brand is resolved by its fixed slug and REFUSED (409) unless
+//      brands.is_demo = 1 -- is_demo is only ever set by this route's own
+//      create path, never by the brand CRUD routes.
+//   2. Every DELETE is scoped through the demo brand id: the wipe targets
+//      customers WHERE brand_id = demo, and every document table is deleted
+//      via "belongs to one of those customers" subqueries (children first,
+//      following the real FK graph in src/db/schema.ts). A real job/invoice
+//      that someone merely TAGGED with the demo brand but that belongs to a
+//      real customer is deliberately NOT touched.
+//   3. The whole wipe runs as ONE db.batch() -- D1 executes a batch as a
+//      single atomic transaction, so a partial failure can't half-wipe.
+//   4. Shared company data (users, technicians, materials, service_types,
+//      products, brands other than the demo one) is never deleted or created.
+//      Demo jobs reference the EXISTING seeded technicians/service types.
+//   5. Shared MUTABLE state is left alone too: demo documents mint their
+//      identifiers from separate demo_* _meta counters (see
+//      nextDemoIdentifier below), so a reset never advances the real
+//      JOB-N/INV-N/EST-N sequences or leaves gaps in real invoice numbering.
+
+const DEMO_BRAND_SLUG = "demo-sunshine";
+const DEMO_BRAND_NAME = "Sunshine Painting Co (Demo)";
+const DEMO_BRAND_PRIMARY = "#0f766e"; // teal
+const DEMO_BRAND_SECONDARY = "#c2604a"; // warm coral
+
+// Demo documents mint identifiers from their OWN _meta counters
+// (demo_job_counter / demo_invoice_counter / demo_estimate_counter) with a
+// DEMO- prefix, NOT from the shared job/invoice/estimate counters -- so
+// resetting the demo before every sales call never advances (and never gaps)
+// the real Westchase/TKC JOB-N/INV-N/EST-N sequences. The demo counters are
+// monotonic (never rewound), so a demo identifier can't collide with a
+// leftover demo row even if a wipe ever misses one; the distinct DEMO- prefix
+// keeps them out of the real namespaces, which jobs.identifier/
+// invoices.identifier UNIQUE constraints protect. Same atomic
+// UPDATE-RETURNING increment as the real counters (see incrementCounter).
+async function nextDemoIdentifier(db: ReturnType<typeof getDb>, counterKey: string, prefix: string): Promise<string> {
+  // Lazily create the counter row -- these keys aren't in the seed SQL.
+  await db.run(sql`INSERT INTO _meta (key, value) VALUES (${counterKey}, '0') ON CONFLICT(key) DO NOTHING`);
+  const next = await incrementCounter(db, counterKey);
+  return `${prefix}-${next}`;
+}
+
+// "YYYY-MM-DD" + N days (negative OK). UTC math on a date-only value is safe
+// here -- no time component, no DST edge to hit.
+function addDays(dateStr: string, days: number): string {
+  const [y, m, d] = dateStr.split("-").map((n) => parseInt(n, 10));
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().split("T")[0];
+}
+
+// Deterministic-but-alive dataset. Dates are computed RELATIVE TO TODAY
+// (America/New_York) on every reset, so the demo board always has jobs
+// "today"/"this week" and a genuinely overdue invoice, no matter when it's
+// reset. All money below is authored in DOLLARS and converted through
+// toCents() at each insert -- the one storage rule this codebase never bends.
+async function seedDemoData(db: ReturnType<typeof getDb>, demoId: number) {
+  const today = todayInTampa();
+
+  // Shared company resources the demo REFERENCES but never creates/mutates.
+  const techs = await db.select({ id: schema.technicians.id }).from(schema.technicians).where(eq(schema.technicians.active, 1)).orderBy(asc(schema.technicians.id)).limit(3).all();
+  const techId = (i: number): number | null => (techs.length ? techs[i % techs.length].id : null);
+  const serviceTypesAll = await db.select({ id: schema.serviceTypes.id, name: schema.serviceTypes.name }).from(schema.serviceTypes).all();
+  const st = (needle: string): number | null => serviceTypesAll.find((s) => s.name.toLowerCase().includes(needle))?.id ?? null;
+  const stInterior = st("interior painting");
+  const stExterior = st("exterior painting");
+  const stPowerWash = st("power washing") ?? st("washing");
+  const stCabinet = st("cabinet refinishing");
+
+  // ── 12 customers across the Tampa map + lead pipeline ──
+  const demoCustomers: {
+    name: string; email: string; phone: string; address: string; city: string; zip: string;
+    status: (typeof CUSTOMER_STATUSES)[number]; source: (typeof CUSTOMER_SOURCES)[number]; notes?: string;
+  }[] = [
+    { name: "Maria Alvarez", email: "maria.alvarez@example.com", phone: "(813) 555-0142", address: "4212 Cypress Meadow Ct", city: "Tampa (Carrollwood)", zip: "33624", status: "active", source: "referral", notes: "Referred by the Whitfields. Two dogs -- keep the gate closed." },
+    { name: "James & Kelly Whitfield", email: "jkwhitfield@example.com", phone: "(813) 555-0177", address: "10437 Greenaire Dr", city: "Tampa (Westchase)", zip: "33626", status: "active", source: "google", notes: "HOA requires color approval before exterior work." },
+    { name: "Deborah Chen", email: "dchen.tampa@example.com", phone: "(813) 555-0119", address: "812 S Orleans Ave", city: "Tampa (Hyde Park)", zip: "33606", status: "active", source: "repeat", notes: "Third project with us. Prefers morning start times." },
+    { name: "Robert Castellano", email: "r.castellano@example.com", phone: "(813) 555-0163", address: "118 Baltic Cir", city: "Tampa (Davis Islands)", zip: "33606", status: "active", source: "website" },
+    { name: "Angela Brooks", email: "angela.brooks@example.com", phone: "(813) 555-0186", address: "3915 W San Juan St", city: "Tampa (Palma Ceia)", zip: "33629", status: "lead", source: "google", notes: "Wants guest bath + laundry room done before Labor Day." },
+    { name: "Tom Nguyen", email: "tom.nguyen@example.com", phone: "(813) 555-0128", address: "6109 Memorial Hwy", city: "Tampa (Town 'n' Country)", zip: "33615", status: "active", source: "website" },
+    { name: "Priya Raman", email: "priya.raman@example.com", phone: "(813) 555-0151", address: "14310 Clubhouse Dr", city: "Tampa (Carrollwood Village)", zip: "33618", status: "active", source: "referral" },
+    { name: "Frank DiMarco", email: "fdimarco@example.com", phone: "(813) 555-0194", address: "5008 W Neptune Way", city: "Tampa (Beach Park)", zip: "33609", status: "lead", source: "other", notes: "Met at the Westshore home show. Big stucco house, faded south wall." },
+    { name: "Susan Oliveira", email: "susan.oliveira@example.com", phone: "(813) 555-0135", address: "7521 Fairway Bend", city: "Tampa (Westchase)", zip: "33626", status: "active", source: "repeat", notes: "On the monthly pressure-wash plan." },
+    { name: "Marcus Reid", email: "marcus.reid@example.com", phone: "(813) 555-0170", address: "909 E Broad St", city: "Tampa (Seminole Heights)", zip: "33604", status: "lead", source: "google" },
+    { name: "Elena Petrov", email: "elena.petrov@example.com", phone: "(813) 555-0122", address: "2418 W Watrous Ave", city: "Tampa (South Tampa)", zip: "33629", status: "active", source: "referral" },
+    { name: "Hannah & Luke Sorensen", email: "sorensens@example.com", phone: "(813) 555-0158", address: "11704 Derbyshire Dr", city: "Tampa (Westchase)", zip: "33626", status: "lead", source: "website", notes: "Expecting in November -- want the interior done well before." },
+  ];
+  const custIds: number[] = [];
+  for (const cust of demoCustomers) {
+    const rows = await db.insert(schema.customers).values({
+      name: cust.name, email: cust.email, phone: cust.phone, address: cust.address,
+      city: cust.city, state: "FL", zip: cust.zip, notes: cust.notes || "",
+      status: cust.status, source: cust.source, brandId: demoId,
+    }).returning({ id: schema.customers.id });
+    custIds.push(rows[0].id);
+  }
+  const cust = (i: number) => custIds[i]; // 0-based index into the list above
+
+  // ── Jobs ── (identifiers minted through the demo-only DEMO-JOB-N counter)
+  async function insertDemoJob(v: {
+    customerIdx: number; technicianId: number | null; serviceTypeId: number | null;
+    status: string; date: string; time: string; durationMin: number; priceDollars: number;
+    notes?: string; endDate?: string; completionNotes?: string; warrantyMonths?: number; priority?: string;
+  }): Promise<number> {
+    const identifier = await nextDemoIdentifier(db, "demo_job_counter", "DEMO-JOB");
+    const customer = demoCustomers[v.customerIdx];
+    const rows = await db.insert(schema.jobs).values({
+      identifier,
+      customerId: cust(v.customerIdx),
+      technicianId: v.technicianId,
+      serviceTypeId: v.serviceTypeId,
+      status: v.status,
+      priority: v.priority || "normal",
+      scheduledDate: v.date,
+      scheduledTime: v.time,
+      duration: v.durationMin,
+      price: toCents(v.priceDollars),
+      address: `${customer.address}, ${customer.city}, FL ${customer.zip}`,
+      notes: v.notes || "",
+      completionNotes: v.completionNotes || "",
+      endDate: v.endDate ?? null,
+      warrantyMonths: v.warrantyMonths ?? null,
+      warrantyExpiresAt: v.warrantyMonths ? addCalendarMonths(v.date, v.warrantyMonths) : null,
+      brandId: demoId,
+    }).returning({ id: schema.jobs.id });
+    return rows[0].id;
+  }
+
+  // Two on the board TODAY (one mid-flight), the rest spread across the week.
+  const jobToday1 = await insertDemoJob({ customerIdx: 0, technicianId: techId(0), serviceTypeId: stInterior, status: "in_progress", date: today, time: "09:00", durationMin: 480, priceDollars: 1850, notes: "Living room, hallway, and stairwell -- walls + ceilings. Furniture centered and covered by homeowner." });
+  await insertDemoJob({ customerIdx: 8, technicianId: techId(1), serviceTypeId: stPowerWash, status: "scheduled", date: today, time: "13:30", durationMin: 120, priceDollars: 350, notes: "Driveway, pool deck, and front walk." });
+  await insertDemoJob({ customerIdx: 2, technicianId: techId(1), serviceTypeId: stInterior, status: "scheduled", date: addDays(today, 1), time: "08:30", durationMin: 480, priceDollars: 2400, notes: "Primary suite + office repaint. Morning start per customer." });
+  // Multi-day exterior repaint spanning three days.
+  const jobMultiDay = await insertDemoJob({ customerIdx: 1, technicianId: techId(0), serviceTypeId: stExterior, status: "confirmed", date: addDays(today, 1), time: "08:00", durationMin: 480, priceDollars: 7400, endDate: addDays(today, 3), priority: "high", notes: "Full exterior repaint -- pressure wash day 1, stucco body day 2, trim/doors day 3. HOA color approval on file." });
+  await insertDemoJob({ customerIdx: 6, technicianId: techId(2), serviceTypeId: stCabinet, status: "confirmed", date: addDays(today, 4), time: "10:00", durationMin: 360, priceDollars: 3100, notes: "Kitchen cabinet refinishing -- 32 doors/drawers, satin white." });
+  // Unassigned/awaiting dispatch.
+  await insertDemoJob({ customerIdx: 4, technicianId: null, serviceTypeId: stInterior, status: "scheduled", date: addDays(today, 8), time: "09:00", durationMin: 240, priceDollars: 950, notes: "Guest bathroom + laundry room. NEEDS CREW ASSIGNMENT." });
+  // Three completed in recent weeks (one with completion notes + warranty).
+  const jobDone1 = await insertDemoJob({ customerIdx: 3, technicianId: techId(0), serviceTypeId: stInterior, status: "completed", date: addDays(today, -5), time: "09:00", durationMin: 480, priceDollars: 2750, completionNotes: "Completed on schedule. Added a third coat on the dining room accent wall at no charge -- customer thrilled.", warrantyMonths: 24 });
+  const jobDone2 = await insertDemoJob({ customerIdx: 10, technicianId: techId(1), serviceTypeId: stExterior, status: "completed", date: addDays(today, -12), time: "08:00", durationMin: 480, priceDollars: 5325 });
+  const jobDone3 = await insertDemoJob({ customerIdx: 8, technicianId: techId(0), serviceTypeId: stPowerWash, status: "completed", date: addDays(today, -19), time: "10:00", durationMin: 120, priceDollars: 425 });
+
+  // Second crew member on the multi-day job (only if a second tech exists).
+  if (techs.length >= 2 && techId(0) !== null && techId(1) !== null && techId(0) !== techId(1)) {
+    await db.insert(schema.jobCrew).values({ jobId: jobMultiDay, technicianId: techId(1)!, role: "helper" });
+  }
+  await db.insert(schema.jobNotes).values({ jobId: jobToday1, content: "Crew on site 9:05a -- prep complete, cutting in the living room now." });
+
+  // ── Estimates ── (identifiers minted through the demo-only DEMO-EST-N counter)
+  async function insertDemoEstimate(v: {
+    customerIdx: number; status: string; taxRate?: number; notes?: string; validUntilDays?: number;
+    approvedDaysAgo?: number; signedName?: string; depositDollars?: number; withToken?: boolean;
+    lines: { description: string; quantity: number; unitPriceDollars: number }[];
+  }): Promise<{ id: number; identifier: string; subtotalCents: number; taxAmountCents: number; totalCents: number }> {
+    const identifier = await nextDemoIdentifier(db, "demo_estimate_counter", "DEMO-EST");
+    const taxRate = v.taxRate ?? 0;
+    const lineTotalsCents = v.lines.map((l) => Math.round(l.quantity * toCents(l.unitPriceDollars)));
+    const subtotalCents = lineTotalsCents.reduce((s, t) => s + t, 0);
+    const taxAmountCents = Math.round(subtotalCents * (taxRate / 100));
+    const totalCents = subtotalCents + taxAmountCents;
+    const approvedAt = v.approvedDaysAgo !== undefined ? `${addDays(today, -v.approvedDaysAgo)} 14:30:00` : null;
+    const rows = await db.insert(schema.estimates).values({
+      identifier,
+      customerId: cust(v.customerIdx),
+      brandId: demoId,
+      status: v.status,
+      subtotal: subtotalCents,
+      taxRate,
+      taxAmount: taxAmountCents,
+      total: totalCents,
+      validUntil: v.validUntilDays !== undefined ? addDays(today, v.validUntilDays) : null,
+      notes: v.notes || "",
+      approvedAt,
+      signedAt: v.signedName ? approvedAt : null,
+      signedName: v.signedName ?? null,
+      publicToken: v.withToken ? crypto.randomUUID() : null,
+      depositAmount: v.depositDollars ? toCents(v.depositDollars) : null,
+    }).returning({ id: schema.estimates.id });
+    const estimateId = rows[0].id;
+    for (let i = 0; i < v.lines.length; i++) {
+      const l = v.lines[i];
+      await db.insert(schema.estimateLines).values({ estimateId, description: l.description, quantity: l.quantity, unitPrice: toCents(l.unitPriceDollars), total: lineTotalsCents[i] });
+    }
+    return { id: estimateId, identifier, subtotalCents, taxAmountCents, totalCents };
+  }
+
+  // Two drafts.
+  await insertDemoEstimate({ customerIdx: 9, status: "draft", validUntilDays: 30, notes: "Two bedrooms + hallway. Colors TBD.", lines: [
+    { description: "Bedroom repaint -- walls, ceiling, trim (x2)", quantity: 2, unitPriceDollars: 780 },
+    { description: "Hallway + stair walls, 2 coats", quantity: 1, unitPriceDollars: 540 },
+  ] });
+  await insertDemoEstimate({ customerIdx: 7, status: "draft", validUntilDays: 30, notes: "South wall badly faded -- recommend elastomeric on stucco.", lines: [
+    { description: "Exterior repaint -- stucco body, 2 coats elastomeric", quantity: 1, unitPriceDollars: 5400 },
+    { description: "Fascia, soffit & trim", quantity: 1, unitPriceDollars: 1400 },
+  ] });
+  // Sent (plain).
+  await insertDemoEstimate({ customerIdx: 4, status: "sent", withToken: true, validUntilDays: 21, notes: "Includes minor drywall patching in the laundry room.", lines: [
+    { description: "Guest bathroom repaint -- walls + ceiling, moisture-resistant", quantity: 1, unitPriceDollars: 520 },
+    { description: "Laundry room repaint + drywall patching", quantity: 1, unitPriceDollars: 430 },
+  ] });
+  // Sent, with the STRUCTURED ROOM/SURFACE BUILDER filled in (a realistic
+  // 3-room interior scope). The generated estimate_lines rows mirror exactly
+  // what syncEstimateLineForSurface would produce (one line per surface,
+  // description via surfaceLineDescription, unit price = labor + material).
+  {
+    const builderRooms: { name: string; surfaces: { type: string; measurement: number; coats: number; prep: string; paint: string; laborDollars: number; materialDollars: number }[] }[] = [
+      { name: "Primary Bedroom", surfaces: [
+        { type: "Walls", measurement: 420, coats: 2, prep: "Patch nail holes, sand, spot-prime", paint: "SW SuperPaint Eg-Shel, Agreeable Gray", laborDollars: 380, materialDollars: 95 },
+        { type: "Ceiling", measurement: 240, coats: 1, prep: "Cut in around fan, cover furniture", paint: "SW Eminence Flat White", laborDollars: 180, materialDollars: 55 },
+        { type: "Trim & Doors", measurement: 120, coats: 2, prep: "Degloss, caulk gaps", paint: "SW ProClassic Semi-Gloss, Extra White", laborDollars: 220, materialDollars: 60 },
+      ] },
+      { name: "Kitchen", surfaces: [
+        { type: "Walls", measurement: 310, coats: 2, prep: "Degrease around range, patch, sand", paint: "SW Duration Matte, Sea Salt", laborDollars: 340, materialDollars: 90 },
+        { type: "Trim", measurement: 80, coats: 2, prep: "Caulk + sand", paint: "SW ProClassic Semi-Gloss, Extra White", laborDollars: 160, materialDollars: 45 },
+      ] },
+      { name: "Living Room", surfaces: [
+        { type: "Walls", measurement: 520, coats: 2, prep: "Fill anchors, sand, spot-prime water stain", paint: "SW Duration Matte, Alabaster", laborDollars: 460, materialDollars: 120 },
+        { type: "Ceiling", measurement: 300, coats: 1, prep: "Cover built-ins", paint: "SW Eminence Flat White", laborDollars: 210, materialDollars: 65 },
+        { type: "Accent Wall", measurement: 90, coats: 2, prep: "Prime for deep base", paint: "BM Regal Select Matte, Hale Navy", laborDollars: 140, materialDollars: 48 },
+      ] },
+    ];
+    const builderLines = builderRooms.flatMap((room) => room.surfaces.map((s) => ({
+      description: surfaceLineDescription(room.name, s.type, s.coats, s.paint),
+      quantity: 1,
+      unitPriceDollars: s.laborDollars + s.materialDollars,
+    })));
+    const builderEst = await insertDemoEstimate({ customerIdx: 11, status: "sent", withToken: true, validUntilDays: 21, notes: "Three-room interior refresh before the nursery setup. Scope built room-by-room below.", lines: builderLines });
+    let lineCursor = 0;
+    const builderLineRows = await db.select({ id: schema.estimateLines.id }).from(schema.estimateLines).where(eq(schema.estimateLines.estimateId, builderEst.id)).orderBy(asc(schema.estimateLines.id)).all();
+    for (let r = 0; r < builderRooms.length; r++) {
+      const room = builderRooms[r];
+      const roomRows = await db.insert(schema.estimateRooms).values({ estimateId: builderEst.id, name: room.name, sortOrder: r }).returning({ id: schema.estimateRooms.id });
+      for (let sIdx = 0; sIdx < room.surfaces.length; sIdx++) {
+        const s = room.surfaces[sIdx];
+        await db.insert(schema.estimateSurfaces).values({
+          roomId: roomRows[0].id,
+          surfaceType: s.type,
+          measurement: s.measurement,
+          prepNotes: s.prep,
+          coats: s.coats,
+          paintProduct: s.paint,
+          laborCost: toCents(s.laborDollars),
+          materialCost: toCents(s.materialDollars),
+          sortOrder: sIdx,
+          generatedLineId: builderLineRows[lineCursor]?.id ?? null,
+        });
+        lineCursor++;
+      }
+    }
+  }
+  // Approved (paper-signed, awaiting conversion).
+  await insertDemoEstimate({ customerIdx: 0, status: "approved", approvedDaysAgo: 2, validUntilDays: 14, notes: "Front door + shutters + garage trim.", lines: [
+    { description: "Front entry door -- strip, prime, 2 coats (BM Aura, Caliente)", quantity: 1, unitPriceDollars: 450 },
+    { description: "Shutters (6) + garage door trim", quantity: 1, unitPriceDollars: 1000 },
+  ] });
+  // Declined.
+  await insertDemoEstimate({ customerIdx: 3, status: "declined", validUntilDays: -3, notes: "Customer went with epoxy-only contractor.", lines: [
+    { description: "Garage floor -- grind + 2-part epoxy with flake", quantity: 1, unitPriceDollars: 2100 },
+  ] });
+  // Converted: estimate -> job (+6 days) + deposit/balance invoice pair below.
+  const convertedEst = await insertDemoEstimate({ customerIdx: 5, status: "converted", approvedDaysAgo: 4, signedName: "Tom Nguyen", depositDollars: 1500, notes: "Whole-interior repaint -- walls throughout, ceilings in living areas.", lines: [
+    { description: "Whole-interior walls, 2 coats (approx. 2,900 sqft)", quantity: 1, unitPriceDollars: 4100 },
+    { description: "Ceilings -- living room, kitchen, hallway", quantity: 1, unitPriceDollars: 1100 },
+  ] });
+  const jobConverted = await insertDemoJob({ customerIdx: 5, technicianId: techId(2), serviceTypeId: stInterior, status: "scheduled", date: addDays(today, 6), time: "08:00", durationMin: 480, priceDollars: 5200, notes: `Converted from estimate ${convertedEst.identifier}. Deposit collected.` });
+
+  // ── Invoices + payments ── (identifiers minted through the demo-only DEMO-INV-N counter)
+  async function insertDemoInvoice(v: {
+    customerIdx: number; jobId: number | null; status: string; dueDate: string; paidDaysAgo?: number; notes?: string;
+    lines: { description: string; quantity: number; unitPriceDollars: number }[];
+  }): Promise<{ id: number; totalCents: number }> {
+    const identifier = await nextDemoIdentifier(db, "demo_invoice_counter", "DEMO-INV");
+    const lineTotalsCents = v.lines.map((l) => Math.round(l.quantity * toCents(l.unitPriceDollars)));
+    const subtotalCents = lineTotalsCents.reduce((s, t) => s + t, 0);
+    const rows = await db.insert(schema.invoices).values({
+      identifier,
+      customerId: cust(v.customerIdx),
+      jobId: v.jobId,
+      status: v.status,
+      subtotal: subtotalCents,
+      taxRate: 0,
+      taxAmount: 0,
+      total: subtotalCents,
+      notes: v.notes || "",
+      dueDate: v.dueDate,
+      paidDate: v.paidDaysAgo !== undefined ? addDays(today, -v.paidDaysAgo) : "",
+      brandId: demoId,
+    }).returning({ id: schema.invoices.id });
+    const invoiceId = rows[0].id;
+    for (let i = 0; i < v.lines.length; i++) {
+      const l = v.lines[i];
+      await db.insert(schema.invoiceLines).values({ invoiceId, description: l.description, quantity: l.quantity, unitPrice: toCents(l.unitPriceDollars), total: lineTotalsCents[i] });
+    }
+    return { id: invoiceId, totalCents: subtotalCents };
+  }
+  async function insertDemoPayment(invoiceId: number, totalCents: number, method: "cash" | "check" | "card" | "financing", paidDaysAgo: number, tiered: boolean) {
+    // tiered=true applies the real cash-discount/card-surcharge math via
+    // computePaymentAmount; tiered=false records the plain total (the same
+    // thing the Stripe webhook does for an online card payment).
+    const { amountCents, surchargeAmountCents } = tiered
+      ? computePaymentAmount(totalCents, method)
+      : { amountCents: totalCents, surchargeAmountCents: 0 };
+    await db.insert(schema.payments).values({
+      invoiceId, method, amount: amountCents, surchargeAmount: surchargeAmountCents,
+      status: "paid", paidAt: `${addDays(today, -paidDaysAgo)} 15:10:00`,
+    });
+  }
+
+  // Paid #1 -- card (online, no surcharge), includes the approved change order.
+  const invPaid1 = await insertDemoInvoice({ customerIdx: 10, jobId: jobDone2, status: "paid", dueDate: addDays(today, -8), paidDaysAgo: 10, lines: [
+    { description: "Exterior repaint -- stucco body + trim, 2 coats", quantity: 1, unitPriceDollars: 5325 },
+    { description: "Change Order: Pressure-wash driveway + walkways before paint", quantity: 1, unitPriceDollars: 275 },
+  ] });
+  await insertDemoPayment(invPaid1.id, invPaid1.totalCents, "card", 10, false);
+  // Paid #2 -- cash, with the 8% cash-discount tier applied.
+  const invPaid2 = await insertDemoInvoice({ customerIdx: 8, jobId: jobDone3, status: "paid", dueDate: addDays(today, -15), paidDaysAgo: 17, notes: "Paid in cash on completion (8% cash discount applied).", lines: [
+    { description: "Pressure wash -- driveway, pool deck, lanai", quantity: 1, unitPriceDollars: 425 },
+  ] });
+  await insertDemoPayment(invPaid2.id, invPaid2.totalCents, "cash", 17, true);
+  // Sent (current).
+  await insertDemoInvoice({ customerIdx: 3, jobId: jobDone1, status: "sent", dueDate: addDays(today, 10), lines: [
+    { description: "Interior repaint -- living/dining/hall walls + ceilings", quantity: 1, unitPriceDollars: 2750 },
+  ] });
+  // OVERDUE -- due date firmly in the past.
+  await insertDemoInvoice({ customerIdx: 2, jobId: null, status: "overdue", dueDate: addDays(today, -9), notes: "Second notice sent.", lines: [
+    { description: "Touch-up visit + drywall repair (2 rooms)", quantity: 1, unitPriceDollars: 480 },
+  ] });
+  // Deposit + balance pair from the converted estimate -- amounts mirror the
+  // real /api/estimates/{id}/convert math: deposit invoice for the deposit,
+  // balance invoice credited with an offsetting "Less: Deposit paid" line so
+  // the pair sums to exactly the estimate total ($5,200 = $1,500 + $3,700).
+  const invDeposit = await insertDemoInvoice({ customerIdx: 5, jobId: jobConverted, status: "paid", dueDate: addDays(today, -3), paidDaysAgo: 3, notes: `Deposit for estimate ${convertedEst.identifier}`, lines: [
+    { description: "Deposit", quantity: 1, unitPriceDollars: 1500 },
+  ] });
+  await insertDemoPayment(invDeposit.id, invDeposit.totalCents, "card", 3, false);
+  await insertDemoInvoice({ customerIdx: 5, jobId: jobConverted, status: "sent", dueDate: addDays(today, 14), notes: `Balance for estimate ${convertedEst.identifier}`, lines: [
+    { description: "Whole-interior walls, 2 coats (approx. 2,900 sqft)", quantity: 1, unitPriceDollars: 4100 },
+    { description: "Ceilings -- living room, kitchen, hallway", quantity: 1, unitPriceDollars: 1100 },
+    { description: "Less: Deposit paid", quantity: 1, unitPriceDollars: -1500 },
+  ] });
+
+  // ── Change orders ──
+  await db.insert(schema.changeOrders).values({ jobId: jobMultiDay, description: "Add garage door + trim", amount: toCents(650), status: "pending" });
+  await db.insert(schema.changeOrders).values({ jobId: jobDone2, description: "Pressure-wash driveway + walkways before paint", amount: toCents(275), status: "approved" });
+
+  // ── Recurring service agreement (monthly pressure wash) ──
+  const nextRun = addDays(today, 14);
+  await db.insert(schema.serviceAgreements).values({
+    customerId: cust(8),
+    brandId: demoId,
+    serviceTypeId: stPowerWash,
+    interval: "monthly",
+    nextRunDate: nextRun,
+    anchorDay: parseInt(nextRun.split("-")[2], 10),
+    active: 1,
+  });
+
+  return { customers: 12, jobs: 10, estimates: 7, invoices: 6, payments: 3, change_orders: 2, service_agreements: 1 };
+}
+
+const DemoCountsSchema = z.object({
+  customers: z.number().int(),
+  jobs: z.number().int(),
+  estimates: z.number().int(),
+  invoices: z.number().int(),
+}).openapi("DemoCounts");
+
+const resetDemoRoute = createRoute({
+  method: "post",
+  path: "/api/demo/reset",
+  responses: {
+    200: {
+      description: "Demo workspace wiped and re-seeded",
+      content: { "application/json": { schema: z.object({
+        ok: z.boolean(),
+        brand_id: z.number().int(),
+        created: z.object({
+          customers: z.number().int(),
+          jobs: z.number().int(),
+          estimates: z.number().int(),
+          invoices: z.number().int(),
+          payments: z.number().int(),
+          change_orders: z.number().int(),
+          service_agreements: z.number().int(),
+        }),
+      }) } },
+    },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "Refused -- target brand is not flagged as demo", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(resetDemoRoute, async (c) => {
+  const forbidden = requireAdminOrForbid(c);
+  if (forbidden) return forbidden;
+  const db = getDb(c.env);
+
+  // 1. Resolve-or-create the demo brand (idempotent by fixed slug).
+  let demo = await db.select().from(schema.brands).where(eq(schema.brands.slug, DEMO_BRAND_SLUG)).get();
+  if (!demo) {
+    await db.insert(schema.brands).values({
+      name: DEMO_BRAND_NAME,
+      slug: DEMO_BRAND_SLUG,
+      colorPrimary: DEMO_BRAND_PRIMARY,
+      colorSecondary: DEMO_BRAND_SECONDARY,
+      active: 1,
+      isDemo: 1,
+    });
+    demo = await db.select().from(schema.brands).where(eq(schema.brands.slug, DEMO_BRAND_SLUG)).get();
+  }
+  // 2. HARD SAFETY INTERLOCK: refuse to wipe anything not flagged is_demo.
+  if (!demo || demo.isDemo !== 1) {
+    return c.json({ error: `Brand "${demo?.name ?? DEMO_BRAND_SLUG}" is not flagged as a demo workspace -- refusing to reset it.` }, 409);
+  }
+  const demoId = demo.id;
+
+  // 3. Wipe -- every DELETE scoped through the demo brand's own customers
+  // (children first, real FK order), all in ONE atomic D1 batch.
+  const demoCustomerIds = db.select({ id: schema.customers.id }).from(schema.customers).where(eq(schema.customers.brandId, demoId));
+  const demoJobIds = db.select({ id: schema.jobs.id }).from(schema.jobs).where(inArray(schema.jobs.customerId, demoCustomerIds));
+  const demoInvoiceIds = db.select({ id: schema.invoices.id }).from(schema.invoices).where(inArray(schema.invoices.customerId, demoCustomerIds));
+  const demoEstimateIds = db.select({ id: schema.estimates.id }).from(schema.estimates).where(inArray(schema.estimates.customerId, demoCustomerIds));
+  const demoRoomIds = db.select({ id: schema.estimateRooms.id }).from(schema.estimateRooms).where(inArray(schema.estimateRooms.estimateId, demoEstimateIds));
+  await db.batch([
+    db.delete(schema.payments).where(inArray(schema.payments.invoiceId, demoInvoiceIds)),
+    db.delete(schema.invoiceLines).where(inArray(schema.invoiceLines.invoiceId, demoInvoiceIds)),
+    db.delete(schema.invoices).where(inArray(schema.invoices.customerId, demoCustomerIds)),
+    db.delete(schema.changeOrders).where(inArray(schema.changeOrders.jobId, demoJobIds)),
+    db.delete(schema.jobCrew).where(inArray(schema.jobCrew.jobId, demoJobIds)),
+    db.delete(schema.jobNotes).where(inArray(schema.jobNotes.jobId, demoJobIds)),
+    db.delete(schema.jobChecklist).where(inArray(schema.jobChecklist.jobId, demoJobIds)),
+    db.delete(schema.jobMaterials).where(inArray(schema.jobMaterials.jobId, demoJobIds)),
+    db.delete(schema.attachments).where(and(eq(schema.attachments.entityType, "job"), inArray(schema.attachments.entityId, demoJobIds))!),
+    db.delete(schema.attachments).where(and(eq(schema.attachments.entityType, "estimate"), inArray(schema.attachments.entityId, demoEstimateIds))!),
+    db.delete(schema.attachments).where(and(eq(schema.attachments.entityType, "customer"), inArray(schema.attachments.entityId, demoCustomerIds))!),
+    db.delete(schema.jobs).where(inArray(schema.jobs.customerId, demoCustomerIds)),
+    db.delete(schema.estimateSurfaces).where(inArray(schema.estimateSurfaces.roomId, demoRoomIds)),
+    db.delete(schema.estimateRooms).where(inArray(schema.estimateRooms.estimateId, demoEstimateIds)),
+    db.delete(schema.estimateLines).where(inArray(schema.estimateLines.estimateId, demoEstimateIds)),
+    db.delete(schema.estimates).where(inArray(schema.estimates.customerId, demoCustomerIds)),
+    db.delete(schema.serviceAgreements).where(inArray(schema.serviceAgreements.customerId, demoCustomerIds)),
+    db.delete(schema.customers).where(eq(schema.customers.brandId, demoId)),
+  ]);
+
+  // 4. Seed the fresh cast, dated relative to today (America/New_York).
+  const created = await seedDemoData(db, demoId);
+  return c.json({ ok: true, brand_id: demoId, created }, 200);
+});
+
+const demoStatusRoute = createRoute({
+  method: "get",
+  path: "/api/demo/status",
+  responses: {
+    200: {
+      description: "Whether the demo workspace exists + row counts",
+      content: { "application/json": { schema: z.object({
+        exists: z.boolean(),
+        brand_id: z.number().int().nullable(),
+        counts: DemoCountsSchema,
+      }) } },
+    },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(demoStatusRoute, async (c) => {
+  const forbidden = requireAdminOrForbid(c);
+  if (forbidden) return forbidden;
+  const db = getDb(c.env);
+  const demo = await db.select({ id: schema.brands.id, isDemo: schema.brands.isDemo }).from(schema.brands).where(eq(schema.brands.slug, DEMO_BRAND_SLUG)).get();
+  if (!demo || demo.isDemo !== 1) {
+    return c.json({ exists: false, brand_id: null, counts: { customers: 0, jobs: 0, estimates: 0, invoices: 0 } }, 200);
+  }
+  const demoCustomerIds = db.select({ id: schema.customers.id }).from(schema.customers).where(eq(schema.customers.brandId, demo.id));
+  const customers = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.customers).where(eq(schema.customers.brandId, demo.id)).get();
+  const jobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs).where(inArray(schema.jobs.customerId, demoCustomerIds)).get();
+  const estimates = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.estimates).where(inArray(schema.estimates.customerId, demoCustomerIds)).get();
+  const invoices = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.invoices).where(inArray(schema.invoices.customerId, demoCustomerIds)).get();
+  return c.json({
+    exists: true,
+    brand_id: demo.id,
+    counts: {
+      customers: customers?.count || 0,
+      jobs: jobs?.count || 0,
+      estimates: estimates?.count || 0,
+      invoices: invoices?.count || 0,
+    },
+  }, 200);
 });
 
 // ═══════════════════════════════════════════════════════════════════

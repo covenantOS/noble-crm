@@ -1,6 +1,7 @@
 import { useApp } from "../context";
 import { LayoutDashboard, Briefcase, Users, Wrench, Settings, CalendarDays, FileText, ClipboardList, Package, LogOut, Palette, Repeat, Hammer } from "lucide-preact";
 import { NobleMark } from "./noble-mark";
+import { AccountSwitcher } from "./account-switcher";
 import type { View } from "../types";
 
 const navItems: { view: View; path: string; label: string; icon: typeof LayoutDashboard }[] = [
@@ -55,6 +56,7 @@ export function Sidebar({ currentView, open, onNavigate }: { currentView: View; 
           <span class="sidebar-wordmark-sub">Noble Tampa</span>
         </div>
       </div>
+      <AccountSwitcher />
       <nav class="sidebar-nav">
         <div class="sidebar-section-title">Menu</div>
         {visibleNavItems.map((item) => (

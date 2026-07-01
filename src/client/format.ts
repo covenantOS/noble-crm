@@ -56,3 +56,11 @@ export function formatMoney(n: number | null | undefined): string {
   const v = typeof n === "number" && isFinite(n) ? n : 0;
   return v.toLocaleString("en-US", { style: "currency", currency: "USD" });
 }
+
+// Strict "#rgb"/"#rrggbb" guard before a stored brand color is injected into
+// inline styles / CSS custom properties (mirrors the server-side safeCssHex in
+// src/server/index.ts -- the same stored-XSS defense, applied on this side of
+// the wire before anything lands in a style attribute or --account-accent).
+export function safeCssHex(hex: string | null | undefined, fallback: string): string {
+  return hex && /^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/.test(hex) ? hex : fallback;
+}

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { Menu } from "lucide-preact";
 import { AppContext } from "./context";
+import { safeCssHex } from "./format";
 import { useAppState } from "./hooks/use-app";
 import { useRouter } from "./hooks/use-router";
 import { useSession } from "./hooks/use-session";
@@ -63,6 +64,25 @@ function AuthenticatedApp({ isAgent, session }: { isAgent: boolean; session: Non
   // Close the mobile drawer whenever the route changes.
   useEffect(() => { setDrawerOpen(false); }, [view, id]);
 
+  // Active account -> a SUBTLE accent only (switcher dot, active-nav tick,
+  // context-bar dot). The brand's color_primary is exposed as --account-accent
+  // on the document root; when All Accounts is active the variable is removed
+  // so everything falls back to Noble gold. The hex is sanitized through
+  // safeCssHex (client mirror of the server's stored-XSS guard) before it is
+  // ever injected into a style.
+  const activeBrand = appState.activeBrandId !== null
+    ? appState.brands.find((b) => b.id === appState.activeBrandId) ?? null
+    : null;
+  useEffect(() => {
+    const root = document.documentElement;
+    if (activeBrand && activeBrand.color_primary) {
+      root.style.setProperty("--account-accent", safeCssHex(activeBrand.color_primary, "#c9a227"));
+    } else {
+      root.style.removeProperty("--account-accent");
+    }
+    return () => { root.style.removeProperty("--account-accent"); };
+  }, [activeBrand?.id, activeBrand?.color_primary]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Load detail when URL has an ID
   useEffect(() => {
     if (view === "jobs" && id) {
@@ -111,6 +131,16 @@ function AuthenticatedApp({ isAgent, session }: { isAgent: boolean; session: Non
         <div class={`sidebar-overlay ${drawerOpen ? "open" : ""}`} onClick={() => setDrawerOpen(false)} />
         <Sidebar currentView={view} open={drawerOpen} onNavigate={() => setDrawerOpen(false)} />
         <main class="main-content">
+          {/* Account context ribbon -- every page header carries the active
+              account's name while a specific account is selected. */}
+          {activeBrand && (
+            <div class="account-context">
+              <span class="account-context-dot" style={{ background: safeCssHex(activeBrand.color_primary, "#c9a227") }} />
+              <span class="account-context-name">{activeBrand.name}</span>
+              {activeBrand.is_demo === 1 && <span class="demo-badge">DEMO</span>}
+              <button class="account-context-clear" onClick={() => appState.setActiveBrandId(null)}>View all accounts</button>
+            </div>
+          )}
           {appState.loading ? (
             <div class="loading-text">Loading...</div>
           ) : (

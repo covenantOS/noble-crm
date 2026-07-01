@@ -57,6 +57,20 @@
       "when": 1782925540802,
       "tag": "0007_low_skullbuster",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1782938250128,
+      "tag": "0008_flawless_mindworm",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1782940941680,
+      "tag": "0009_backfill_brand_children",
+      "breakpoints": true
     }
   ]
 }

@@ -136,7 +136,10 @@ export function BrandList() {
                           <span class="color-swatch" style={{ background: b.color_secondary || "#ccc" }} />
                         </div>
                       </td>
-                      <td class="text-bold">{b.name}</td>
+                      <td class="text-bold">
+                        {b.name}
+                        {b.is_demo === 1 && <span class="demo-badge" style={{ marginLeft: 8 }}>DEMO</span>}
+                      </td>
                       <td class="text-muted">{b.slug}</td>
                       <td>
                         {b.review_url ? (

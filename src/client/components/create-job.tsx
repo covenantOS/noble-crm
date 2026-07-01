@@ -4,13 +4,15 @@ import { formatMoney } from "../format";
 import { X } from "lucide-preact";
 
 export function CreateJob({ onClose }: { onClose: () => void }) {
-  const { addJob, customerLookup, technicianLookup, serviceTypes, brands, setError } = useApp();
+  const { addJob, customerLookup, technicianLookup, serviceTypes, brands, activeBrandId, setError } = useApp();
 
   const today = new Date().toISOString().split("T")[0];
   const [customerId, setCustomerId] = useState("");
   const [technicianId, setTechnicianId] = useState("");
   const [serviceTypeId, setServiceTypeId] = useState("");
-  const [brandId, setBrandId] = useState("");
+  // Defaults to the active account (still user-changeable). Under All
+  // Accounts it starts blank and the server inherits the customer's account.
+  const [brandId, setBrandId] = useState(activeBrandId !== null ? String(activeBrandId) : "");
   const [scheduledDate, setScheduledDate] = useState(today);
   const [endDate, setEndDate] = useState("");
   const [scheduledTime, setScheduledTime] = useState("09:00");
@@ -32,7 +34,9 @@ export function CreateJob({ onClose }: { onClose: () => void }) {
         customer_id: parseInt(customerId, 10),
         technician_id: technicianId ? parseInt(technicianId, 10) : null,
         service_type_id: serviceTypeId ? parseInt(serviceTypeId, 10) : null,
-        brand_id: brandId ? parseInt(brandId, 10) : null,
+        // Omitted (not null) when blank -- the server then inherits the
+        // customer's own account instead of forcing "no brand".
+        ...(brandId ? { brand_id: parseInt(brandId, 10) } : {}),
         scheduled_date: scheduledDate,
         end_date: endDate || null,
         scheduled_time: scheduledTime,
@@ -89,11 +93,11 @@ export function CreateJob({ onClose }: { onClose: () => void }) {
               </select>
             </div>
             <div class="form-group">
-              <label>Brand</label>
+              <label>Account</label>
               <select value={brandId} onChange={(e) => setBrandId((e.target as HTMLSelectElement).value)}>
-                <option value="">No brand</option>
+                <option value="">Match customer's account</option>
                 {brands.map((b) => (
-                  <option key={b.id} value={b.id}>{b.name}</option>
+                  <option key={b.id} value={b.id}>{b.name}{b.is_demo === 1 ? " (Demo)" : ""}</option>
                 ))}
               </select>
             </div>

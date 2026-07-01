@@ -72,6 +72,10 @@ export interface Customer {
   notes: string;
   status: CustomerStatus;
   source: CustomerSource | null;
+  // NEW (multi-account pass): the owning account/brand.
+  brand_id?: number | null;
+  brand_name?: string | null;
+  brand_color_primary?: string | null;
   job_count?: number;
   created_at: string;
   updated_at: string;
@@ -112,6 +116,8 @@ export interface Brand {
   active: number;
   // NEW (review-request pass): nullable review-site URL.
   review_url?: string | null;
+  // NEW (multi-account pass): 1 marks the resettable demo workspace.
+  is_demo?: number;
 }
 
 export interface JobNote {
@@ -336,6 +342,7 @@ export interface CustomerLookup {
   id: number;
   name: string;
   address: string;
+  brand_id?: number | null;
 }
 
 export interface TechnicianLookup {

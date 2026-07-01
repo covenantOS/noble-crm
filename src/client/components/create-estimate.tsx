@@ -12,10 +12,12 @@ interface DraftLine {
 const emptyLine = (): DraftLine => ({ description: "", quantity: "1", unit_price: "0" });
 
 export function CreateEstimate({ onClose }: { onClose: () => void }) {
-  const { addEstimate, customerLookup, brands, setError } = useApp();
+  const { addEstimate, customerLookup, brands, activeBrandId, setError } = useApp();
 
   const [customerId, setCustomerId] = useState("");
-  const [brandId, setBrandId] = useState("");
+  // Defaults to the active account (still user-changeable). Under All
+  // Accounts it starts blank and the server inherits the customer's account.
+  const [brandId, setBrandId] = useState(activeBrandId !== null ? String(activeBrandId) : "");
   const [taxRate, setTaxRate] = useState("0");
   const [validUntil, setValidUntil] = useState("");
   const [notes, setNotes] = useState("");
@@ -42,7 +44,9 @@ export function CreateEstimate({ onClose }: { onClose: () => void }) {
     try {
       await addEstimate({
         customer_id: parseInt(customerId, 10),
-        brand_id: brandId ? parseInt(brandId, 10) : null,
+        // Omitted (not null) when blank -- the server then inherits the
+        // customer's own account instead of forcing "no brand".
+        ...(brandId ? { brand_id: parseInt(brandId, 10) } : {}),
         tax_rate: parseFloat(taxRate) || 0,
         valid_until: validUntil || undefined,
         notes,
@@ -79,11 +83,11 @@ export function CreateEstimate({ onClose }: { onClose: () => void }) {
               </select>
             </div>
             <div class="form-group">
-              <label>Brand</label>
+              <label>Account</label>
               <select value={brandId} onChange={(e) => setBrandId((e.target as HTMLSelectElement).value)}>
-                <option value="">No brand</option>
+                <option value="">Match customer's account</option>
                 {brands.map((b) => (
-                  <option key={b.id} value={b.id}>{b.name}</option>
+                  <option key={b.id} value={b.id}>{b.name}{b.is_demo === 1 ? " (Demo)" : ""}</option>
                 ))}
               </select>
             </div>
