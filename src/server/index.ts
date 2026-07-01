@@ -90,6 +90,33 @@ const zName = z.string().trim().min(1, { message: "Required -- cannot be blank" 
 // here isn't just data hygiene -- it's what keeps that unauthenticated,
 // no-escaping render path from being a stored-XSS vector.
 const zHexColor = z.string().regex(/^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/, { message: "Must be a hex color like #1a2b4a" });
+
+// ── Money: integer-cents storage <-> decimal-dollars wire format ──────
+// The DB stores every money column as INTEGER CENTS (see the cents-migration
+// note atop src/db/schema.ts) -- this eliminates float-drift in tax math and
+// running payment balances. The public API/JSON contract is UNCHANGED: every
+// request body the client sends and every response body the client receives
+// still speaks decimal DOLLARS, exactly as before. These two helpers are the
+// ONLY place that conversion happens -- toCents() right where a dollar value
+// coming from client input (or computed from other dollar values) is about to
+// be written via db.insert/db.update, and fromCents() right where a cents
+// value read out of a Drizzle query result is about to be handed to c.json(),
+// buildDocumentPdf(), sendEmail(), or createInvoiceCheckout(). If you find
+// yourself wanting to touch client .tsx/format.ts/pdf.ts/notify.ts money
+// formatting to "fix" a wrong-looking amount, that's a sign a boundary
+// conversion is missing HERE, not a reason to change those files.
+function toCents(dollars: number): number {
+  return Math.round(dollars * 100);
+}
+function fromCents(cents: number): number {
+  return cents / 100;
+}
+// Same as fromCents but passes null/undefined through unchanged -- for
+// nullable money columns (e.g. estimates.deposit_amount) where "no value" must
+// stay null in the API response, not become 0.
+function fromCentsNullable(cents: number | null | undefined): number | null {
+  return cents === null || cents === undefined ? null : fromCents(cents);
+}
 // Money the client supplies: never negative. (Zero is allowed -- e.g. a $0
 // service line or a free item; over-collection/positive-only cases use
 // zPositive below.)
@@ -477,17 +504,21 @@ const PAYMENT_TIERS: Record<"cash" | "check" | "card" | "financing", number> = {
   financing: 0.06,
 };
 
-// Pure function: given an invoice's current total and a payment method,
-// returns the amount actually owed under that method's tier plus the signed
-// surcharge/discount amount that produced it (surchargeAmount = amount -
-// invoiceTotal). Kept free of any DB/request access so it's trivially
+// Pure function: given an invoice's current total (IN CENTS) and a payment
+// method, returns the amount actually owed under that method's tier plus the
+// signed surcharge/discount amount that produced it (surchargeAmountCents =
+// amountCents - invoiceTotalCents), both IN CENTS. Operates entirely in
+// integer-cents space (round at the multiplication step) so the result is
+// exact -- no float drift the way `invoiceTotal * 0.04` in dollars could
+// produce. Kept free of any DB/request access so it's trivially
 // unit-reasonable and reusable (e.g. a future test file could import it
-// directly).
-function computePaymentAmount(invoiceTotal: number, method: "cash" | "check" | "card" | "financing"): { amount: number; surchargeAmount: number } {
+// directly). Callers convert dollars -> cents before calling this and cents ->
+// dollars after, same boundary-conversion rule as everywhere else.
+function computePaymentAmount(invoiceTotalCents: number, method: "cash" | "check" | "card" | "financing"): { amountCents: number; surchargeAmountCents: number } {
   const rate = PAYMENT_TIERS[method];
-  const surchargeAmount = invoiceTotal * rate;
-  const amount = invoiceTotal + surchargeAmount;
-  return { amount, surchargeAmount };
+  const surchargeAmountCents = Math.round(invoiceTotalCents * rate);
+  const amountCents = invoiceTotalCents + surchargeAmountCents;
+  return { amountCents, surchargeAmountCents };
 }
 
 // ── Shared Schemas ─────────────────────────────────────────────────
@@ -770,6 +801,10 @@ function jobJoinedSelect(db: ReturnType<typeof getDb>) {
       scheduled_date: schema.jobs.scheduledDate,
       scheduled_time: sql<string>`COALESCE(${schema.jobs.scheduledTime}, '')`,
       duration: schema.jobs.duration,
+      // Raw cents here -- jobJoinedSelectOut() below converts to dollars at
+      // the boundary. Every call site of jobJoinedSelect() MUST pipe its
+      // result through jobJoinedSelectOut()/jobJoinedSelectOutOne() before it
+      // reaches c.json().
       price: schema.jobs.price,
       address: sql<string>`COALESCE(${schema.jobs.address}, '')`,
       notes: sql<string>`COALESCE(${schema.jobs.notes}, '')`,
@@ -798,6 +833,14 @@ function jobJoinedSelect(db: ReturnType<typeof getDb>) {
     .leftJoin(schema.technicians, eq(schema.jobs.technicianId, schema.technicians.id))
     .leftJoin(schema.serviceTypes, eq(schema.jobs.serviceTypeId, schema.serviceTypes.id))
     .leftJoin(schema.brands, eq(schema.jobs.brandId, schema.brands.id));
+}
+// Boundary conversion for a single jobJoinedSelect() row: price cents -> dollars.
+function jobJoinedSelectOutOne<T extends { price: number }>(row: T): T {
+  return { ...row, price: fromCents(row.price) };
+}
+// Same, for an array of rows (list routes).
+function jobJoinedSelectOut<T extends { price: number }>(rows: T[]): T[] {
+  return rows.map(jobJoinedSelectOutOne);
 }
 
 // Enqueues a reminder message for a job onto the REMINDERS queue. Called
@@ -879,7 +922,7 @@ app.openapi(getStats, async (c) => {
     today_jobs: todayJobs?.count || 0,
     upcoming_jobs: upcomingJobs?.count || 0,
     completed_jobs: completedJobs?.count || 0,
-    revenue: revenue?.total || 0,
+    revenue: fromCents(revenue?.total || 0),
     invoices_outstanding: invoicesOutstanding?.count || 0,
     invoices_overdue: invoicesOverdue?.count || 0,
   }, 200);
@@ -1142,7 +1185,7 @@ app.openapi(listJobs, async (c) => {
     .offset(offset)
     .all();
 
-  return c.json({ jobs, total: countRow?.count || 0 }, 200);
+  return c.json({ jobs: jobJoinedSelectOut(jobs), total: countRow?.count || 0 }, 200);
 });
 
 const getJob = createRoute({
@@ -1203,7 +1246,8 @@ app.openapi(getJob, async (c) => {
     .all();
   const notesOut = notes.map((n) => ({ id: n.id, job_id: n.jobId, content: n.content, created_at: n.createdAt ?? "" }));
   const checklistOut = checklist.map((ch) => ({ id: ch.id, job_id: ch.jobId, label: ch.label, checked: ch.checked, sort_order: ch.sortOrder }));
-  return c.json({ job: { ...job, job_notes: notesOut, checklist: checklistOut, job_materials: jobMaterials, crew: crewRows.map(jobCrewOut) } }, 200);
+  const jobMaterialsOut = jobMaterials.map((jm) => ({ ...jm, unit_cost: fromCents(jm.unit_cost) }));
+  return c.json({ job: { ...jobJoinedSelectOutOne(job), job_notes: notesOut, checklist: checklistOut, job_materials: jobMaterialsOut, crew: crewRows.map(jobCrewOut) } }, 200);
 });
 
 const createJob = createRoute({
@@ -1294,7 +1338,7 @@ app.openapi(createJob, async (c) => {
     scheduledDate: data.scheduled_date,
     scheduledTime: data.scheduled_time || "09:00",
     duration,
-    price,
+    price: toCents(price),
     address,
     notes: data.notes || "",
     isRecurring: data.is_recurring || 0,
@@ -1307,7 +1351,7 @@ app.openapi(createJob, async (c) => {
   // Every new job gets a reminder queued -- see enqueueJobReminder's comment
   // for why this doesn't try to be "24 hours before".
   await enqueueJobReminder(c.env, job!.id, job!.scheduled_date);
-  return c.json(job!, 201);
+  return c.json(jobJoinedSelectOutOne(job!), 201);
 });
 
 const updateJob = createRoute({
@@ -1395,7 +1439,7 @@ app.openapi(updateJob, async (c) => {
   if (data.scheduled_date !== undefined) updates.scheduledDate = data.scheduled_date;
   if (data.scheduled_time !== undefined) updates.scheduledTime = data.scheduled_time;
   if (data.duration !== undefined) updates.duration = data.duration;
-  if (data.price !== undefined) updates.price = data.price;
+  if (data.price !== undefined) updates.price = toCents(data.price);
   if (data.address !== undefined) updates.address = data.address;
   if (data.notes !== undefined) updates.notes = data.notes;
   if (data.completion_notes !== undefined) updates.completionNotes = data.completion_notes;
@@ -2097,26 +2141,43 @@ app.openapi(getCustomer, async (c) => {
   // Outstanding balance = sum of the still-owed portion of every invoice that
   // is sent/overdue/draft (i.e. not fully paid and not cancelled). Per-invoice
   // owed = total - raw credit already collected (amount - surcharge for each
-  // paid payment, mirroring recordPayment's raw-credit accounting), floored at 0.
+  // paid payment, mirroring recordPayment's raw-credit accounting), floored at
+  // 0. This whole computation runs in CENTS (invoices/payments are read raw
+  // from the DB, pre-conversion) -- exact integer math, no float drift -- and
+  // is converted to dollars only once, at the very end via fromCents().
   const paidPayments = await db
     .select({ invoiceId: schema.payments.invoiceId, amount: schema.payments.amount, surchargeAmount: schema.payments.surchargeAmount })
     .from(schema.payments)
     .leftJoin(schema.invoices, eq(schema.payments.invoiceId, schema.invoices.id))
     .where(and(eq(schema.invoices.customerId, idNum), eq(schema.payments.status, "paid")))
     .all();
-  const rawCreditByInvoice = new Map<number, number>();
+  const rawCreditByInvoiceCents = new Map<number, number>();
   for (const p of paidPayments) {
-    const prev = rawCreditByInvoice.get(p.invoiceId) || 0;
-    rawCreditByInvoice.set(p.invoiceId, prev + ((p.amount || 0) - (p.surchargeAmount || 0)));
+    const prev = rawCreditByInvoiceCents.get(p.invoiceId) || 0;
+    rawCreditByInvoiceCents.set(p.invoiceId, prev + ((p.amount || 0) - (p.surchargeAmount || 0)));
   }
-  let outstandingBalance = 0;
+  let outstandingBalanceCents = 0;
   for (const inv of invoices) {
     if (inv.status === "paid" || inv.status === "cancelled") continue;
-    const owed = (inv.total || 0) - (rawCreditByInvoice.get(inv.id) || 0);
-    if (owed > 0) outstandingBalance += owed;
+    const owedCents = (inv.total || 0) - (rawCreditByInvoiceCents.get(inv.id) || 0);
+    if (owedCents > 0) outstandingBalanceCents += owedCents;
   }
 
-  return c.json({ customer: customerOut, jobs, estimates, invoices, outstanding_balance: outstandingBalance }, 200);
+  const jobsOut = jobJoinedSelectOut(jobs);
+  const invoicesOut = invoices.map((inv) => ({
+    ...inv,
+    subtotal: fromCentsNullable(inv.subtotal),
+    tax_amount: fromCentsNullable(inv.tax_amount),
+    total: fromCentsNullable(inv.total),
+  }));
+
+  return c.json({
+    customer: customerOut,
+    jobs: jobsOut,
+    estimates: estimateJoinedSelectOut(estimates),
+    invoices: invoicesOut,
+    outstanding_balance: fromCents(outstandingBalanceCents),
+  }, 200);
 });
 
 const createCustomer = createRoute({
@@ -2846,7 +2907,7 @@ app.openapi(getSchedule, async (c) => {
     .where(and(...conditions))
     .orderBy(asc(schema.jobs.scheduledDate), asc(schema.jobs.scheduledTime))
     .all();
-  return c.json({ jobs }, 200);
+  return c.json({ jobs: jobJoinedSelectOut(jobs) }, 200);
 });
 
 // ── Job Checklist ──────────────────────────────────────────────────
@@ -2971,7 +3032,7 @@ app.openapi(listMaterials, async (c) => {
     .from(schema.materials)
     .orderBy(asc(schema.materials.name))
     .all();
-  return c.json({ materials }, 200);
+  return c.json({ materials: materials.map((m) => ({ ...m, unit_cost: fromCents(m.unit_cost) })) }, 200);
 });
 
 const createMaterial = createRoute({
@@ -2997,7 +3058,7 @@ app.openapi(createMaterial, async (c) => {
   await db.insert(schema.materials).values({
     name: data.name,
     unit: data.unit || "ea",
-    unitCost: data.unit_cost || 0,
+    unitCost: toCents(data.unit_cost || 0),
     inStock: data.in_stock || 0,
   });
   return c.json({ ok: true }, 201);
@@ -3028,7 +3089,7 @@ app.openapi(updateMaterial, async (c) => {
   const updates: Record<string, unknown> = {};
   if (data.name !== undefined) updates.name = data.name;
   if (data.unit !== undefined) updates.unit = data.unit;
-  if (data.unit_cost !== undefined) updates.unitCost = data.unit_cost;
+  if (data.unit_cost !== undefined) updates.unitCost = toCents(data.unit_cost);
   if (data.in_stock !== undefined) updates.inStock = data.in_stock;
   if (Object.keys(updates).length > 0) {
     await db.update(schema.materials).set(updates).where(eq(schema.materials.id, toId(id)));
@@ -3109,7 +3170,7 @@ app.openapi(listProducts, async (c) => {
     .where(where)
     .orderBy(asc(schema.products.name))
     .all();
-  return c.json({ products }, 200);
+  return c.json({ products: products.map((p) => ({ ...p, unit_cost: fromCents(p.unit_cost) })) }, 200);
 });
 
 const createProduct = createRoute({
@@ -3141,7 +3202,7 @@ app.openapi(createProduct, async (c) => {
     name: data.name,
     sku: data.sku || null,
     category: data.category || null,
-    unitCost: data.unit_cost || 0,
+    unitCost: toCents(data.unit_cost || 0),
     unit: data.unit || "ea",
     active: data.active ?? 1,
   });
@@ -3179,7 +3240,7 @@ app.openapi(updateProduct, async (c) => {
   if (data.name !== undefined) updates.name = data.name;
   if (data.sku !== undefined) updates.sku = data.sku;
   if (data.category !== undefined) updates.category = data.category;
-  if (data.unit_cost !== undefined) updates.unitCost = data.unit_cost;
+  if (data.unit_cost !== undefined) updates.unitCost = toCents(data.unit_cost);
   if (data.unit !== undefined) updates.unit = data.unit;
   if (data.active !== undefined) updates.active = data.active;
   if (Object.keys(updates).length > 0) {
@@ -3238,12 +3299,17 @@ app.openapi(addJobMaterial, async (c) => {
   // Reject a dangling material_id with a clean 400 rather than a raw FK 500.
   const mat = await db.select({ unit_cost: schema.materials.unitCost }).from(schema.materials).where(eq(schema.materials.id, data.material_id)).get();
   if (!mat) return c.json({ error: "Material not found" }, 400);
-  const cost = data.unit_cost ?? (mat.unit_cost || 0);
+  // data.unit_cost (if provided) is a DOLLARS value from the client -- convert
+  // to cents before comparing/storing alongside mat.unit_cost, which is
+  // already raw cents straight from the DB. Mixing an unconverted dollars
+  // value with a raw cents value here would silently store a value 100x too
+  // small.
+  const costCents = data.unit_cost !== undefined ? toCents(data.unit_cost) : (mat.unit_cost || 0);
   await db.insert(schema.jobMaterials).values({
     jobId: idNum,
     materialId: data.material_id,
     quantity: data.quantity,
-    unitCost: cost,
+    unitCost: costCents,
   });
   return c.json({ ok: true }, 201);
 });
@@ -3357,8 +3423,25 @@ app.openapi(listInvoices, async (c) => {
     .offset(offset)
     .all();
 
-  return c.json({ invoices, total: countRow?.count || 0 }, 200);
+  return c.json({ invoices: invoices.map(invoiceMoneyOut), total: countRow?.count || 0 }, 200);
 });
+
+// Boundary conversion for an invoices-select row: subtotal/tax_amount/total
+// cents -> dollars. Reused by every invoice list/detail route below.
+function invoiceMoneyOut<T extends { subtotal: number | null; tax_amount: number | null; total: number | null }>(row: T): T {
+  return { ...row, subtotal: fromCentsNullable(row.subtotal), tax_amount: fromCentsNullable(row.tax_amount), total: fromCentsNullable(row.total) };
+}
+// Boundary conversion for an invoice_lines row: unit_price/total cents -> dollars.
+function invoiceLineOut(l: typeof schema.invoiceLines.$inferSelect) {
+  return {
+    id: l.id,
+    invoice_id: l.invoiceId,
+    description: l.description,
+    quantity: l.quantity,
+    unit_price: fromCentsNullable(l.unitPrice),
+    total: fromCentsNullable(l.total),
+  };
+}
 
 const getInvoice = createRoute({
   method: "get",
@@ -3410,14 +3493,7 @@ app.openapi(getInvoice, async (c) => {
     .where(eq(schema.invoiceLines.invoiceId, idNum))
     .orderBy(asc(schema.invoiceLines.id))
     .all();
-  const linesOut = lines.map((l) => ({
-    id: l.id,
-    invoice_id: l.invoiceId,
-    description: l.description,
-    quantity: l.quantity,
-    unit_price: l.unitPrice,
-    total: l.total,
-  }));
+  const linesOut = lines.map(invoiceLineOut);
   // Nested "payments" array, same pattern as "lines" above -- lets
   // invoice-detail.tsx render the payment history without a second request.
   const payments = await db
@@ -3427,7 +3503,7 @@ app.openapi(getInvoice, async (c) => {
     .orderBy(desc(schema.payments.id))
     .all();
   const paymentsOut = payments.map(paymentOut);
-  return c.json({ invoice: { ...invoice, lines: linesOut, payments: paymentsOut } }, 200);
+  return c.json({ invoice: { ...invoiceMoneyOut(invoice), lines: linesOut, payments: paymentsOut } }, 200);
 });
 
 // Shared invoice-line shape used by createInvoice, invoiceFromJob's progress-
@@ -3447,40 +3523,44 @@ const invoiceLineInput = z.object({
 // still do their own checks before calling this -- callers that derive
 // customer_id/job_id from an already-loaded job/estimate row, like the
 // progress-billing and change-order routes, don't need to re-check).
+//
+// input.lines[].unit_price is DOLLARS (every caller passes client-facing/
+// already-converted-to-dollars values) -- converted to cents once at the top,
+// then every internal computation (line totals, subtotal, tax, grand total)
+// runs in exact integer-cents space before being written to the (cents)
+// invoices/invoice_lines columns.
 async function createInvoiceWithLines(
   db: ReturnType<typeof getDb>,
   input: { customerId: number; jobId: number | null; taxRate: number; notes: string; dueDate: string; brandId: number | null; status?: string; lines: { description: string; quantity: number; unit_price: number }[] },
 ): Promise<number> {
   const identifier = await nextInvoiceIdentifier(db);
-  let subtotal = 0;
-  for (const line of input.lines) {
-    subtotal += line.quantity * line.unit_price;
-  }
-  const taxAmount = subtotal * (input.taxRate / 100);
-  const total = subtotal + taxAmount;
+  const lineTotalsCents = input.lines.map((line) => Math.round(line.quantity * toCents(line.unit_price)));
+  const subtotalCents = lineTotalsCents.reduce((sum, t) => sum + t, 0);
+  const taxAmountCents = Math.round(subtotalCents * (input.taxRate / 100));
+  const totalCents = subtotalCents + taxAmountCents;
 
   await db.insert(schema.invoices).values({
     identifier,
     customerId: input.customerId,
     jobId: input.jobId,
     status: input.status || "draft",
-    subtotal,
+    subtotal: subtotalCents,
     taxRate: input.taxRate,
-    taxAmount,
-    total,
+    taxAmount: taxAmountCents,
+    total: totalCents,
     notes: input.notes,
     dueDate: input.dueDate,
     brandId: input.brandId,
   });
   const invoice = await db.select({ id: schema.invoices.id }).from(schema.invoices).where(eq(schema.invoices.identifier, identifier)).get();
-  for (const line of input.lines) {
-    const lineTotal = line.quantity * line.unit_price;
+  for (let i = 0; i < input.lines.length; i++) {
+    const line = input.lines[i];
     await db.insert(schema.invoiceLines).values({
       invoiceId: invoice!.id,
       description: line.description,
       quantity: line.quantity,
-      unitPrice: line.unit_price,
-      total: lineTotal,
+      unitPrice: toCents(line.unit_price),
+      total: lineTotalsCents[i],
     });
   }
   return invoice!.id;
@@ -3568,21 +3648,25 @@ app.openapi(createInvoice, async (c) => {
     lines: data.lines,
   });
   const result = await getInvoiceJoinedById(db, invoiceId);
-  return c.json(result!, 201);
+  return c.json(invoiceMoneyOut(result!), 201);
 });
 
 // Recomputes and persists an invoice's subtotal/tax_amount/total from its
 // current set of invoice_lines rows, mirroring recomputeEstimateTotals. Called
 // after any line add/delete so the parent invoice's totals never drift from
 // its line items.
+// All money here (lines' total, invoices.subtotal/tax_amount/total) is raw
+// cents straight from/to the DB -- this function never crosses the JSON
+// boundary, so no toCents/fromCents calls are needed, only Math.round at the
+// tax multiplication (now exact integer-cents math, no float drift).
 async function recomputeInvoiceTotals(db: ReturnType<typeof getDb>, invoiceId: number) {
   const lines = await db.select({ total: schema.invoiceLines.total }).from(schema.invoiceLines).where(eq(schema.invoiceLines.invoiceId, invoiceId)).all();
-  const subtotal = lines.reduce((sum, l) => sum + (l.total || 0), 0);
+  const subtotalCents = lines.reduce((sum, l) => sum + (l.total || 0), 0);
   const invoice = await db.select({ taxRate: schema.invoices.taxRate }).from(schema.invoices).where(eq(schema.invoices.id, invoiceId)).get();
   const taxRate = invoice?.taxRate || 0;
-  const taxAmount = subtotal * (taxRate / 100);
-  const total = subtotal + taxAmount;
-  await db.update(schema.invoices).set({ subtotal, taxAmount, total, updatedAt: sql`(datetime('now'))` }).where(eq(schema.invoices.id, invoiceId));
+  const taxAmountCents = Math.round(subtotalCents * (taxRate / 100));
+  const totalCents = subtotalCents + taxAmountCents;
+  await db.update(schema.invoices).set({ subtotal: subtotalCents, taxAmount: taxAmountCents, total: totalCents, updatedAt: sql`(datetime('now'))` }).where(eq(schema.invoices.id, invoiceId));
 }
 
 const updateInvoice = createRoute({
@@ -3633,13 +3717,15 @@ app.openapi(updateInvoice, async (c) => {
   if (data.brand_id !== undefined) updates.brandId = data.brand_id;
   // Recompute tax_amount/total if tax_rate changes -- subtotal stays derived
   // from lines (this route never touches lines directly), so reuse the
-  // existing subtotal, exactly like updateEstimate does.
+  // existing subtotal (already raw cents from the DB), exactly like
+  // updateEstimate does. Math.round keeps the result an exact integer-cents
+  // value.
   if (data.tax_rate !== undefined) {
-    const subtotal = existing.subtotal || 0;
-    const taxAmount = subtotal * (data.tax_rate / 100);
+    const subtotalCents = existing.subtotal || 0;
+    const taxAmountCents = Math.round(subtotalCents * (data.tax_rate / 100));
     updates.taxRate = data.tax_rate;
-    updates.taxAmount = taxAmount;
-    updates.total = subtotal + taxAmount;
+    updates.taxAmount = taxAmountCents;
+    updates.total = subtotalCents + taxAmountCents;
   }
   if (Object.keys(updates).length > 0) {
     updates.updatedAt = sql`(datetime('now'))`;
@@ -3676,8 +3762,8 @@ function paymentOut(row: typeof schema.payments.$inferSelect) {
     id: row.id,
     invoice_id: row.invoiceId,
     method: row.method,
-    amount: row.amount,
-    surcharge_amount: row.surchargeAmount,
+    amount: fromCents(row.amount),
+    surcharge_amount: fromCentsNullable(row.surchargeAmount),
     processor_ref: row.processorRef,
     status: row.status,
     paid_at: row.paidAt,
@@ -3734,29 +3820,35 @@ app.openapi(recordPayment, async (c) => {
   const invoice = await db.select().from(schema.invoices).where(eq(schema.invoices.id, idNum)).get();
   if (!invoice) return c.json({ error: "Invoice not found" }, 404);
 
-  const invoiceTotal = invoice.total || 0;
+  // Everything below runs in CENTS (integer, exact) -- invoice.total and the
+  // prior payments' amount/surchargeAmount are raw DB reads (already cents),
+  // and data.amount (if provided) is the one DOLLARS value here, converted to
+  // cents immediately via toCents(). No float epsilon is needed anymore for
+  // the over-collection guard (unlike the old dollars-space version) because
+  // integer cents comparisons are exact.
+  const invoiceTotalCents = invoice.total || 0;
 
-  // Track remaining balance in RAW (pre-discount/surcharge) dollars so
-  // multiple payments against one invoice never over-collect. For any
-  // payment row, (amount - surchargeAmount) always equals the raw-dollar
-  // slice of invoiceTotal that payment cleared -- true by construction for
-  // auto/tier payments (see below) and true by definition for manual ones
+  // Track remaining balance in RAW (pre-discount/surcharge) cents so multiple
+  // payments against one invoice never over-collect. For any payment row,
+  // (amount - surchargeAmount) always equals the raw-cents slice of
+  // invoiceTotalCents that payment cleared -- true by construction for auto/
+  // tier payments (see below) and true by definition for manual ones
   // (surchargeAmount is always 0 for those, so amount IS the raw slice).
   const priorPayments = await db.select({ amount: schema.payments.amount, surchargeAmount: schema.payments.surchargeAmount })
     .from(schema.payments).where(and(eq(schema.payments.invoiceId, idNum), eq(schema.payments.status, "paid"))).all();
-  const priorRawCredit = priorPayments.reduce((sum, p) => sum + ((p.amount || 0) - (p.surchargeAmount || 0)), 0);
-  const remainingRaw = Math.max(0, invoiceTotal - priorRawCredit);
+  const priorRawCreditCents = priorPayments.reduce((sum, p) => sum + ((p.amount || 0) - (p.surchargeAmount || 0)), 0);
+  const remainingRawCents = Math.max(0, invoiceTotalCents - priorRawCreditCents);
 
-  // Reject over-collection at the API. The raw balance owed is remainingRaw
-  // (invoice total minus prior raw credit). A manual amount that exceeds it --
-  // or any payment against an already-fully-paid invoice -- is rejected with a
-  // 400 that states the max allowed. The 0.005 epsilon absorbs float rounding
-  // on the tier math so a legitimate "pay the exact remainder" isn't tripped.
-  if (remainingRaw <= 0.005) {
+  // Reject over-collection at the API. The raw balance owed is
+  // remainingRawCents (invoice total minus prior raw credit). A manual amount
+  // that exceeds it -- or any payment against an already-fully-paid invoice --
+  // is rejected with a 400 that states the max allowed.
+  if (remainingRawCents <= 0) {
     return c.json({ error: "This invoice is already paid in full." }, 400);
   }
-  if (data.amount !== undefined && data.amount > remainingRaw + 0.005) {
-    return c.json({ error: `Payment exceeds the balance owed. Maximum allowed is ${remainingRaw.toFixed(2)}.` }, 400);
+  const dataAmountCents = data.amount !== undefined ? toCents(data.amount) : undefined;
+  if (dataAmountCents !== undefined && dataAmountCents > remainingRawCents) {
+    return c.json({ error: `Payment exceeds the balance owed. Maximum allowed is ${fromCents(remainingRawCents).toFixed(2)}.` }, 400);
   }
 
   // amount defaults to the tier-computed amount for what's actually still
@@ -3767,22 +3859,22 @@ app.openapi(recordPayment, async (c) => {
   // surcharge_amount only reflects the tier math, so a manually-entered
   // amount is recorded with surcharge_amount 0 rather than a misleading
   // inferred figure.
-  let amount: number;
-  let surchargeAmount: number;
-  if (data.amount !== undefined) {
-    amount = data.amount;
-    surchargeAmount = 0;
+  let amountCents: number;
+  let surchargeAmountCents: number;
+  if (dataAmountCents !== undefined) {
+    amountCents = dataAmountCents;
+    surchargeAmountCents = 0;
   } else {
-    const computed = computePaymentAmount(remainingRaw, data.method);
-    amount = computed.amount;
-    surchargeAmount = computed.surchargeAmount;
+    const computed = computePaymentAmount(remainingRawCents, data.method);
+    amountCents = computed.amountCents;
+    surchargeAmountCents = computed.surchargeAmountCents;
   }
 
   await db.insert(schema.payments).values({
     invoiceId: idNum,
     method: data.method,
-    amount,
-    surchargeAmount,
+    amount: amountCents,
+    surchargeAmount: surchargeAmountCents,
     // No real processor integration yet (Phase 5 Stripe work) -- cash/
     // check/card/financing are all recorded as immediately "paid" with no
     // processor_ref, matching the build plan's note that this app doesn't
@@ -3793,16 +3885,16 @@ app.openapi(recordPayment, async (c) => {
   const payment = await db.select().from(schema.payments).where(eq(schema.payments.invoiceId, idNum)).orderBy(desc(schema.payments.id)).limit(1).get();
 
   // This payment's own raw credit (auto payments are computed to exactly
-  // clear remainingRaw, so they always zero it out in one shot; manual
-  // payments only clear as much raw balance as their dollar amount).
-  const thisRawCredit = amount - surchargeAmount;
-  const totalRawCredit = priorRawCredit + thisRawCredit;
+  // clear remainingRawCents, so they always zero it out in one shot; manual
+  // payments only clear as much raw balance as their cents amount).
+  const thisRawCreditCents = amountCents - surchargeAmountCents;
+  const totalRawCreditCents = priorRawCreditCents + thisRawCreditCents;
   // Flip to "paid" (the same 4-value status enum already used elsewhere in
   // this file -- draft/sent/paid/overdue/cancelled -- no new "partial"
   // status invented) once accumulated raw credit covers the invoice total.
-  // A small epsilon guards against float rounding on the tier math.
+  // Exact integer-cents comparison -- no epsilon needed.
   let invoiceStatus = invoice.status;
-  if (totalRawCredit >= invoiceTotal - 0.005) {
+  if (totalRawCreditCents >= invoiceTotalCents) {
     invoiceStatus = "paid";
     await db.update(schema.invoices).set({ status: "paid", paidDate: todayInTampa(), updatedAt: sql`(datetime('now'))` }).where(eq(schema.invoices.id, idNum));
   }
@@ -3841,6 +3933,13 @@ app.openapi(invoiceFromJob, async (c) => {
   if (!job) return c.json({ error: "Job not found" }, 404);
 
   const identifier = await nextInvoiceIdentifier(db);
+  // NOTE: job.price and m.unit_cost below are raw, UNCONVERTED cents reads
+  // (this route never calls fromCents on them) -- that's correct here, not a
+  // missed boundary: this whole block computes subtotal/unit_price/total in
+  // cents-space and writes them straight into the (now-cents) invoices/
+  // invoice_lines columns below. The route's only JSON response is
+  // { ok, invoice_id } -- no money value is ever returned to the client, so
+  // there is no dollars boundary to cross here.
   const price = job.price;
 
   // Gather materials used
@@ -3951,7 +4050,7 @@ app.openapi(listJobInvoices, async (c) => {
     .where(eq(schema.invoices.jobId, idNum))
     .orderBy(asc(schema.invoices.createdAt))
     .all();
-  return c.json({ invoices: rows }, 200);
+  return c.json({ invoices: rows.map(invoiceMoneyOut) }, 200);
 });
 
 const jobProgressInvoice = createRoute({
@@ -4002,7 +4101,7 @@ app.openapi(jobProgressInvoice, async (c) => {
     lines,
   });
   const result = await getInvoiceJoinedById(db, invoiceId);
-  return c.json(result!, 201);
+  return c.json(invoiceMoneyOut(result!), 201);
 });
 
 // ── Invoice line management ────────────────────────────────────────
@@ -4039,13 +4138,17 @@ app.openapi(addInvoiceLine, async (c) => {
     return c.json({ error: `Cannot add a line to a ${invoice.status} invoice.` }, 409);
   }
   const data = c.req.valid("json");
-  const lineTotal = data.quantity * data.unit_price;
+  // data.unit_price is DOLLARS (client input) -- convert to cents before the
+  // line-total multiplication so both unit_price and total are stored as
+  // exact integer cents.
+  const unitPriceCents = toCents(data.unit_price);
+  const lineTotalCents = Math.round(data.quantity * unitPriceCents);
   await db.insert(schema.invoiceLines).values({
     invoiceId: idNum,
     description: data.description,
     quantity: data.quantity,
-    unitPrice: data.unit_price,
-    total: lineTotal,
+    unitPrice: unitPriceCents,
+    total: lineTotalCents,
   });
   await recomputeInvoiceTotals(db, idNum);
   return c.json({ ok: true }, 201);
@@ -4117,6 +4220,21 @@ function estimateJoinedSelect(db: ReturnType<typeof getDb>) {
     .leftJoin(schema.customers, eq(schema.estimates.customerId, schema.customers.id))
     .leftJoin(schema.brands, eq(schema.estimates.brandId, schema.brands.id));
 }
+// Boundary conversion for an estimateJoinedSelect() row: subtotal/tax_amount/
+// total/deposit_amount cents -> dollars. deposit_amount is nullable, so it
+// uses fromCentsNullable (must stay null, not become 0).
+function estimateJoinedSelectOutOne<T extends { subtotal: number | null; tax_amount: number | null; total: number | null; deposit_amount: number | null }>(row: T): T {
+  return {
+    ...row,
+    subtotal: fromCentsNullable(row.subtotal),
+    tax_amount: fromCentsNullable(row.tax_amount),
+    total: fromCentsNullable(row.total),
+    deposit_amount: fromCentsNullable(row.deposit_amount),
+  };
+}
+function estimateJoinedSelectOut<T extends { subtotal: number | null; tax_amount: number | null; total: number | null; deposit_amount: number | null }>(rows: T[]): T[] {
+  return rows.map(estimateJoinedSelectOutOne);
+}
 
 const listEstimates = createRoute({
   method: "get",
@@ -4171,8 +4289,20 @@ app.openapi(listEstimates, async (c) => {
     .offset(offset)
     .all();
 
-  return c.json({ estimates, total: countRow?.count || 0 }, 200);
+  return c.json({ estimates: estimateJoinedSelectOut(estimates), total: countRow?.count || 0 }, 200);
 });
+
+// Boundary conversion for an estimate_lines row: unit_price/total cents -> dollars.
+function estimateLineOut(l: typeof schema.estimateLines.$inferSelect) {
+  return {
+    id: l.id,
+    estimate_id: l.estimateId,
+    description: l.description,
+    quantity: l.quantity,
+    unit_price: fromCentsNullable(l.unitPrice),
+    total: fromCentsNullable(l.total),
+  };
+}
 
 const getEstimate = createRoute({
   method: "get",
@@ -4196,15 +4326,8 @@ app.openapi(getEstimate, async (c) => {
     .where(eq(schema.estimateLines.estimateId, idNum))
     .orderBy(asc(schema.estimateLines.id))
     .all();
-  const linesOut = lines.map((l) => ({
-    id: l.id,
-    estimate_id: l.estimateId,
-    description: l.description,
-    quantity: l.quantity,
-    unit_price: l.unitPrice,
-    total: l.total,
-  }));
-  return c.json({ estimate: { ...estimate, lines: linesOut } }, 200);
+  const linesOut = lines.map(estimateLineOut);
+  return c.json({ estimate: { ...estimateJoinedSelectOutOne(estimate), lines: linesOut } }, 200);
 });
 
 const createEstimate = createRoute({
@@ -4239,40 +4362,40 @@ app.openapi(createEstimate, async (c) => {
   const identifier = await nextEstimateIdentifier(db);
   const taxRate = data.tax_rate || 0;
 
-  let subtotal = 0;
-  for (const line of data.lines) {
-    subtotal += line.quantity * line.unit_price;
-  }
-  const taxAmount = subtotal * (taxRate / 100);
-  const total = subtotal + taxAmount;
+  // data.lines[].unit_price is DOLLARS (client input) -- convert to cents up
+  // front, then every sum/multiply below is exact integer-cents math.
+  const lineTotalsCents = data.lines.map((line) => Math.round(line.quantity * toCents(line.unit_price)));
+  const subtotalCents = lineTotalsCents.reduce((sum, t) => sum + t, 0);
+  const taxAmountCents = Math.round(subtotalCents * (taxRate / 100));
+  const totalCents = subtotalCents + taxAmountCents;
 
   await db.insert(schema.estimates).values({
     identifier,
     customerId: data.customer_id,
     brandId: data.brand_id ?? null,
     status: "draft",
-    subtotal,
+    subtotal: subtotalCents,
     taxRate,
-    taxAmount,
-    total,
+    taxAmount: taxAmountCents,
+    total: totalCents,
     validUntil: data.valid_until || null,
     notes: data.notes || "",
   });
 
   const estimate = await db.select({ id: schema.estimates.id }).from(schema.estimates).where(eq(schema.estimates.identifier, identifier)).get();
-  for (const line of data.lines) {
-    const lineTotal = line.quantity * line.unit_price;
+  for (let i = 0; i < data.lines.length; i++) {
+    const line = data.lines[i];
     await db.insert(schema.estimateLines).values({
       estimateId: estimate!.id,
       description: line.description,
       quantity: line.quantity,
-      unitPrice: line.unit_price,
-      total: lineTotal,
+      unitPrice: toCents(line.unit_price),
+      total: lineTotalsCents[i],
     });
   }
 
   const result = await estimateJoinedSelect(db).where(eq(schema.estimates.id, estimate!.id)).get();
-  return c.json(result!, 201);
+  return c.json(estimateJoinedSelectOutOne(result!), 201);
 });
 
 const updateEstimate = createRoute({
@@ -4315,13 +4438,14 @@ app.openapi(updateEstimate, async (c) => {
   if (data.brand_id !== undefined) updates.brandId = data.brand_id;
   // Recompute tax_amount/total if tax_rate changes -- subtotal stays
   // derived from lines (this route never touches lines directly), so it's
-  // safe to reuse the existing subtotal in the recompute.
+  // safe to reuse the existing subtotal (already raw cents from the DB) in
+  // the recompute. Math.round keeps the result an exact integer-cents value.
   if (data.tax_rate !== undefined) {
-    const subtotal = existing.subtotal || 0;
-    const taxAmount = subtotal * (data.tax_rate / 100);
+    const subtotalCents = existing.subtotal || 0;
+    const taxAmountCents = Math.round(subtotalCents * (data.tax_rate / 100));
     updates.taxRate = data.tax_rate;
-    updates.taxAmount = taxAmount;
-    updates.total = subtotal + taxAmount;
+    updates.taxAmount = taxAmountCents;
+    updates.total = subtotalCents + taxAmountCents;
   }
   if (Object.keys(updates).length > 0) {
     await db.update(schema.estimates).set(updates).where(eq(schema.estimates.id, idNum));
@@ -4493,14 +4617,17 @@ app.openapi(declineEstimate, async (c) => {
 // Recomputes and persists an estimate's subtotal/tax_amount/total from its
 // current set of estimate_lines rows. Called after any line add/remove so
 // the parent estimate's totals never drift from its line items.
+// All money here (lines' total, estimates.subtotal/tax_amount/total) is raw
+// cents straight from/to the DB -- no toCents/fromCents needed, only
+// Math.round at the tax multiplication (exact integer-cents math).
 async function recomputeEstimateTotals(db: ReturnType<typeof getDb>, estimateId: number) {
   const lines = await db.select({ total: schema.estimateLines.total }).from(schema.estimateLines).where(eq(schema.estimateLines.estimateId, estimateId)).all();
-  const subtotal = lines.reduce((sum, l) => sum + (l.total || 0), 0);
+  const subtotalCents = lines.reduce((sum, l) => sum + (l.total || 0), 0);
   const estimate = await db.select({ taxRate: schema.estimates.taxRate }).from(schema.estimates).where(eq(schema.estimates.id, estimateId)).get();
   const taxRate = estimate?.taxRate || 0;
-  const taxAmount = subtotal * (taxRate / 100);
-  const total = subtotal + taxAmount;
-  await db.update(schema.estimates).set({ subtotal, taxAmount, total }).where(eq(schema.estimates.id, estimateId));
+  const taxAmountCents = Math.round(subtotalCents * (taxRate / 100));
+  const totalCents = subtotalCents + taxAmountCents;
+  await db.update(schema.estimates).set({ subtotal: subtotalCents, taxAmount: taxAmountCents, total: totalCents }).where(eq(schema.estimates.id, estimateId));
 }
 
 const addEstimateLine = createRoute({
@@ -4529,13 +4656,16 @@ app.openapi(addEstimateLine, async (c) => {
   const estimate = await db.select({ id: schema.estimates.id }).from(schema.estimates).where(eq(schema.estimates.id, idNum)).get();
   if (!estimate) return c.json({ error: "Estimate not found" }, 404);
   const data = c.req.valid("json");
-  const lineTotal = data.quantity * data.unit_price;
+  // data.unit_price is DOLLARS (client input) -- convert to cents before the
+  // line-total multiplication.
+  const unitPriceCents = toCents(data.unit_price);
+  const lineTotalCents = Math.round(data.quantity * unitPriceCents);
   await db.insert(schema.estimateLines).values({
     estimateId: idNum,
     description: data.description,
     quantity: data.quantity,
-    unitPrice: data.unit_price,
-    total: lineTotal,
+    unitPrice: unitPriceCents,
+    total: lineTotalCents,
   });
   await recomputeEstimateTotals(db, idNum);
   return c.json({ ok: true }, 201);
@@ -4586,6 +4716,10 @@ function surfaceLineDescription(roomName: string, surfaceType: string, coats: nu
 // create/update/delete so estimate_lines never drifts from the builder.
 // Deliberately does everything needed for one surface in one place so every
 // call site (create/update/delete surface, delete room) stays a single call.
+// surface.laborCost/materialCost are raw cents (straight from a Drizzle row,
+// never converted) -- this function stays entirely in cents-space, writing
+// the summed total straight into the (cents) estimate_lines.unitPrice/total
+// columns. No toCents/fromCents needed here.
 async function syncEstimateLineForSurface(
   db: ReturnType<typeof getDb>,
   estimateId: number,
@@ -4622,8 +4756,8 @@ function estimateSurfaceOut(row: typeof schema.estimateSurfaces.$inferSelect) {
     prep_notes: row.prepNotes,
     coats: row.coats,
     paint_product: row.paintProduct,
-    labor_cost: row.laborCost,
-    material_cost: row.materialCost,
+    labor_cost: fromCents(row.laborCost),
+    material_cost: fromCents(row.materialCost),
     sort_order: row.sortOrder,
     generated_line_id: row.generatedLineId,
   };
@@ -4824,12 +4958,13 @@ app.openapi(addEstimateSurface, async (c) => {
   await db.insert(schema.estimateSurfaces).values({
     roomId: idNum,
     surfaceType: data.surface_type,
+    // measurement is sqft/linear ft, NOT money -- stays as-is.
     measurement: data.measurement ?? 0,
     prepNotes: data.prep_notes || null,
     coats: data.coats ?? 2,
     paintProduct: data.paint_product || null,
-    laborCost: data.labor_cost ?? 0,
-    materialCost: data.material_cost ?? 0,
+    laborCost: toCents(data.labor_cost ?? 0),
+    materialCost: toCents(data.material_cost ?? 0),
     sortOrder: data.sort_order ?? 0,
   });
   const surface = await db.select().from(schema.estimateSurfaces).where(eq(schema.estimateSurfaces.roomId, idNum)).orderBy(desc(schema.estimateSurfaces.id)).limit(1).get();
@@ -4890,8 +5025,8 @@ app.openapi(updateEstimateSurface, async (c) => {
   if (data.prep_notes !== undefined) updates.prepNotes = data.prep_notes || null;
   if (data.coats !== undefined) updates.coats = data.coats;
   if (data.paint_product !== undefined) updates.paintProduct = data.paint_product || null;
-  if (data.labor_cost !== undefined) updates.laborCost = data.labor_cost;
-  if (data.material_cost !== undefined) updates.materialCost = data.material_cost;
+  if (data.labor_cost !== undefined) updates.laborCost = toCents(data.labor_cost);
+  if (data.material_cost !== undefined) updates.materialCost = toCents(data.material_cost);
   if (data.sort_order !== undefined) updates.sortOrder = data.sort_order;
   if (Object.keys(updates).length > 0) {
     await db.update(schema.estimateSurfaces).set(updates).where(eq(schema.estimateSurfaces.id, idNum));
@@ -4969,16 +5104,21 @@ app.openapi(setEstimateDeposit, async (c) => {
     return c.json({ error: `Cannot set a deposit on a ${estimate.status} estimate.` }, 409);
   }
   const data = c.req.valid("json");
-  const depositAmount = data.deposit_amount;
-  if (depositAmount !== null && depositAmount > (estimate.total || 0) + 0.005) {
-    return c.json({ error: `Deposit cannot exceed the estimate total (${(estimate.total || 0).toFixed(2)}).` }, 400);
+  // data.deposit_amount is DOLLARS (client input) -- convert to cents before
+  // comparing against estimate.total, which is already raw cents from the DB.
+  // Mixing an unconverted dollars value with a raw cents value here would
+  // silently accept a deposit ~100x too large.
+  const depositAmountCents = data.deposit_amount === null ? null : toCents(data.deposit_amount);
+  const estimateTotalCents = estimate.total || 0;
+  if (depositAmountCents !== null && depositAmountCents > estimateTotalCents) {
+    return c.json({ error: `Deposit cannot exceed the estimate total (${fromCents(estimateTotalCents).toFixed(2)}).` }, 400);
   }
   // Store 0 the same as null -- both mean "no deposit" (convertEstimate's
   // `depositAmount && depositAmount > 0` guard already treats them the same,
   // but normalizing here too keeps the stored value matching the "null/0
   // clears the deposit" contract above instead of leaving a stray literal 0).
-  const storedDeposit = depositAmount === null || depositAmount === 0 ? null : depositAmount;
-  await db.update(schema.estimates).set({ depositAmount: storedDeposit }).where(eq(schema.estimates.id, idNum));
+  const storedDepositCents = depositAmountCents === null || depositAmountCents === 0 ? null : depositAmountCents;
+  await db.update(schema.estimates).set({ depositAmount: storedDepositCents }).where(eq(schema.estimates.id, idNum));
   return c.json({ ok: true }, 200);
 });
 
@@ -5011,6 +5151,18 @@ app.openapi(convertEstimate, async (c) => {
   }
 
   const lines = await db.select().from(schema.estimateLines).where(eq(schema.estimateLines.estimateId, idNum)).orderBy(asc(schema.estimateLines.id)).all();
+
+  // NOTE: this entire route operates on raw, UNCONVERTED cents values --
+  // estimate.subtotal/total/depositAmount and line.unitPrice/total are all
+  // read straight from Drizzle (no fromCents), and every value written below
+  // (jobs.price, invoices.subtotal/total, invoiceLines.unitPrice/total) goes
+  // straight into the corresponding (cents) column. That's correct, not a
+  // missed boundary: this route's only JSON response is
+  // { ok, job_id, invoice_id, deposit_invoice_id } -- no money crosses the
+  // wire here, so the deposit-credit-on-final-invoice math below (offsetting
+  // "Less: Deposit paid" line) is exact integer-cents arithmetic with no
+  // float drift, same as the original dollars-space version but now provably
+  // exact.
 
   // ── Create the job ──
   // createJob's Zod schema only requires customer_id + scheduled_date;
@@ -5127,7 +5279,18 @@ app.openapi(convertEstimate, async (c) => {
     });
 
     // Credit the deposit against the final invoice so the two never sum to
-    // more than the estimate's total.
+    // more than the estimate's total -- for ANY tax rate, not just 0%.
+    //
+    // A plain recomputeInvoiceTotals() call here would re-derive tax as
+    // (subtotal_after_credit * taxRate), which UNDER-collects tax whenever
+    // tax_rate > 0: it effectively taxes the deposit portion at 0% instead of
+    // the estimate's real rate. (Adversarial review on the cents migration
+    // caught this: a $530.70 estimate with a 6% rate + $100.25 deposit summed
+    // to only $524.68 across the two invoices -- $6.02 short.) The deposit is
+    // a credit against an already-fully-taxed total, not a pre-tax discount,
+    // so tax_amount must be carried over UNCHANGED from the estimate, and
+    // only subtotal/total shift by the deposit -- total lands on exactly
+    // estimate.total - depositAmount for every tax rate, not just 0%.
     await db.insert(schema.invoiceLines).values({
       invoiceId,
       description: "Less: Deposit paid",
@@ -5135,7 +5298,12 @@ app.openapi(convertEstimate, async (c) => {
       unitPrice: -depositAmount,
       total: -depositAmount,
     });
-    await recomputeInvoiceTotals(db, invoiceId);
+    await db.update(schema.invoices).set({
+      subtotal: (estimate.subtotal || 0) - depositAmount,
+      taxAmount: estimate.taxAmount || 0,
+      total: (estimate.total || 0) - depositAmount,
+      updatedAt: sql`(datetime('now'))`,
+    }).where(eq(schema.invoices.id, invoiceId));
   }
 
   // Mark converted so a second call 409s (the `status !== "approved"` check
@@ -5154,7 +5322,7 @@ app.openapi(convertEstimate, async (c) => {
 // an invoice; rejecting one does not.
 
 function changeOrderOut(row: typeof schema.changeOrders.$inferSelect) {
-  return { id: row.id, job_id: row.jobId, description: row.description, amount: row.amount, status: row.status, created_at: row.createdAt ?? "" };
+  return { id: row.id, job_id: row.jobId, description: row.description, amount: fromCents(row.amount), status: row.status, created_at: row.createdAt ?? "" };
 }
 
 const listJobChangeOrders = createRoute({
@@ -5201,7 +5369,7 @@ app.openapi(createChangeOrder, async (c) => {
   const job = await db.select({ id: schema.jobs.id }).from(schema.jobs).where(eq(schema.jobs.id, idNum)).get();
   if (!job) return c.json({ error: "Job not found" }, 404);
   const data = c.req.valid("json");
-  await db.insert(schema.changeOrders).values({ jobId: idNum, description: data.description, amount: data.amount, status: "pending" });
+  await db.insert(schema.changeOrders).values({ jobId: idNum, description: data.description, amount: toCents(data.amount), status: "pending" });
   const row = await db.select().from(schema.changeOrders).where(eq(schema.changeOrders.jobId, idNum)).orderBy(desc(schema.changeOrders.id)).limit(1).get();
   return c.json(changeOrderOut(row!), 201);
 });
@@ -5241,20 +5409,26 @@ app.openapi(approveChangeOrder, async (c) => {
   let invoiceId: number;
   if (targetInvoice) {
     invoiceId = targetInvoice.id;
-    const lineTotal = changeOrder.amount;
+    // changeOrder.amount is raw cents (straight from the DB) -- write it
+    // straight into the (cents) invoice_lines columns, no conversion.
+    const lineTotalCents = changeOrder.amount;
     await db.insert(schema.invoiceLines).values({
       invoiceId,
       description: `Change Order: ${changeOrder.description}`,
       quantity: 1,
-      unitPrice: lineTotal,
-      total: lineTotal,
+      unitPrice: lineTotalCents,
+      total: lineTotalCents,
     });
     await recomputeInvoiceTotals(db, invoiceId);
   } else {
     // No draft/sent invoice exists on this job (e.g. it's brand new, or every
     // existing invoice is already paid/cancelled) -- create a new invoice for
     // just the change-order amount, reusing the same createInvoiceWithLines
-    // path progress billing uses.
+    // path progress billing uses. createInvoiceWithLines expects its
+    // lines[].unit_price in DOLLARS (it converts to cents internally) --
+    // changeOrder.amount is raw cents, so it must be converted back to
+    // dollars here first, or this would silently double-convert (divide by
+    // 100 twice) and store an amount 100x too small.
     const job = await db.select({ customerId: schema.jobs.customerId, brandId: schema.jobs.brandId }).from(schema.jobs).where(eq(schema.jobs.id, changeOrder.jobId)).get();
     invoiceId = await createInvoiceWithLines(db, {
       customerId: job!.customerId,
@@ -5264,7 +5438,7 @@ app.openapi(approveChangeOrder, async (c) => {
       dueDate: "",
       brandId: job!.brandId ?? null,
       status: "sent",
-      lines: [{ description: `Change Order: ${changeOrder.description}`, quantity: 1, unit_price: changeOrder.amount }],
+      lines: [{ description: `Change Order: ${changeOrder.description}`, quantity: 1, unit_price: fromCents(changeOrder.amount) }],
     });
   }
 
@@ -5583,7 +5757,10 @@ async function processDueServiceAgreements(env: AppBindings["Bindings"]): Promis
       scheduledDate: agreement.nextRunDate,
       scheduledTime: "09:00",
       duration,
-      price,
+      // price came from service_types.default_price above, which is DOLLARS
+      // (that column is deliberately NOT part of the cents migration) --
+      // convert to cents before writing into jobs.price (a cents column).
+      price: toCents(price),
       address,
       notes: "Auto-generated from recurring service agreement.",
       brandId: agreement.brandId ?? null,
@@ -5665,7 +5842,9 @@ async function buildEstimatePdfBytes(db: ReturnType<typeof getDb>, estimateId: n
     .get();
   if (!est) return null;
   const lines = await db.select().from(schema.estimateLines).where(eq(schema.estimateLines.estimateId, estimateId)).orderBy(asc(schema.estimateLines.id)).all();
-  const pdfLines: PdfLine[] = lines.map((l) => ({ description: l.description, quantity: l.quantity ?? 0, unitPrice: l.unitPrice ?? 0, total: l.total ?? 0 }));
+  // buildDocumentPdf (src/lib/pdf.ts) formats these as decimal dollars --
+  // convert every cents value at this boundary, right before it's handed off.
+  const pdfLines: PdfLine[] = lines.map((l) => ({ description: l.description, quantity: l.quantity ?? 0, unitPrice: fromCents(l.unitPrice ?? 0), total: fromCents(l.total ?? 0) }));
   return await buildDocumentPdf({
     docType: "Estimate",
     businessName: est.brandName || "Noble Tampa",
@@ -5674,10 +5853,10 @@ async function buildEstimatePdfBytes(db: ReturnType<typeof getDb>, estimateId: n
     customerName: est.customerName || "",
     customerAddress: est.customerAddress || "",
     lines: pdfLines,
-    subtotal: est.subtotal || 0,
+    subtotal: fromCents(est.subtotal || 0),
     taxRate: est.taxRate || 0,
-    taxAmount: est.taxAmount || 0,
-    total: est.total || 0,
+    taxAmount: fromCents(est.taxAmount || 0),
+    total: fromCents(est.total || 0),
     notes: est.notes,
     signedName: est.signedName,
     signedAt: est.signedAt,
@@ -5709,7 +5888,9 @@ async function buildInvoicePdfBytes(db: ReturnType<typeof getDb>, invoiceId: num
     .get();
   if (!inv) return null;
   const lines = await db.select().from(schema.invoiceLines).where(eq(schema.invoiceLines.invoiceId, invoiceId)).orderBy(asc(schema.invoiceLines.id)).all();
-  const pdfLines: PdfLine[] = lines.map((l) => ({ description: l.description, quantity: l.quantity ?? 0, unitPrice: l.unitPrice ?? 0, total: l.total ?? 0 }));
+  // buildDocumentPdf (src/lib/pdf.ts) formats these as decimal dollars --
+  // convert every cents value at this boundary, right before it's handed off.
+  const pdfLines: PdfLine[] = lines.map((l) => ({ description: l.description, quantity: l.quantity ?? 0, unitPrice: fromCents(l.unitPrice ?? 0), total: fromCents(l.total ?? 0) }));
   return await buildDocumentPdf({
     docType: "Invoice",
     businessName: inv.brandName || "Noble Tampa",
@@ -5718,10 +5899,10 @@ async function buildInvoicePdfBytes(db: ReturnType<typeof getDb>, invoiceId: num
     customerName: inv.customerName || "",
     customerAddress: inv.customerAddress || "",
     lines: pdfLines,
-    subtotal: inv.subtotal || 0,
+    subtotal: fromCents(inv.subtotal || 0),
     taxRate: inv.taxRate || 0,
-    taxAmount: inv.taxAmount || 0,
-    total: inv.total || 0,
+    taxAmount: fromCents(inv.taxAmount || 0),
+    total: fromCents(inv.total || 0),
     notes: inv.notes,
     colorPrimary: inv.brandColorPrimary,
     colorSecondary: inv.brandColorSecondary,
@@ -5808,7 +5989,11 @@ app.openapi(invoiceCheckout, async (c) => {
   if (invoice.status !== "sent" && invoice.status !== "overdue") {
     return c.json({ error: `This invoice is not payable online (status: ${invoice.status}).` }, 409);
   }
-  const result = await createInvoiceCheckout(c.env, { id: invoice.id, identifier: invoice.identifier, total: invoice.total || 0, brandName: invoice.brandName }, requestBaseUrl(c));
+  // createInvoiceCheckout (src/lib/payments.ts) expects CheckoutInvoice.total
+  // in DOLLARS -- it does its own `* 100` to get Stripe cents. invoice.total
+  // is raw DB cents, so it must be converted here at the boundary; passing it
+  // unconverted would make createInvoiceCheckout charge Stripe 100x too little.
+  const result = await createInvoiceCheckout(c.env, { id: invoice.id, identifier: invoice.identifier, total: fromCents(invoice.total || 0), brandName: invoice.brandName }, requestBaseUrl(c));
   if (!result.configured) {
     return c.json({ error: "Online payments are not configured yet.", configured: false }, 501);
   }
@@ -5846,11 +6031,17 @@ app.post("/api/stripe/webhook", async (c) => {
       const db = getDb(c.env);
       const invoice = await db.select().from(schema.invoices).where(eq(schema.invoices.id, invoiceId)).get();
       if (invoice) {
-        // Amount actually collected from Stripe (cents -> dollars). This is the
-        // real card charge; record it as-is with a card surcharge of 0 (the
-        // customer paid the amount Stripe collected -- see createInvoiceCheckout,
-        // which charges the plain total).
-        const amount = (obj.amount_total ?? Math.round((invoice.total || 0) * 100)) / 100;
+        // Amount actually collected from Stripe. obj.amount_total is already
+        // in Stripe's smallest-currency-unit (USD cents) -- the SAME unit our
+        // payments.amount column now stores natively, so it's used as-is with
+        // NO division by 100 (unlike the pre-cents-migration version of this
+        // code, which had to convert Stripe cents down to dollars to match
+        // the old real-dollars column). The fallback (amount_total absent) is
+        // invoice.total, which is already raw DB cents -- also used as-is,
+        // no conversion. This is the real card charge; record it with a card
+        // surcharge of 0 (the customer paid the amount Stripe collected --
+        // see createInvoiceCheckout, which charges the plain total).
+        const amountCents = obj.amount_total ?? (invoice.total || 0);
         // Guard against a duplicate webhook delivery creating a second payment
         // for the same Stripe session/intent.
         const ref = obj.payment_intent || obj.id || null;
@@ -5859,17 +6050,18 @@ app.post("/api/stripe/webhook", async (c) => {
           await db.insert(schema.payments).values({
             invoiceId,
             method: "card",
-            amount,
+            amount: amountCents,
             surchargeAmount: 0,
             processorRef: ref,
             status: "paid",
             paidAt: sql`(datetime('now'))`,
           });
           // Reuse recordPayment's flip-to-paid rule: if accumulated raw credit
-          // now covers the total, mark the invoice paid.
+          // now covers the total, mark the invoice paid. Exact integer-cents
+          // comparison -- no epsilon needed.
           const paid = await db.select({ amount: schema.payments.amount, surchargeAmount: schema.payments.surchargeAmount }).from(schema.payments).where(and(eq(schema.payments.invoiceId, invoiceId), eq(schema.payments.status, "paid"))).all();
-          const rawCredit = paid.reduce((s, p) => s + ((p.amount || 0) - (p.surchargeAmount || 0)), 0);
-          if (rawCredit >= (invoice.total || 0) - 0.005) {
+          const rawCreditCents = paid.reduce((s, p) => s + ((p.amount || 0) - (p.surchargeAmount || 0)), 0);
+          if (rawCreditCents >= (invoice.total || 0)) {
             await db.update(schema.invoices).set({ status: "paid", paidDate: todayInTampa(), updatedAt: sql`(datetime('now'))` }).where(eq(schema.invoices.id, invoiceId));
           }
         }
@@ -5930,10 +6122,10 @@ app.get("/api/public/estimates/:token", async (c) => {
     estimate: {
       identifier: est.identifier,
       status: est.status,
-      subtotal: est.subtotal,
+      subtotal: fromCentsNullable(est.subtotal),
       tax_rate: est.taxRate,
-      tax_amount: est.taxAmount,
-      total: est.total,
+      tax_amount: fromCentsNullable(est.taxAmount),
+      total: fromCentsNullable(est.total),
       valid_until: est.validUntil,
       notes: est.notes,
       approved_at: est.approvedAt,
@@ -5941,7 +6133,7 @@ app.get("/api/public/estimates/:token", async (c) => {
       signed_at: est.signedAt,
       created_at: est.createdAt,
       customer_name: est.customerName,
-      lines: lines.map((l) => ({ id: l.id, description: l.description, quantity: l.quantity, unit_price: l.unitPrice, total: l.total })),
+      lines: lines.map((l) => ({ id: l.id, description: l.description, quantity: l.quantity, unit_price: fromCentsNullable(l.unitPrice), total: fromCentsNullable(l.total) })),
     },
     brand: {
       name: est.brandName || "Noble Tampa",
@@ -6188,16 +6380,19 @@ function customerEstimatePage(
   const brandName = est.brandName || "Noble Tampa";
   const logo = est.brandLogoKey ? `<img src="/api/r2/${esc(est.brandLogoKey)}" alt="${esc(brandName)}">` : "";
 
+  // est/lines are raw DB rows (money in cents) -- htmlMoney formats decimal
+  // dollars, so convert every money value at this boundary, right before
+  // rendering, exactly like the JSON /api/public/estimates/{token} route does.
   const linesHtml = lines.map((l) => `
     <tr>
       <td>${esc(l.description)}</td>
       <td class="r">${l.quantity ?? 0}</td>
-      <td class="r">${htmlMoney(l.unitPrice)}</td>
-      <td class="r">${htmlMoney(l.total)}</td>
+      <td class="r">${htmlMoney(fromCentsNullable(l.unitPrice))}</td>
+      <td class="r">${htmlMoney(fromCentsNullable(l.total))}</td>
     </tr>`).join("");
 
   const taxRow = (est.taxRate || 0) > 0
-    ? `<div class="row"><span>Tax (${est.taxRate}%)</span><span>${htmlMoney(est.taxAmount)}</span></div>`
+    ? `<div class="row"><span>Tax (${est.taxRate}%)</span><span>${htmlMoney(fromCentsNullable(est.taxAmount))}</span></div>`
     : "";
 
   const notesHtml = est.notes && est.notes.trim()
@@ -6258,9 +6453,9 @@ function customerEstimatePage(
       </table>
 
       <div class="totals">
-        <div class="row"><span>Subtotal</span><span>${htmlMoney(est.subtotal)}</span></div>
+        <div class="row"><span>Subtotal</span><span>${htmlMoney(fromCentsNullable(est.subtotal))}</span></div>
         ${taxRow}
-        <div class="row grand"><span>Total</span><span>${htmlMoney(est.total)}</span></div>
+        <div class="row grand"><span>Total</span><span>${htmlMoney(fromCentsNullable(est.total))}</span></div>
       </div>
 
       <div class="financing"><a href="${esc(ACORN_FINANCE_URL)}" target="_blank" rel="noopener noreferrer">Financing available — pre-qualify now</a></div>

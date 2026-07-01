@@ -13,8 +13,19 @@
 // even though they're not wired into any routes until Phase 3. They're
 // inert until used, and this avoids a second schema-diff migration later.
 //
-// Money stays REAL (decimal) to match the original. Move to integer cents
-// only in a deliberate migration, not silently.
+// MONEY IS INTEGER CENTS (migrated from real/decimal-dollars in the cents
+// migration). Every column that represents a dollar amount (subtotal, tax
+// amounts, totals, unit prices, deposits, payments, surcharges, unit costs)
+// is `integer(...)` storing whole cents -- e.g. $110.00 is stored as 11000.
+// This is INTERNAL STORAGE ONLY: the public API/JSON contract still speaks
+// decimal dollars exactly as before. The conversion happens at the boundary
+// in src/server/index.ts via the toCents()/fromCents() helpers defined near
+// the top of that file -- every db.insert/db.update converts incoming
+// dollars -> cents, and every value read out of a query result going into a
+// c.json() response (or buildDocumentPdf()/sendEmail()) converts cents ->
+// dollars first. tax_rate stays `real` (it's a percentage, not money).
+// quantity/measurement columns (sqft, linear ft, counts, in_stock) stay
+// `real` too -- they're not money.
 
 import { sqliteTable, integer, text, real, index, uniqueIndex } from 'drizzle-orm/sqlite-core';
 import { sql } from 'drizzle-orm';
@@ -89,7 +100,9 @@ export const jobs = sqliteTable('jobs', {
   scheduledDate: text('scheduled_date').notNull().default(sql`(date('now'))`),
   scheduledTime: text('scheduled_time').default('09:00'),
   duration: integer('duration').notNull().default(60),
-  price: real('price').notNull().default(0),
+  // INTEGER CENTS (was real dollars) -- see the cents-migration note atop
+  // this file. e.g. $450.00 stored as 45000.
+  price: integer('price').notNull().default(0),
   address: text('address').default(''),
   notes: text('notes').default(''),
   completionNotes: text('completion_notes').default(''),
@@ -159,7 +172,10 @@ export const materials = sqliteTable('materials', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   name: text('name').notNull(),
   unit: text('unit').notNull().default('ea'),
-  unitCost: real('unit_cost').notNull().default(0),
+  // INTEGER CENTS (was real dollars) -- see the cents-migration note atop
+  // this file.
+  unitCost: integer('unit_cost').notNull().default(0),
+  // Quantity, not money -- stays real.
   inStock: real('in_stock').notNull().default(0),
   createdAt: text('created_at').default(nowTimestamp()),
 });
@@ -168,8 +184,11 @@ export const jobMaterials = sqliteTable('job_materials', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   jobId: integer('job_id').notNull().references(() => jobs.id, { onDelete: 'cascade' }),
   materialId: integer('material_id').notNull().references(() => materials.id, { onDelete: 'cascade' }),
+  // Quantity, not money -- stays real.
   quantity: real('quantity').notNull().default(1),
-  unitCost: real('unit_cost').notNull().default(0),
+  // INTEGER CENTS (was real dollars) -- see the cents-migration note atop
+  // this file.
+  unitCost: integer('unit_cost').notNull().default(0),
 }, (table) => [
   index('idx_job_materials_job').on(table.jobId),
 ]);
@@ -180,10 +199,12 @@ export const invoices = sqliteTable('invoices', {
   customerId: integer('customer_id').notNull().references(() => customers.id, { onDelete: 'cascade' }),
   jobId: integer('job_id').references(() => jobs.id, { onDelete: 'set null' }),
   status: text('status').notNull().default('draft'),
-  subtotal: real('subtotal').notNull().default(0),
+  // INTEGER CENTS (was real dollars) -- see the cents-migration note atop
+  // this file. taxRate stays real -- it's a percentage, not money.
+  subtotal: integer('subtotal').notNull().default(0),
   taxRate: real('tax_rate').notNull().default(0),
-  taxAmount: real('tax_amount').notNull().default(0),
-  total: real('total').notNull().default(0),
+  taxAmount: integer('tax_amount').notNull().default(0),
+  total: integer('total').notNull().default(0),
   notes: text('notes').default(''),
   dueDate: text('due_date').default(''),
   paidDate: text('paid_date').default(''),
@@ -201,9 +222,12 @@ export const invoiceLines = sqliteTable('invoice_lines', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   invoiceId: integer('invoice_id').notNull().references(() => invoices.id, { onDelete: 'cascade' }),
   description: text('description').notNull(),
+  // Quantity, not money -- stays real.
   quantity: real('quantity').notNull().default(1),
-  unitPrice: real('unit_price').notNull().default(0),
-  total: real('total').notNull().default(0),
+  // INTEGER CENTS (was real dollars) -- see the cents-migration note atop
+  // this file.
+  unitPrice: integer('unit_price').notNull().default(0),
+  total: integer('total').notNull().default(0),
 }, (table) => [
   index('idx_invoice_lines_invoice').on(table.invoiceId),
 ]);
@@ -241,10 +265,12 @@ export const estimates = sqliteTable('estimates', {
   brandId: integer('brand_id').references(() => brands.id),
   // draft | sent | approved | declined | expired
   status: text('status').notNull().default('draft'),
-  subtotal: real('subtotal').default(0),
+  // INTEGER CENTS (was real dollars) -- see the cents-migration note atop
+  // this file. taxRate stays real -- it's a percentage, not money.
+  subtotal: integer('subtotal').default(0),
   taxRate: real('tax_rate').default(0),
-  taxAmount: real('tax_amount').default(0),
-  total: real('total').default(0),
+  taxAmount: integer('tax_amount').default(0),
+  total: integer('total').default(0),
   validUntil: text('valid_until'),
   notes: text('notes'),
   signatureR2Key: text('signature_r2_key'),
@@ -266,16 +292,21 @@ export const estimates = sqliteTable('estimates', {
   // server-side to never exceed the estimate total. When set (> 0) AND the
   // estimate is converted to a job, a second "Deposit" invoice is minted
   // alongside the normal full-value invoice (see /api/estimates/{id}/convert).
-  depositAmount: real('deposit_amount'),
+  // INTEGER CENTS (was real dollars) -- see the cents-migration note atop
+  // this file.
+  depositAmount: integer('deposit_amount'),
 });
 
 export const estimateLines = sqliteTable('estimate_lines', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   estimateId: integer('estimate_id').notNull().references(() => estimates.id),
   description: text('description').notNull(),
+  // Quantity, not money -- stays real.
   quantity: real('quantity').default(1),
-  unitPrice: real('unit_price').default(0),
-  total: real('total').default(0),
+  // INTEGER CENTS (was real dollars) -- see the cents-migration note atop
+  // this file.
+  unitPrice: integer('unit_price').default(0),
+  total: integer('total').default(0),
 });
 
 // NEW (painting-realism pass): structured estimate builder. A room groups
@@ -309,8 +340,10 @@ export const estimateSurfaces = sqliteTable('estimate_surfaces', {
   prepNotes: text('prep_notes'),
   coats: integer('coats').notNull().default(2),
   paintProduct: text('paint_product'),
-  laborCost: real('labor_cost').notNull().default(0),
-  materialCost: real('material_cost').notNull().default(0),
+  // INTEGER CENTS (was real dollars) -- see the cents-migration note atop
+  // this file.
+  laborCost: integer('labor_cost').notNull().default(0),
+  materialCost: integer('material_cost').notNull().default(0),
   sortOrder: integer('sort_order').notNull().default(0),
   // The estimate_lines row generated FROM this surface (see
   // syncEstimateLinesFromBuilder) -- lets an edit/delete find and update/
@@ -332,7 +365,9 @@ export const changeOrders = sqliteTable('change_orders', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   jobId: integer('job_id').notNull().references(() => jobs.id, { onDelete: 'cascade' }),
   description: text('description').notNull(),
-  amount: real('amount').notNull().default(0),
+  // INTEGER CENTS (was real dollars) -- see the cents-migration note atop
+  // this file.
+  amount: integer('amount').notNull().default(0),
   // pending | approved | rejected
   status: text('status').notNull().default('pending'),
   createdAt: text('created_at').default(nowTimestamp()).notNull(),
@@ -359,8 +394,10 @@ export const payments = sqliteTable('payments', {
   invoiceId: integer('invoice_id').notNull().references(() => invoices.id),
   // cash | check | card | financing
   method: text('method').notNull(),
-  amount: real('amount').notNull().default(0),
-  surchargeAmount: real('surcharge_amount').default(0),
+  // INTEGER CENTS (was real dollars) -- see the cents-migration note atop
+  // this file.
+  amount: integer('amount').notNull().default(0),
+  surchargeAmount: integer('surcharge_amount').default(0),
   processorRef: text('processor_ref'), // Stripe payment intent / charge id
   // pending | paid | failed | refunded
   status: text('status').notNull().default('pending'),
@@ -399,7 +436,9 @@ export const products = sqliteTable('products', {
   sku: text('sku'),
   // Free text, not a rigid enum -- e.g. "door style" | "hardware" | "countertop".
   category: text('category'),
-  unitCost: real('unit_cost').notNull().default(0),
+  // INTEGER CENTS (was real dollars) -- see the cents-migration note atop
+  // this file.
+  unitCost: integer('unit_cost').notNull().default(0),
   unit: text('unit').notNull().default('ea'),
   active: integer('active').notNull().default(1),
 }, (table) => [

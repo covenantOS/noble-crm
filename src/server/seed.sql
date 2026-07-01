@@ -33,17 +33,20 @@ INSERT OR IGNORE INTO _meta (key, value) VALUES ('estimate_prefix', 'EST');
 -- (name/unit/unit_cost/in_stock). A richer paint-spec model (brand/color/
 -- sheen) is a later chunk -- no extra columns here. Costs are typical retail
 -- ballparks; the office can adjust in-app.
+-- unit_cost is INTEGER CENTS (see the cents-migration note in
+-- src/db/schema.ts) -- e.g. $38.00 is stored as 3800. in_stock is a
+-- quantity, not money, and stays as-is.
 INSERT OR IGNORE INTO materials (id, name, unit, unit_cost, in_stock)
 VALUES
-  (1,  'Interior Paint',   'gal',   38, 40),
-  (2,  'Exterior Paint',   'gal',   45, 40),
-  (3,  'Primer',           'gal',   28, 30),
-  (4,  'Ceiling Paint',    'gal',   32, 20),
-  (5,  'Painter''s Tape',  'roll',   6, 60),
-  (6,  'Drop Cloth',       'ea',    14, 25),
-  (7,  'Caulk',            'tube',   5, 80),
-  (8,  'Spackle',          'tub',   12, 25),
-  (9,  'Sandpaper',        'pack',   9, 40),
-  (10, 'Roller Cover',     'ea',     7, 100),
-  (11, 'Brush',            'ea',    11, 60),
-  (12, 'Plastic Sheeting', 'roll',  18, 30);
+  (1,  'Interior Paint',   'gal',   3800, 40),
+  (2,  'Exterior Paint',   'gal',   4500, 40),
+  (3,  'Primer',           'gal',   2800, 30),
+  (4,  'Ceiling Paint',    'gal',   3200, 20),
+  (5,  'Painter''s Tape',  'roll',   600, 60),
+  (6,  'Drop Cloth',       'ea',    1400, 25),
+  (7,  'Caulk',            'tube',   500, 80),
+  (8,  'Spackle',          'tub',   1200, 25),
+  (9,  'Sandpaper',        'pack',   900, 40),
+  (10, 'Roller Cover',     'ea',     700, 100),
+  (11, 'Brush',            'ea',    1100, 60),
+  (12, 'Plastic Sheeting', 'roll',  1800, 30);

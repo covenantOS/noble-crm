@@ -18,6 +18,9 @@ VALUES
 -- ── Painting service catalog (brand_id 1: Westchase Painting) ────────
 -- New ids (7+) so these coexist with the original generic seed.sql rows
 -- (ids 1-6) in any DB that's already been seeded with those.
+-- NOTE: service_types.default_price is DELIBERATELY NOT part of the cents
+-- migration (see src/db/schema.ts's cents-migration note) -- it stays real
+-- decimal dollars, so these literals are unchanged from before.
 
 INSERT OR IGNORE INTO service_types (id, name, description, default_duration, default_price, color, brand_id)
 VALUES
