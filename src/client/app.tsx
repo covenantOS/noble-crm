@@ -18,6 +18,7 @@ import { InvoiceDetail } from "./components/invoice-detail";
 import { EstimateList } from "./components/estimate-list";
 import { EstimateDetail } from "./components/estimate-detail";
 import { BrandList } from "./components/brand-list";
+import { ServiceAgreementList } from "./components/service-agreement-list";
 import { ErrorBanner } from "./components/error-banner";
 import { Login } from "./components/login";
 
@@ -84,6 +85,7 @@ function AuthenticatedApp({ isAgent, session }: { isAgent: boolean; session: Non
       case "invoices": return <InvoiceList />;
       case "estimates": return <EstimateList />;
       case "brands": return <BrandList />;
+      case "service-agreements": return <ServiceAgreementList />;
       default: return <Dashboard />;
     }
   };

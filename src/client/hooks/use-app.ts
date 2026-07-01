@@ -5,6 +5,7 @@ import type {
   Job, Customer, Technician, ServiceType, Material, Invoice, Stats, PaginatedState,
   CustomerLookup, TechnicianLookup, Priority, Brand, Estimate,
   Attachment, AttachmentEntityType, AttachmentKind, Payment, PaymentMethod,
+  ServiceAgreement,
 } from "../types";
 import type { AppContextValue, CurrentUser } from "../context";
 
@@ -34,6 +35,9 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
 
   // Brands
   const [brands, setBrands] = useState<Brand[]>([]);
+
+  // Service Agreements
+  const [serviceAgreements, setServiceAgreements] = useState<ServiceAgreement[]>([]);
 
   // Invoices
   const [invoices, setInvoices] = useState<Invoice[]>([]);
@@ -110,6 +114,11 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     setBrands(data.brands);
   }, []);
 
+  const fetchServiceAgreements = useCallback(async () => {
+    const data = await api<{ service_agreements: ServiceAgreement[] }>("GET", "/api/service-agreements");
+    setServiceAgreements(data.service_agreements);
+  }, []);
+
   const fetchInvoices = useCallback(async (pag: PaginatedState, status: string) => {
     const params = new URLSearchParams({ page: String(pag.page), limit: String(pag.limit) });
     if (status) params.set("status", status);
@@ -155,7 +164,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
       const isTechnician = currentUser?.role === "technician";
       const tasks = [fetchStats(), fetchJobs(jobsPag, "", ""), fetchServiceTypes(), fetchMaterials(), fetchSchedule(scheduleStart, scheduleEnd), fetchBrands()];
       if (!isTechnician) {
-        tasks.push(fetchCustomers(customersPag, ""), fetchTechnicians(), fetchInvoices(invoicesPag, ""), fetchEstimates(estimatesPag, "", ""), fetchLookups());
+        tasks.push(fetchCustomers(customersPag, ""), fetchTechnicians(), fetchInvoices(invoicesPag, ""), fetchEstimates(estimatesPag, "", ""), fetchLookups(), fetchServiceAgreements());
       }
       const results = await Promise.allSettled(tasks);
       const firstFailure = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
@@ -418,6 +427,23 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     await fetchBrands();
   }, [fetchBrands]);
 
+  // ── Service Agreements CRUD ──
+
+  const addServiceAgreement = useCallback(async (data: { customer_id: number; brand_id?: number | null; service_type_id?: number | null; interval: string; next_run_date: string; active?: number }) => {
+    await api("POST", "/api/service-agreements", data);
+    await fetchServiceAgreements();
+  }, [fetchServiceAgreements]);
+
+  const updateServiceAgreement = useCallback(async (id: number, data: Partial<ServiceAgreement>) => {
+    await api("PUT", `/api/service-agreements/${id}`, data);
+    await fetchServiceAgreements();
+  }, [fetchServiceAgreements]);
+
+  const deleteServiceAgreement = useCallback(async (id: number) => {
+    await api("DELETE", `/api/service-agreements/${id}`);
+    await fetchServiceAgreements();
+  }, [fetchServiceAgreements]);
+
   // ── Invoices CRUD ──
 
   const setInvoicesPage = useCallback((page: number) => setInvoicesPag((p) => ({ ...p, page })), []);
@@ -617,6 +643,7 @@ export function useAppState(isAgent: boolean, navigate: (to: string) => void, cu
     sendEstimate, approveEstimate, declineEstimate, addEstimateLine, deleteEstimateLine, convertEstimate,
     scheduleJobs, scheduleStart, scheduleEnd, setScheduleRange,
     customerLookup, technicianLookup,
+    serviceAgreements, addServiceAgreement, updateServiceAgreement, deleteServiceAgreement,
     loading, error, setError,
   };
 }

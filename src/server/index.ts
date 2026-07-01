@@ -3,7 +3,7 @@ import type { Context } from "hono";
 import { and, asc, desc, eq, like, or, sql, inArray } from "drizzle-orm";
 import { getDb, schema } from "../db/index.js";
 import { createAuth } from "../lib/auth.js";
-import type { AppBindings } from "../lib/types.js";
+import type { AppBindings, Env, ReminderMessage } from "../lib/types.js";
 
 const app = new OpenAPIHono<AppBindings>();
 
@@ -60,6 +60,14 @@ app.use("/api/*", async (c, next) => {
   // Estimates are a sales/estimating task (admin, office, estimator) --
   // technicians get no access at all, matching the invoices block above.
   if (path.startsWith("/api/estimates") || path.startsWith("/api/estimate-lines")) {
+    return c.json({ error: "forbidden" }, 403);
+  }
+  // Service agreements (recurring-job templates) are an office/admin/
+  // estimator scheduling task, not field work -- same full block as
+  // estimates/invoices above rather than a per-route check, since there's
+  // no per-job ownership angle here (these aren't jobs, just templates that
+  // generate them).
+  if (path.startsWith("/api/service-agreements")) {
     return c.json({ error: "forbidden" }, 403);
   }
   if (isMutating && (path.startsWith("/api/materials") || path.startsWith("/api/service-types"))) {
@@ -297,6 +305,19 @@ const JobSchema = z.object({
   updated_at: z.string(),
 }).openapi("Job");
 
+const ServiceAgreementSchema = z.object({
+  id: z.number().int(),
+  customer_id: z.number().int(),
+  brand_id: z.number().int().nullable(),
+  service_type_id: z.number().int().nullable(),
+  interval: z.enum(["weekly", "monthly", "quarterly", "annual"]),
+  next_run_date: z.string().nullable(),
+  active: z.number().int(),
+  customer_name: z.string().nullable().optional(),
+  brand_name: z.string().nullable().optional(),
+  service_type_name: z.string().nullable().optional(),
+}).openapi("ServiceAgreement");
+
 const IdParam = z.object({ id: z.string().openapi({ description: "Resource ID" }) });
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -377,6 +398,24 @@ function jobJoinedSelect(db: ReturnType<typeof getDb>) {
     .leftJoin(schema.technicians, eq(schema.jobs.technicianId, schema.technicians.id))
     .leftJoin(schema.serviceTypes, eq(schema.jobs.serviceTypeId, schema.serviceTypes.id))
     .leftJoin(schema.brands, eq(schema.jobs.brandId, schema.brands.id));
+}
+
+// Enqueues a reminder message for a job onto the REMINDERS queue. Called
+// from createJob (every new job) and updateJob (whenever scheduled_date or
+// technician_id changes -- a reschedule/reassignment is exactly the kind of
+// change a reminder should reflect). Deliberately simple: no "24 hours
+// before" delayed-delivery scheduling here (Queues' delivery_delay is a
+// fixed producer-level setting, not a flexible per-message schedule, so
+// building real "N hours before scheduled_date" logic is out of scope for
+// this pass -- see the queue() consumer below for how this is recorded).
+// Failures here are swallowed (logged, not thrown) so a queue hiccup never
+// blocks the actual job create/update from succeeding.
+async function enqueueJobReminder(env: AppBindings["Bindings"], jobId: number, scheduledDate: string) {
+  try {
+    await env.REMINDERS.send({ type: "job_reminder", job_id: jobId, scheduled_date: scheduledDate });
+  } catch (err) {
+    console.error(`Failed to enqueue reminder for job ${jobId}:`, err);
+  }
 }
 
 // ── Stats ──────────────────────────────────────────────────────────
@@ -633,6 +672,9 @@ app.openapi(createJob, async (c) => {
   });
 
   const job = await jobJoinedSelect(db).where(eq(schema.jobs.identifier, identifier)).get();
+  // Every new job gets a reminder queued -- see enqueueJobReminder's comment
+  // for why this doesn't try to be "24 hours before".
+  await enqueueJobReminder(c.env, job!.id, job!.scheduled_date);
   return c.json(job!, 201);
 });
 
@@ -710,6 +752,13 @@ app.openapi(updateJob, async (c) => {
   if (Object.keys(updates).length > 0) {
     updates.updatedAt = sql`(datetime('now'))`;
     await db.update(schema.jobs).set(updates).where(eq(schema.jobs.id, idNum));
+  }
+  // Reschedule (scheduled_date) or reassignment (technician_id) both change
+  // who/when a reminder is relevant for, so re-enqueue on either -- not on
+  // every field (e.g. a notes edit shouldn't spam a new reminder).
+  if (data.scheduled_date !== undefined || data.technician_id !== undefined) {
+    const scheduledDate = data.scheduled_date ?? existing.scheduledDate;
+    await enqueueJobReminder(c.env, idNum, scheduledDate);
   }
   return c.json({ ok: true }, 200);
 });
@@ -3071,4 +3120,347 @@ app.openapi(convertEstimate, async (c) => {
   return c.json({ ok: true, job_id: jobId, invoice_id: invoiceId }, 201);
 });
 
-export default app;
+// ── Service Agreements (recurring-job templates) ──────────────────
+// Full access for admin/office/estimator; technicians are 403'd entirely by
+// the blanket role-gate middleware above (path.startsWith("/api/service-
+// agreements")), same pattern as estimates/invoices -- no per-route check
+// needed here.
+
+const SERVICE_AGREEMENT_INTERVALS = ["weekly", "monthly", "quarterly", "annual"] as const;
+type ServiceAgreementInterval = (typeof SERVICE_AGREEMENT_INTERVALS)[number];
+
+function serviceAgreementJoinedSelect(db: ReturnType<typeof getDb>) {
+  return db
+    .select({
+      id: schema.serviceAgreements.id,
+      customer_id: schema.serviceAgreements.customerId,
+      brand_id: schema.serviceAgreements.brandId,
+      service_type_id: schema.serviceAgreements.serviceTypeId,
+      // The column is plain `text` in schema.ts, so cast the narrowed enum
+      // shape here (application-level invariant: only createServiceAgreement/
+      // updateServiceAgreement ever write this column, and both validate
+      // against SERVICE_AGREEMENT_INTERVALS via the Zod enum below).
+      interval: sql<ServiceAgreementInterval>`${schema.serviceAgreements.interval}`,
+      next_run_date: schema.serviceAgreements.nextRunDate,
+      active: schema.serviceAgreements.active,
+      customer_name: schema.customers.name,
+      brand_name: schema.brands.name,
+      service_type_name: schema.serviceTypes.name,
+    })
+    .from(schema.serviceAgreements)
+    .leftJoin(schema.customers, eq(schema.serviceAgreements.customerId, schema.customers.id))
+    .leftJoin(schema.brands, eq(schema.serviceAgreements.brandId, schema.brands.id))
+    .leftJoin(schema.serviceTypes, eq(schema.serviceAgreements.serviceTypeId, schema.serviceTypes.id));
+}
+
+const listServiceAgreements = createRoute({
+  method: "get",
+  path: "/api/service-agreements",
+  responses: {
+    200: {
+      description: "All service agreements",
+      content: { "application/json": { schema: z.object({ service_agreements: z.array(ServiceAgreementSchema) }) } },
+    },
+  },
+});
+
+app.openapi(listServiceAgreements, async (c) => {
+  const db = getDb(c.env);
+  const agreements = await serviceAgreementJoinedSelect(db).orderBy(asc(schema.serviceAgreements.nextRunDate)).all();
+  return c.json({ service_agreements: agreements }, 200);
+});
+
+const createServiceAgreement = createRoute({
+  method: "post",
+  path: "/api/service-agreements",
+  request: {
+    body: {
+      content: { "application/json": { schema: z.object({
+        customer_id: z.number().int(),
+        brand_id: z.number().int().nullable().optional(),
+        service_type_id: z.number().int().nullable().optional(),
+        interval: z.enum(SERVICE_AGREEMENT_INTERVALS),
+        next_run_date: z.string(),
+        active: z.number().int().optional(),
+      }) } },
+    },
+  },
+  responses: {
+    201: { description: "Created", content: { "application/json": { schema: ServiceAgreementSchema } } },
+  },
+});
+
+app.openapi(createServiceAgreement, async (c) => {
+  const db = getDb(c.env);
+  const data = c.req.valid("json");
+  await db.insert(schema.serviceAgreements).values({
+    customerId: data.customer_id,
+    brandId: data.brand_id ?? null,
+    serviceTypeId: data.service_type_id ?? null,
+    interval: data.interval,
+    nextRunDate: data.next_run_date,
+    // Fixed at creation from the starting date's day-of-month -- see
+    // advanceByInterval's comment for why this must never be re-derived
+    // from a later (possibly already-clamped) next_run_date.
+    anchorDay: parseInt(data.next_run_date.split("-")[2], 10),
+    active: data.active ?? 1,
+  });
+  const row = await db.select().from(schema.serviceAgreements).orderBy(desc(schema.serviceAgreements.id)).limit(1).get();
+  const out = await serviceAgreementJoinedSelect(db).where(eq(schema.serviceAgreements.id, row!.id)).get();
+  return c.json(out!, 201);
+});
+
+const updateServiceAgreement = createRoute({
+  method: "put",
+  path: "/api/service-agreements/{id}",
+  request: {
+    params: IdParam,
+    body: {
+      content: { "application/json": { schema: z.object({
+        customer_id: z.number().int().optional(),
+        brand_id: z.number().int().nullable().optional(),
+        service_type_id: z.number().int().nullable().optional(),
+        interval: z.enum(SERVICE_AGREEMENT_INTERVALS).optional(),
+        next_run_date: z.string().optional(),
+        active: z.number().int().optional(),
+      }) } },
+    },
+  },
+  responses: {
+    200: { description: "Updated", content: { "application/json": { schema: OkSchema } } },
+    404: { description: "Not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(updateServiceAgreement, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  const idNum = toId(id);
+  const data = c.req.valid("json");
+  const existing = await db.select({ id: schema.serviceAgreements.id }).from(schema.serviceAgreements).where(eq(schema.serviceAgreements.id, idNum)).get();
+  if (!existing) return c.json({ error: "Service agreement not found" }, 404);
+
+  const updates: Record<string, unknown> = {};
+  if (data.customer_id !== undefined) updates.customerId = data.customer_id;
+  if (data.brand_id !== undefined) updates.brandId = data.brand_id;
+  if (data.service_type_id !== undefined) updates.serviceTypeId = data.service_type_id;
+  if (data.interval !== undefined) updates.interval = data.interval;
+  if (data.next_run_date !== undefined) {
+    updates.nextRunDate = data.next_run_date;
+    // An explicit next_run_date change is a new starting point -- re-anchor
+    // to its day-of-month rather than leaving the old anchor in place.
+    updates.anchorDay = parseInt(data.next_run_date.split("-")[2], 10);
+  }
+  if (data.active !== undefined) updates.active = data.active;
+  if (Object.keys(updates).length > 0) {
+    await db.update(schema.serviceAgreements).set(updates).where(eq(schema.serviceAgreements.id, idNum));
+  }
+  return c.json({ ok: true }, 200);
+});
+
+const deleteServiceAgreement = createRoute({
+  method: "delete",
+  path: "/api/service-agreements/{id}",
+  request: { params: IdParam },
+  responses: {
+    200: { description: "Deleted", content: { "application/json": { schema: OkSchema } } },
+  },
+});
+
+app.openapi(deleteServiceAgreement, async (c) => {
+  const db = getDb(c.env);
+  const { id } = c.req.valid("param");
+  await db.delete(schema.serviceAgreements).where(eq(schema.serviceAgreements.id, toId(id)));
+  return c.json({ ok: true }, 200);
+});
+
+// ── Recurring-job generation (Cron Trigger + manual test route) ───────
+// Advances a "YYYY-MM-DD" date string by exactly one interval period.
+// weekly is a fixed +7 days, but monthly/quarterly/annual need real
+// calendar-month/year arithmetic (not a fixed day count) -- e.g. Jan 31 +
+// 1 month must land on Feb 28 (or Feb 29 in a leap year), not overflow into
+// March via a naive "set date to 31" on a 28-day month. JS Date's
+// setMonth/setFullYear already normalize month-end overflow *forward*
+// (e.g. Jan 31 -> setMonth(1) rolls to Mar 3), so this clamps the day to
+// the target month's actual last day itself rather than relying on that
+// rollover behavior.
+// anchorDay is the agreement's fixed target day-of-month (e.g. 31 for "runs
+// on the 31st"), independent of dateStr's own day. Without this, deriving
+// the target day from dateStr would compound: a 31st-of-the-month agreement
+// clamped to Feb 28 would then advance from 28, permanently downgrading to
+// "runs on the 28th" in every subsequent month -- even 31-day ones. Passing
+// the original anchor lets every advance re-clamp against ONLY the target
+// month's own length, so day 31 comes back on the very next 31-day month.
+function advanceByInterval(dateStr: string, interval: (typeof SERVICE_AGREEMENT_INTERVALS)[number], anchorDay: number): string {
+  const [y, m] = dateStr.split("-").map((n) => parseInt(n, 10));
+  if (interval === "weekly") {
+    const [, , d] = dateStr.split("-").map((n) => parseInt(n, 10));
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() + 7);
+    return dt.toISOString().split("T")[0];
+  }
+  const monthsToAdd = interval === "monthly" ? 1 : interval === "quarterly" ? 3 : 12; // annual
+  // Compute target year/month first (0-indexed month math), then clamp the
+  // ANCHOR day-of-month to whatever the target month actually has (e.g. 31
+  // -> 28/29 for February) instead of letting an out-of-range day overflow
+  // into the following month.
+  const totalMonths = (m - 1) + monthsToAdd;
+  const targetYear = y + Math.floor(totalMonths / 12);
+  const targetMonth = totalMonths % 12; // 0-indexed
+  const daysInTargetMonth = new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate();
+  const targetDay = Math.min(anchorDay, daysInTargetMonth);
+  const dt = new Date(Date.UTC(targetYear, targetMonth, targetDay));
+  return dt.toISOString().split("T")[0];
+}
+
+// Shared logic used by BOTH the scheduled() cron handler and the manual
+// POST /api/service-agreements/run-due-now route below, so the two can never
+// drift out of sync and the manual route is a faithful stand-in for testing
+// what the cron trigger does (Cron Triggers don't fire in local `wrangler
+// dev` in a way that's easy to test interactively).
+//
+// For every active agreement whose next_run_date is today (server-computed
+// via SQL date('now'), never client-passed) or earlier: creates a new job
+// dated at the agreement's due next_run_date (status "scheduled", price/
+// duration defaulted from the service type exactly like createJob does),
+// then advances next_run_date by one interval period. Returns a summary for
+// the manual route's response / cron log line.
+async function processDueServiceAgreements(env: AppBindings["Bindings"]): Promise<{ processed: number; created_job_ids: number[] }> {
+  const db = getDb(env);
+  const due = await db
+    .select()
+    .from(schema.serviceAgreements)
+    .where(and(eq(schema.serviceAgreements.active, 1), sql`${schema.serviceAgreements.nextRunDate} <= (date('now'))`))
+    .all();
+
+  const createdJobIds: number[] = [];
+  for (const agreement of due) {
+    if (!agreement.nextRunDate) continue; // no due date set -- nothing to schedule against
+
+    // Default price/duration from the service type, same as createJob.
+    let duration = 60;
+    let price = 0;
+    if (agreement.serviceTypeId) {
+      const st = await db
+        .select({ default_duration: schema.serviceTypes.defaultDuration, default_price: schema.serviceTypes.defaultPrice })
+        .from(schema.serviceTypes)
+        .where(eq(schema.serviceTypes.id, agreement.serviceTypeId))
+        .get();
+      if (st) {
+        duration = st.default_duration;
+        price = st.default_price;
+      }
+    }
+
+    // Address defaults from the customer, same fallback createJob uses.
+    let address = "";
+    const cust = await db
+      .select({ address: schema.customers.address, city: schema.customers.city, state: schema.customers.state, zip: schema.customers.zip })
+      .from(schema.customers)
+      .where(eq(schema.customers.id, agreement.customerId))
+      .get();
+    if (cust) {
+      address = [cust.address, cust.city, cust.state, cust.zip].filter(Boolean).join(", ");
+    }
+
+    const identifier = await nextIdentifier(db);
+    await db.insert(schema.jobs).values({
+      identifier,
+      customerId: agreement.customerId,
+      serviceTypeId: agreement.serviceTypeId ?? null,
+      status: "scheduled",
+      priority: "normal",
+      scheduledDate: agreement.nextRunDate,
+      scheduledTime: "09:00",
+      duration,
+      price,
+      address,
+      notes: "Auto-generated from recurring service agreement.",
+      brandId: agreement.brandId ?? null,
+    });
+    const job = await db.select({ id: schema.jobs.id }).from(schema.jobs).where(eq(schema.jobs.identifier, identifier)).get();
+    createdJobIds.push(job!.id);
+    await enqueueJobReminder(env, job!.id, agreement.nextRunDate);
+
+    // Fall back to the current date's own day for pre-existing rows created
+    // before anchorDay existed (backward compatible with any such rows --
+    // they'll re-derive an anchor from wherever they currently are, which
+    // is the best available information at that point).
+    const anchorDay = agreement.anchorDay ?? parseInt(agreement.nextRunDate.split("-")[2], 10);
+    const nextRun = advanceByInterval(agreement.nextRunDate, agreement.interval as (typeof SERVICE_AGREEMENT_INTERVALS)[number], anchorDay);
+    await db.update(schema.serviceAgreements).set({ nextRunDate: nextRun }).where(eq(schema.serviceAgreements.id, agreement.id));
+  }
+
+  return { processed: due.length, created_job_ids: createdJobIds };
+}
+
+// Admin-only manual trigger for the exact same due-agreement processing the
+// scheduled() cron handler runs -- exists purely so this can be exercised
+// on demand (curl/Postman/browser devtools) since Cron Triggers don't fire
+// interactively in local `wrangler dev`.
+const runDueServiceAgreementsNow = createRoute({
+  method: "post",
+  path: "/api/service-agreements/run-due-now",
+  responses: {
+    200: {
+      description: "Processed due service agreements",
+      content: { "application/json": { schema: z.object({ ok: z.boolean(), processed: z.number().int(), created_job_ids: z.array(z.number().int()) }) } },
+    },
+    403: { description: "Forbidden", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(runDueServiceAgreementsNow, async (c) => {
+  // Deliberately admin-only (stricter than the rest of this resource
+  // family, which is admin/office/estimator) -- this mutates data
+  // (creates jobs, advances agreements) on demand rather than through the
+  // normal UI flow, so it's scoped to the most trusted role.
+  if (c.get("user").role !== "admin") {
+    return c.json({ error: "forbidden" }, 403);
+  }
+  const result = await processDueServiceAgreements(c.env);
+  return c.json({ ok: true, ...result }, 200);
+});
+
+export default {
+  fetch: app.fetch,
+
+  // Daily 6am UTC (see wrangler.jsonc's triggers.crons) -- generates jobs
+  // for any active service_agreements whose next_run_date has arrived and
+  // advances each one to its next due date. Shares processDueServiceAgreements
+  // with the manual POST /api/service-agreements/run-due-now route above so
+  // both paths run identical logic.
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(
+      processDueServiceAgreements(env).then((result) => {
+        console.log(`[scheduled] processed ${result.processed} due service agreement(s), created jobs: ${result.created_job_ids.join(", ") || "none"}`);
+      })
+    );
+  },
+
+  // Consumes reminder messages enqueued by createJob/updateJob (see
+  // enqueueJobReminder above) off the "westchase-reminders" queue. There is
+  // no real SMS/email provider configured (Twilio/SendGrid/etc. -- none of
+  // that is set up, and wiring one up is out of scope for this pass), so
+  // this deliberately does NOT pretend to send a notification. Instead it
+  // records the reminder intent as a job_notes row so it's durable and
+  // inspectable from the job detail view -- a clear, visible placeholder for
+  // real Phase 5/6 notification-provider integration, not a fake "sent"
+  // status.
+  async queue(batch: MessageBatch<ReminderMessage>, env: Env) {
+    const db = getDb(env);
+    for (const message of batch.messages) {
+      try {
+        const { job_id, scheduled_date } = message.body;
+        await db.insert(schema.jobNotes).values({
+          jobId: job_id,
+          content: `Reminder queued for ${scheduled_date} (no notification provider configured yet).`,
+        });
+        message.ack();
+      } catch (err) {
+        console.error(`Failed to process reminder message for job ${message.body.job_id}:`, err);
+        message.retry();
+      }
+    }
+  },
+} satisfies ExportedHandler<Env, ReminderMessage>;

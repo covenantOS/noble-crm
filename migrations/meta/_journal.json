@@ -15,6 +15,13 @@
       "when": 1782862552997,
       "tag": "0001_tranquil_bromley",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1782907470617,
+      "tag": "0002_majestic_dracula",
+      "breakpoints": true
     }
   ]
 }

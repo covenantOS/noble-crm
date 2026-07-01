@@ -1,5 +1,5 @@
 import { useApp } from "../context";
-import { CalendarClock, LayoutDashboard, Briefcase, Users, Wrench, Settings, CalendarDays, FileText, ClipboardList, Package, LogOut, Palette } from "lucide-preact";
+import { CalendarClock, LayoutDashboard, Briefcase, Users, Wrench, Settings, CalendarDays, FileText, ClipboardList, Package, LogOut, Palette, Repeat } from "lucide-preact";
 import type { View } from "../types";
 
 const navItems: { view: View; path: string; label: string; icon: typeof LayoutDashboard }[] = [
@@ -10,6 +10,7 @@ const navItems: { view: View; path: string; label: string; icon: typeof LayoutDa
   { view: "technicians", path: "/technicians", label: "Technicians", icon: Wrench },
   { view: "estimates", path: "/estimates", label: "Estimates", icon: ClipboardList },
   { view: "invoices", path: "/invoices", label: "Invoices", icon: FileText },
+  { view: "service-agreements", path: "/service-agreements", label: "Recurring", icon: Repeat },
   { view: "materials", path: "/materials", label: "Materials", icon: Package },
   { view: "services", path: "/services", label: "Service Types", icon: Settings },
   { view: "brands", path: "/brands", label: "Brands", icon: Palette },
@@ -18,7 +19,7 @@ const navItems: { view: View; path: string; label: string; icon: typeof LayoutDa
 // Resource families that the backend forbids technicians from (see the
 // blanket role-gate middleware in src/server/index.ts). Hidden from the nav
 // so a technician's UI never dead-ends into a 403.
-const TECHNICIAN_HIDDEN_VIEWS: View[] = ["customers", "technicians", "invoices", "estimates", "materials", "services", "brands"];
+const TECHNICIAN_HIDDEN_VIEWS: View[] = ["customers", "technicians", "invoices", "estimates", "materials", "services", "brands", "service-agreements"];
 
 // Brand identity/colors/logo management is an office/admin task, not a
 // sales task -- mirrors requireAdminOrOfficeOrForbid on the brand mutation

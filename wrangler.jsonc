@@ -30,8 +30,24 @@
   // src/client/hooks/use-router.ts) handle the path instead of a raw 404.
   "assets": { "directory": "./dist", "binding": "ASSETS", "not_found_handling": "single-page-application" },
 
-  // Phase 4: uncomment for recurring-job generation + reminders (daily 6am UTC).
-  // "triggers": { "crons": ["0 6 * * *"] },
+  // Phase 4: recurring-job generation (scheduled() handler processes due
+  // service_agreements) + reminders (queued on job create/reschedule, see
+  // the REMINDERS producer binding below). Daily 6am UTC.
+  "triggers": { "crons": ["0 6 * * *"] },
+
+  // Reminder queue: createJob/updateJob (src/server/index.ts) enqueue a
+  // { type: "job_reminder", job_id, scheduled_date } message on every
+  // create/reschedule via env.REMINDERS.send(...); the queue() handler
+  // (same file's default export) consumes them. Low-volume, so a small
+  // batch size is plenty -- this isn't trying to be a high-throughput queue.
+  "queues": {
+    "producers": [
+      { "binding": "REMINDERS", "queue": "westchase-reminders" }
+    ],
+    "consumers": [
+      { "queue": "westchase-reminders", "max_batch_size": 10 }
+    ]
+  },
 
   "vars": {
     "BETTER_AUTH_URL": "http://localhost:8787"

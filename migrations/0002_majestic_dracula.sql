@@ -1,0 +1,1 @@
+ALTER TABLE `service_agreements` ADD `anchor_day` integer;

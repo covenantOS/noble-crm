@@ -254,6 +254,13 @@ export const serviceAgreements = sqliteTable('service_agreements', {
   // weekly | monthly | quarterly | annual
   interval: text('interval').notNull(),
   nextRunDate: text('next_run_date'),
+  // Target day-of-month (1-31) this agreement recurs on, fixed at creation
+  // from the initial next_run_date. Kept separate from next_run_date so a
+  // monthly/quarterly/annual advance that has to clamp for a short month
+  // (e.g. day 31 -> Feb 28) doesn't permanently lose the original day --
+  // each advance re-clamps THIS anchor against whatever the target month
+  // actually has, rather than compounding drift off the previous clamp.
+  anchorDay: integer('anchor_day'),
   active: integer('active').notNull().default(1),
 });
 

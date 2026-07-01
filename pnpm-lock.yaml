@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@daypilot/daypilot-lite-javascript':
+        specifier: ^5.9.0
+        version: 5.9.0
       '@hono/zod-openapi':
         specifier: ^0.18.0
         version: 0.18.4(hono@4.12.10)(zod@3.25.76)
@@ -286,6 +289,9 @@ packages:
   '@cspotcode/source-map-support@0.8.1':
     resolution: {integrity: sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw==}
     engines: {node: '>=12'}
+
+  '@daypilot/daypilot-lite-javascript@5.9.0':
+    resolution: {integrity: sha512-1DNZkteBwzzx2cvVa21hEb+/qT2sLYAmR0Fyt3Hx7ZupMt/gUkiqqHtu9EOZlkA8FBKhpoghugDmIbxWo3ovDA==}
 
   '@drizzle-team/brocli@0.10.2':
     resolution: {integrity: sha512-z33Il7l5dKjUgGULTqBsQBQwckHh5AbIuxhdsIxDDiZAzBOrZO6q9ogcWC65kU382AfynTfgNumVcNIjuIua6w==}
@@ -2304,6 +2310,8 @@ snapshots:
   '@cspotcode/source-map-support@0.8.1':
     dependencies:
       '@jridgewell/trace-mapping': 0.3.9
+
+  '@daypilot/daypilot-lite-javascript@5.9.0': {}
 
   '@drizzle-team/brocli@0.10.2': {}
 

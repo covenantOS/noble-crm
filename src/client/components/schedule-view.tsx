@@ -1,5 +1,7 @@
+import { useState } from "preact/hooks";
 import { useApp } from "../context";
-import { ChevronLeft, ChevronRight } from "lucide-preact";
+import { ChevronLeft, ChevronRight, List, LayoutGrid } from "lucide-preact";
+import { DispatchBoard } from "./dispatch-board";
 
 function getDaysInRange(start: string, end: string): string[] {
   const days: string[] = [];
@@ -15,7 +17,15 @@ function getDaysInRange(start: string, end: string): string[] {
 const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 export function ScheduleView() {
-  const { scheduleJobs, scheduleStart, scheduleEnd, setScheduleRange, navigate, technicianLookup } = useApp();
+  const { scheduleJobs, scheduleStart, scheduleEnd, setScheduleRange, navigate, technicianLookup, currentUser } = useApp();
+  // Dispatch board is an office/admin/estimator tool for assigning
+  // technicians -- a technician dragging jobs between OTHER technicians'
+  // columns makes no sense given they can't even reassign their own jobs
+  // (see job-detail.tsx's canManageJob / the "Assign Technician" section
+  // being hidden for that role). List view stays the default/fallback for
+  // everyone, including technicians, who never see the Board tab at all.
+  const isTechnician = currentUser?.role === "technician";
+  const [tab, setTab] = useState<"list" | "board">("list");
 
   const days = getDaysInRange(scheduleStart, scheduleEnd);
   const todayStr = new Date().toISOString().split("T")[0];
@@ -37,22 +47,48 @@ export function ScheduleView() {
     setScheduleRange(monday.toISOString().split("T")[0], sunday.toISOString().split("T")[0]);
   };
 
+  // Switching back to List re-syncs the schedule range back to the current
+  // week -- while Board is active it narrows scheduleStart/scheduleEnd to a
+  // single day (see dispatch-board.tsx), which would otherwise leave List
+  // showing just that one day's data after a tab switch.
+  const switchToList = () => {
+    setTab("list");
+    goToday();
+  };
+
   return (
     <div class="page">
       <div class="page-header">
         <h1>Schedule</h1>
         <div class="page-header-right">
-          <button class="btn" onClick={goToday}>Today</button>
-          <button class="btn btn-icon" onClick={() => shiftWeek(-1)}><ChevronLeft size={16} /></button>
-          <span style={{ fontSize: 14, fontWeight: 600, minWidth: 200, textAlign: "center" }}>
-            {new Date(scheduleStart + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" })}
-            {" — "}
-            {new Date(scheduleEnd + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
-          </span>
-          <button class="btn btn-icon" onClick={() => shiftWeek(1)}><ChevronRight size={16} /></button>
+          {!isTechnician && (
+            <div class="filter-group">
+              <button class={`filter-btn ${tab === "list" ? "active" : ""}`} onClick={switchToList}>
+                <List size={14} /> List
+              </button>
+              <button class={`filter-btn ${tab === "board" ? "active" : ""}`} onClick={() => setTab("board")}>
+                <LayoutGrid size={14} /> Board
+              </button>
+            </div>
+          )}
+          {tab === "list" && (
+            <>
+              <button class="btn" onClick={goToday}>Today</button>
+              <button class="btn btn-icon" onClick={() => shiftWeek(-1)}><ChevronLeft size={16} /></button>
+              <span style={{ fontSize: 14, fontWeight: 600, minWidth: 200, textAlign: "center" }}>
+                {new Date(scheduleStart + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" })}
+                {" — "}
+                {new Date(scheduleEnd + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+              </span>
+              <button class="btn btn-icon" onClick={() => shiftWeek(1)}><ChevronRight size={16} /></button>
+            </>
+          )}
         </div>
       </div>
 
+      {tab === "board" && !isTechnician ? (
+        <DispatchBoard />
+      ) : (
       <div class="schedule-grid">
         {days.map((day) => {
           const dayJobs = scheduleJobs.filter((j) => j.scheduled_date === day);
@@ -86,6 +122,7 @@ export function ScheduleView() {
           );
         })}
       </div>
+      )}
     </div>
   );
 }

@@ -1,4 +1,4 @@
-export type View = "dashboard" | "schedule" | "jobs" | "customers" | "technicians" | "services" | "invoices" | "estimates" | "materials" | "brands";
+export type View = "dashboard" | "schedule" | "jobs" | "customers" | "technicians" | "services" | "invoices" | "estimates" | "materials" | "brands" | "service-agreements";
 
 export type JobStatus = "scheduled" | "confirmed" | "in_progress" | "completed" | "cancelled";
 export type Priority = "low" | "normal" | "high" | "urgent";
@@ -212,6 +212,21 @@ export interface EstimateLine {
   quantity: number;
   unit_price: number;
   total: number;
+}
+
+export type ServiceAgreementInterval = "weekly" | "monthly" | "quarterly" | "annual";
+
+export interface ServiceAgreement {
+  id: number;
+  customer_id: number;
+  brand_id: number | null;
+  service_type_id: number | null;
+  interval: ServiceAgreementInterval;
+  next_run_date: string | null;
+  active: number;
+  customer_name?: string | null;
+  brand_name?: string | null;
+  service_type_name?: string | null;
 }
 
 export interface Stats {

@@ -4,6 +4,7 @@ import type {
   Job, Customer, Technician, ServiceType, Material, Invoice, Stats, PaginatedState,
   CustomerLookup, TechnicianLookup, Priority, Brand, Estimate,
   Attachment, AttachmentEntityType, AttachmentKind, Payment, PaymentMethod,
+  ServiceAgreement,
 } from "./types";
 
 export interface CurrentUser {
@@ -145,6 +146,12 @@ export interface AppContextValue {
   scheduleStart: string;
   scheduleEnd: string;
   setScheduleRange: (start: string, end: string) => void;
+
+  // Service Agreements
+  serviceAgreements: ServiceAgreement[];
+  addServiceAgreement: (data: { customer_id: number; brand_id?: number | null; service_type_id?: number | null; interval: string; next_run_date: string; active?: number }) => Promise<void>;
+  updateServiceAgreement: (id: number, data: Partial<ServiceAgreement>) => Promise<void>;
+  deleteServiceAgreement: (id: number) => Promise<void>;
 
   // Lookups
   customerLookup: CustomerLookup[];

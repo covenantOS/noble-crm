@@ -18,6 +18,7 @@ const VIEW_ROUTES: Record<string, View> = {
   "estimates": "estimates",
   "materials": "materials",
   "brands": "brands",
+  "service-agreements": "service-agreements",
 };
 
 function parseRoute(path: string): RouteState {
