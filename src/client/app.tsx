@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "preact/hooks";
-import { Menu } from "lucide-preact";
+import { Menu, Sparkles } from "lucide-preact";
 import { AppContext } from "./context";
 import { safeCssHex } from "./format";
 import { useAppState } from "./hooks/use-app";
@@ -25,6 +25,8 @@ import { BrandList } from "./components/brand-list";
 import { ServiceAgreementList } from "./components/service-agreement-list";
 import { ErrorBanner } from "./components/error-banner";
 import { Login } from "./components/login";
+import { CommandPalette } from "./components/command-palette";
+import { NobleAssistant } from "./components/noble-assistant";
 
 export function App() {
   const isAgent = useMemo(() => {
@@ -61,8 +63,42 @@ function AuthenticatedApp({ isAgent, session }: { isAgent: boolean; session: Non
   }), [session]);
   const appState = useAppState(isAgent, navigate, currentUser);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [cmdOpen, setCmdOpen] = useState(false);
+  const [assistantOpen, setAssistantOpen] = useState(false);
   // Close the mobile drawer whenever the route changes.
   useEffect(() => { setDrawerOpen(false); }, [view, id]);
+
+  // ⌘K / Ctrl+K command palette
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const isK = e.key === "k" || e.key === "K";
+      if (isK && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        setCmdOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Demo workspace one-click reset (admin) — from Cmd-K or dashboard
+  useEffect(() => {
+    const onReset = async () => {
+      if (currentUser.role !== "admin") {
+        appState.setError("Only admins can reset the demo workspace.");
+        return;
+      }
+      if (!confirm("Reset Sunshine Painting Co (Demo)? This wipes demo data only and reseeds a full cast.")) return;
+      try {
+        const res = await appState.resetDemo();
+        appState.setActiveBrandId(res.brand_id);
+      } catch (err) {
+        appState.setError(err instanceof Error ? err.message : "Demo reset failed");
+      }
+    };
+    window.addEventListener("noble:demo-reset", onReset);
+    return () => window.removeEventListener("noble:demo-reset", onReset);
+  }, [currentUser.role]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Active account -> a SUBTLE accent only (switcher dot, active-nav tick,
   // context-bar dot). The brand's color_primary is exposed as --account-accent
@@ -149,6 +185,18 @@ function AuthenticatedApp({ isAgent, session }: { isAgent: boolean; session: Non
         </main>
       </div>
       <ErrorBanner />
+      <CommandPalette open={cmdOpen} onClose={() => setCmdOpen(false)} />
+      <NobleAssistant open={assistantOpen} onClose={() => setAssistantOpen(false)} />
+      {!assistantOpen && (
+        <button
+          class="assistant-fab"
+          onClick={() => setAssistantOpen(true)}
+          title="Noble Assistant (keyless AI)"
+          aria-label="Open Noble Assistant"
+        >
+          <Sparkles size={18} />
+        </button>
+      )}
     </AppContext.Provider>
   );
 }

@@ -41,6 +41,10 @@ export interface Env {
   TWILIO_ACCOUNT_SID?: string;
   TWILIO_AUTH_TOKEN?: string;
   TWILIO_FROM?: string;
+
+  // Optional Claude enhancer for Noble Assistant (C14). Keyless intent matcher
+  // always works; when set, future tool-use drafting can call Anthropic.
+  ANTHROPIC_API_KEY?: string;
 }
 
 // Authenticated user attached to Hono's context via the auth middleware in

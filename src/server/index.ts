@@ -8,6 +8,12 @@ import { buildDocumentPdf, type PdfLine } from "../lib/pdf.js";
 import { sendEmail, escapeHtml } from "../lib/notify.js";
 import { createInvoiceCheckout, verifyStripeWebhook } from "../lib/payments.js";
 import { ACORN_FINANCE_URL } from "../lib/business.js";
+import {
+  agentCapabilities,
+  ASSISTANT_HELP,
+  buildDigestSentences,
+  matchAssistantIntent,
+} from "../lib/intelligence.js";
 
 // defaultHook normalizes EVERY Zod request-validation failure across all
 // app.openapi routes into a clean 400 { error } shape (first issue's message),
@@ -1068,6 +1074,682 @@ app.openapi(getStats, async (c) => {
     revenue: fromCents(revenue?.total || 0),
     invoices_outstanding: invoicesOutstanding?.count || 0,
     invoices_overdue: invoicesOverdue?.count || 0,
+  }, 200);
+});
+
+// ── Owner intelligence (C3/C14 demo slice) ──────────────────────────
+// Global search, Today board, narrative digest, keyless assistant, agent
+// capabilities. Pure-code first; Claude API remains an optional enhancer.
+
+const SearchHitSchema = z.object({
+  type: z.enum(["customer", "job", "estimate", "invoice"]),
+  id: z.number().int(),
+  title: z.string(),
+  subtitle: z.string().nullable(),
+  href: z.string(),
+  brand_id: z.number().int().nullable().optional(),
+}).openapi("SearchHit");
+
+const getSearch = createRoute({
+  method: "get",
+  path: "/api/search",
+  request: {
+    query: z.object({
+      q: z.string().min(1).max(80),
+      brand_id: zBrandIdQuery,
+    }),
+  },
+  responses: {
+    200: {
+      description: "Ranked search hits",
+      content: { "application/json": { schema: z.object({
+        q: z.string(),
+        hits: z.array(SearchHitSchema),
+      }) } },
+    },
+    400: { description: "Bad request", content: { "application/json": { schema: ErrorSchema } } },
+    404: { description: "Brand not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(getSearch, async (c) => {
+  const db = getDb(c.env);
+  const q = c.req.valid("query");
+  const brandRes = await resolveBrandFilter(db, q.brand_id);
+  if (!brandRes.ok) return c.json({ error: "Brand not found" }, 404);
+  const brandFilter = brandRes.brandId;
+  const needle = q.q.trim();
+  if (!needle) return c.json({ q: needle, hits: [] }, 200);
+
+  const custBrand = brandFilter === null ? undefined : eq(schema.customers.brandId, brandFilter);
+  const jobBrand = brandFilter === null ? undefined : eq(schema.jobs.brandId, brandFilter);
+  const estBrand = brandFilter === null ? undefined : eq(schema.estimates.brandId, brandFilter);
+  const invBrand = brandFilter === null ? undefined : eq(schema.invoices.brandId, brandFilter);
+
+  const [customers, jobs, estimates, invoices] = await Promise.all([
+    db.select({
+      id: schema.customers.id,
+      name: schema.customers.name,
+      phone: schema.customers.phone,
+      city: schema.customers.city,
+      brand_id: schema.customers.brandId,
+    }).from(schema.customers).where(and(
+      or(
+        likeEscaped(schema.customers.name, needle),
+        likeEscaped(schema.customers.phone, needle),
+        likeEscaped(schema.customers.email, needle),
+        likeEscaped(schema.customers.address, needle),
+      )!,
+      custBrand,
+    )).limit(5).all(),
+    db.select({
+      id: schema.jobs.id,
+      identifier: schema.jobs.identifier,
+      address: schema.jobs.address,
+      status: schema.jobs.status,
+      customer_name: schema.customers.name,
+      brand_id: schema.jobs.brandId,
+    }).from(schema.jobs)
+      .leftJoin(schema.customers, eq(schema.jobs.customerId, schema.customers.id))
+      .where(and(
+        or(
+          likeEscaped(schema.jobs.identifier, needle),
+          likeEscaped(schema.jobs.address, needle),
+          likeEscaped(schema.customers.name, needle),
+        )!,
+        jobBrand,
+      )).limit(5).all(),
+    db.select({
+      id: schema.estimates.id,
+      identifier: schema.estimates.identifier,
+      status: schema.estimates.status,
+      total: schema.estimates.total,
+      customer_name: schema.customers.name,
+      brand_id: schema.estimates.brandId,
+    }).from(schema.estimates)
+      .leftJoin(schema.customers, eq(schema.estimates.customerId, schema.customers.id))
+      .where(and(
+        or(
+          likeEscaped(schema.estimates.identifier, needle),
+          likeEscaped(schema.customers.name, needle),
+        )!,
+        estBrand,
+      )).limit(5).all(),
+    db.select({
+      id: schema.invoices.id,
+      identifier: schema.invoices.identifier,
+      status: schema.invoices.status,
+      total: schema.invoices.total,
+      customer_name: schema.customers.name,
+      brand_id: schema.invoices.brandId,
+    }).from(schema.invoices)
+      .leftJoin(schema.customers, eq(schema.invoices.customerId, schema.customers.id))
+      .where(and(
+        or(
+          likeEscaped(schema.invoices.identifier, needle),
+          likeEscaped(schema.customers.name, needle),
+        )!,
+        invBrand,
+      )).limit(5).all(),
+  ]);
+
+  const lower = needle.toLowerCase();
+  const rank = (title: string) => {
+    const t = title.toLowerCase();
+    if (t === lower) return 0;
+    if (t.startsWith(lower)) return 1;
+    if (t.includes(lower)) return 2;
+    return 3;
+  };
+
+  type Hit = z.infer<typeof SearchHitSchema> & { _r: number };
+  const hits: Hit[] = [];
+  for (const row of customers) {
+    hits.push({
+      type: "customer", id: row.id, title: row.name,
+      subtitle: [row.phone, row.city].filter(Boolean).join(" · ") || null,
+      href: `/customers/${row.id}`, brand_id: row.brand_id, _r: rank(row.name),
+    });
+  }
+  for (const row of jobs) {
+    const title = row.identifier || `Job #${row.id}`;
+    hits.push({
+      type: "job", id: row.id, title,
+      subtitle: [row.customer_name, row.status, row.address].filter(Boolean).join(" · ") || null,
+      href: `/jobs/${row.id}`, brand_id: row.brand_id, _r: rank(title),
+    });
+  }
+  for (const row of estimates) {
+    const title = row.identifier || `Estimate #${row.id}`;
+    hits.push({
+      type: "estimate", id: row.id, title,
+      subtitle: [row.customer_name, row.status, `$${fromCents(row.total || 0).toFixed(0)}`].filter(Boolean).join(" · ") || null,
+      href: `/estimates/${row.id}`, brand_id: row.brand_id, _r: rank(title),
+    });
+  }
+  for (const row of invoices) {
+    const title = row.identifier || `Invoice #${row.id}`;
+    hits.push({
+      type: "invoice", id: row.id, title,
+      subtitle: [row.customer_name, row.status, `$${fromCents(row.total || 0).toFixed(0)}`].filter(Boolean).join(" · ") || null,
+      href: `/invoices/${row.id}`, brand_id: row.brand_id, _r: rank(title),
+    });
+  }
+  hits.sort((a, b) => a._r - b._r || a.title.localeCompare(b.title));
+  return c.json({
+    q: needle,
+    hits: hits.slice(0, 16).map(({ _r, ...h }) => h),
+  }, 200);
+});
+
+const getToday = createRoute({
+  method: "get",
+  path: "/api/today",
+  request: { query: z.object({ brand_id: zBrandIdQuery }) },
+  responses: {
+    200: {
+      description: "Owner Today board",
+      content: { "application/json": { schema: z.object({
+        date: z.string(),
+        jobs: z.array(z.object({
+          id: z.number().int(),
+          identifier: z.string().nullable(),
+          scheduled_time: z.string().nullable(),
+          status: z.string(),
+          customer_name: z.string().nullable(),
+          technician_name: z.string().nullable(),
+          address: z.string().nullable(),
+        })),
+        estimates_awaiting: z.array(z.object({
+          id: z.number().int(),
+          identifier: z.string().nullable(),
+          customer_name: z.string().nullable(),
+          total: z.number(),
+          sent_at: z.string().nullable(),
+          age_days: z.number().int(),
+        })),
+        overdue_invoices: z.array(z.object({
+          id: z.number().int(),
+          identifier: z.string().nullable(),
+          customer_name: z.string().nullable(),
+          total: z.number(),
+          due_date: z.string().nullable(),
+          days_overdue: z.number().int(),
+        })),
+        signed_overnight: z.array(z.object({
+          id: z.number().int(),
+          identifier: z.string().nullable(),
+          customer_name: z.string().nullable(),
+          total: z.number(),
+          signed_at: z.string().nullable(),
+        })),
+      }) } },
+    },
+    404: { description: "Brand not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(getToday, async (c) => {
+  const db = getDb(c.env);
+  const brandRes = await resolveBrandFilter(db, c.req.valid("query").brand_id);
+  if (!brandRes.ok) return c.json({ error: "Brand not found" }, 404);
+  const brandFilter = brandRes.brandId;
+  const today = todayInTampa();
+  const jobBrand = brandFilter === null ? undefined : eq(schema.jobs.brandId, brandFilter);
+  const estBrand = brandFilter === null ? undefined : eq(schema.estimates.brandId, brandFilter);
+  const invBrand = brandFilter === null ? undefined : eq(schema.invoices.brandId, brandFilter);
+
+  const jobs = await db.select({
+    id: schema.jobs.id,
+    identifier: schema.jobs.identifier,
+    scheduled_time: schema.jobs.scheduledTime,
+    status: schema.jobs.status,
+    customer_name: schema.customers.name,
+    technician_name: schema.technicians.name,
+    address: schema.jobs.address,
+  }).from(schema.jobs)
+    .leftJoin(schema.customers, eq(schema.jobs.customerId, schema.customers.id))
+    .leftJoin(schema.technicians, eq(schema.jobs.technicianId, schema.technicians.id))
+    .where(and(
+      eq(schema.jobs.scheduledDate, today),
+      sql`${schema.jobs.status} != 'cancelled'`,
+      jobBrand,
+    ))
+    .orderBy(asc(schema.jobs.scheduledTime))
+    .all();
+
+  // estimates have no dedicated sent_at column yet — age from created_at while status=sent
+  const estimatesAwaiting = await db.select({
+    id: schema.estimates.id,
+    identifier: schema.estimates.identifier,
+    customer_name: schema.customers.name,
+    total: schema.estimates.total,
+    sent_at: schema.estimates.createdAt,
+  }).from(schema.estimates)
+    .leftJoin(schema.customers, eq(schema.estimates.customerId, schema.customers.id))
+    .where(and(eq(schema.estimates.status, "sent"), estBrand))
+    .orderBy(asc(schema.estimates.createdAt))
+    .limit(12)
+    .all();
+
+  const overdueInvoices = await db.select({
+    id: schema.invoices.id,
+    identifier: schema.invoices.identifier,
+    customer_name: schema.customers.name,
+    total: schema.invoices.total,
+    due_date: schema.invoices.dueDate,
+    status: schema.invoices.status,
+  }).from(schema.invoices)
+    .leftJoin(schema.customers, eq(schema.invoices.customerId, schema.customers.id))
+    .where(and(
+      sql`(${schema.invoices.status} = 'overdue' OR (${schema.invoices.status} = 'sent' AND ${schema.invoices.dueDate} != '' AND ${schema.invoices.dueDate} < ${today}))`,
+      invBrand,
+    ))
+    .orderBy(asc(schema.invoices.dueDate))
+    .limit(12)
+    .all();
+
+  const signedOvernight = await db.select({
+    id: schema.estimates.id,
+    identifier: schema.estimates.identifier,
+    customer_name: schema.customers.name,
+    total: schema.estimates.total,
+    signed_at: schema.estimates.signedAt,
+  }).from(schema.estimates)
+    .leftJoin(schema.customers, eq(schema.estimates.customerId, schema.customers.id))
+    .where(and(
+      eq(schema.estimates.status, "approved"),
+      sql`${schema.estimates.signedAt} IS NOT NULL AND ${schema.estimates.signedAt} >= datetime('now', '-1 day')`,
+      estBrand,
+    ))
+    .orderBy(desc(schema.estimates.signedAt))
+    .limit(8)
+    .all();
+
+  const dayMs = 86400000;
+  const now = Date.now();
+  return c.json({
+    date: today,
+    jobs,
+    estimates_awaiting: estimatesAwaiting.map((e) => {
+      const sentMs = e.sent_at ? Date.parse(e.sent_at.replace(" ", "T") + "Z") : now;
+      const age = Math.max(0, Math.floor((now - (Number.isFinite(sentMs) ? sentMs : now)) / dayMs));
+      return {
+        id: e.id,
+        identifier: e.identifier,
+        customer_name: e.customer_name,
+        total: fromCents(e.total || 0),
+        sent_at: e.sent_at,
+        age_days: age,
+      };
+    }),
+    overdue_invoices: overdueInvoices.map((inv) => {
+      const due = inv.due_date || today;
+      const dueMs = Date.parse(due + "T12:00:00");
+      const days = Math.max(0, Math.floor((now - (Number.isFinite(dueMs) ? dueMs : now)) / dayMs));
+      return {
+        id: inv.id,
+        identifier: inv.identifier,
+        customer_name: inv.customer_name,
+        total: fromCents(inv.total || 0),
+        due_date: inv.due_date,
+        days_overdue: days,
+      };
+    }),
+    signed_overnight: signedOvernight.map((e) => ({
+      id: e.id,
+      identifier: e.identifier,
+      customer_name: e.customer_name,
+      total: fromCents(e.total || 0),
+      signed_at: e.signed_at,
+    })),
+  }, 200);
+});
+
+const getDigest = createRoute({
+  method: "get",
+  path: "/api/digest",
+  request: { query: z.object({ brand_id: zBrandIdQuery }) },
+  responses: {
+    200: {
+      description: "Narrative ops digest",
+      content: { "application/json": { schema: z.object({
+        as_of: z.string(),
+        brand_label: z.string(),
+        sentences: z.array(z.object({
+          text: z.string(),
+          href: z.string(),
+          tone: z.enum(["neutral", "good", "warn", "danger"]),
+        })),
+        claude_ready: z.boolean(),
+      }) } },
+    },
+    404: { description: "Brand not found", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+app.openapi(getDigest, async (c) => {
+  const db = getDb(c.env);
+  const brandRes = await resolveBrandFilter(db, c.req.valid("query").brand_id);
+  if (!brandRes.ok) return c.json({ error: "Brand not found" }, 404);
+  const brandFilter = brandRes.brandId;
+  const today = todayInTampa();
+  const invBrand = brandFilter === null ? undefined : eq(schema.invoices.brandId, brandFilter);
+  const estBrand = brandFilter === null ? undefined : eq(schema.estimates.brandId, brandFilter);
+  const jobBrand = brandFilter === null ? undefined : eq(schema.jobs.brandId, brandFilter);
+
+  let brandLabel = "All Noble accounts";
+  if (brandFilter !== null) {
+    const b = await db.select({ name: schema.brands.name }).from(schema.brands).where(eq(schema.brands.id, brandFilter)).get();
+    brandLabel = b?.name || brandLabel;
+  }
+
+  const collectedLast = await db.select({ total: sql<number>`COALESCE(SUM(${schema.payments.amount}), 0)` })
+    .from(schema.payments)
+    .leftJoin(schema.invoices, eq(schema.payments.invoiceId, schema.invoices.id))
+    .where(and(
+      eq(schema.payments.status, "paid"),
+      sql`${schema.payments.paidAt} IS NOT NULL AND date(${schema.payments.paidAt}) >= date('now', '-7 day')`,
+      invBrand,
+    )).get();
+  const collectedPrev = await db.select({ total: sql<number>`COALESCE(SUM(${schema.payments.amount}), 0)` })
+    .from(schema.payments)
+    .leftJoin(schema.invoices, eq(schema.payments.invoiceId, schema.invoices.id))
+    .where(and(
+      eq(schema.payments.status, "paid"),
+      sql`${schema.payments.paidAt} IS NOT NULL AND date(${schema.payments.paidAt}) >= date('now', '-14 day') AND date(${schema.payments.paidAt}) < date('now', '-7 day')`,
+      invBrand,
+    )).get();
+  const overdue = await db.select({
+    count: sql<number>`COUNT(*)`,
+    total: sql<number>`COALESCE(SUM(${schema.invoices.total}), 0)`,
+  }).from(schema.invoices)
+    .where(and(
+      sql`(${schema.invoices.status} = 'overdue' OR (${schema.invoices.status} = 'sent' AND ${schema.invoices.dueDate} != '' AND ${schema.invoices.dueDate} < ${today}))`,
+      invBrand,
+    )).get();
+  const openEst = await db.select({
+    count: sql<number>`COUNT(*)`,
+    total: sql<number>`COALESCE(SUM(${schema.estimates.total}), 0)`,
+  }).from(schema.estimates).where(and(eq(schema.estimates.status, "sent"), estBrand)).get();
+  const todayJobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs)
+    .where(and(eq(schema.jobs.scheduledDate, today), sql`${schema.jobs.status} != 'cancelled'`, jobBrand)).get();
+  const signed = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.estimates)
+    .where(and(
+      eq(schema.estimates.status, "approved"),
+      sql`${schema.estimates.signedAt} IS NOT NULL AND ${schema.estimates.signedAt} >= datetime('now', '-1 day')`,
+      estBrand,
+    )).get();
+
+  const sentences = buildDigestSentences({
+    collectedLast7DaysCents: collectedLast?.total || 0,
+    collectedPrev7DaysCents: collectedPrev?.total || 0,
+    overdueCount: overdue?.count || 0,
+    overdueCents: overdue?.total || 0,
+    openEstimatesCount: openEst?.count || 0,
+    openEstimatesCents: openEst?.total || 0,
+    todayJobsCount: todayJobs?.count || 0,
+    signedLast24h: signed?.count || 0,
+    brandLabel,
+  });
+
+  return c.json({
+    as_of: today,
+    brand_label: brandLabel,
+    sentences,
+    claude_ready: Boolean(c.env.ANTHROPIC_API_KEY),
+  }, 200);
+});
+
+const getAgentCapabilities = createRoute({
+  method: "get",
+  path: "/api/agent/capabilities",
+  responses: {
+    200: {
+      description: "Agent-oriented capability map",
+      content: { "application/json": { schema: z.object({
+        name: z.string(),
+        version: z.string(),
+        agent_mode: z.string(),
+        claude_ready: z.boolean(),
+        capabilities: z.array(z.object({
+          id: z.string(),
+          method: z.string(),
+          path: z.string(),
+          description: z.string(),
+          brand_scoped: z.boolean(),
+        })),
+      }) } },
+    },
+  },
+});
+
+app.openapi(getAgentCapabilities, async (c) => {
+  return c.json({
+    name: "Noble CRM",
+    version: "ai-first-slice-1",
+    agent_mode: "Append ?agent to any URL for automation-friendly UI",
+    claude_ready: Boolean(c.env.ANTHROPIC_API_KEY),
+    capabilities: agentCapabilities(),
+  }, 200);
+});
+
+// Plain Hono route (not openapi) — response shape varies by intent.
+app.post("/api/assistant", async (c) => {
+  const db = getDb(c.env);
+  let body: { message: string; brand_id?: string };
+  try {
+    body = z.object({
+      message: z.string().min(1).max(500),
+      brand_id: z.string().regex(/^[1-9]\d*$/).optional(),
+    }).parse(await c.req.json());
+  } catch {
+    return c.json({ error: "Invalid request" }, 400);
+  }
+  const brandRes = await resolveBrandFilter(db, body.brand_id);
+  if (!brandRes.ok) return c.json({ error: "Brand not found" }, 404);
+  const brandFilter = brandRes.brandId;
+  const intent = matchAssistantIntent(body.message);
+  const brandQ = brandFilter !== null ? `?brand_id=${brandFilter}` : "";
+  const today = todayInTampa();
+  const invBrand = brandFilter === null ? undefined : eq(schema.invoices.brandId, brandFilter);
+  const estBrand = brandFilter === null ? undefined : eq(schema.estimates.brandId, brandFilter);
+  const jobBrand = brandFilter === null ? undefined : eq(schema.jobs.brandId, brandFilter);
+
+  // Claude path is scaffolded but not required — keyless is the product.
+  const mode = c.env.ANTHROPIC_API_KEY ? "claude" as const : "keyless" as const;
+  // (Full tool-use loop lands when ANTHROPIC_API_KEY is configured; until then
+  // we always run the intent matcher so the product works without keys.)
+
+  if (intent.kind === "help" || intent.kind === "unknown") {
+    return c.json({
+      mode: "keyless",
+      intent: intent.kind,
+      reply: intent.kind === "unknown"
+        ? `I didn't catch that. Here's what I can do without an AI key:`
+        : "Noble Assistant (keyless). I can run these right now:",
+      actions: [
+        { label: "Overdue invoices", href: "/invoices", kind: "nav" },
+        { label: "Today's jobs", href: "/schedule", kind: "nav" },
+        { label: "Open estimates", href: "/estimates", kind: "nav" },
+        { label: "Money digest", href: "/", kind: "digest" },
+      ],
+      help: ASSISTANT_HELP,
+      data: intent.kind === "unknown" ? { original: intent.original } : undefined,
+    }, 200);
+  }
+
+  if (intent.kind === "navigate") {
+    return c.json({
+      mode: "keyless",
+      intent: "navigate",
+      reply: `Opening ${intent.label}.`,
+      actions: [{ label: intent.label, href: intent.path, kind: "nav" }],
+    }, 200);
+  }
+
+  if (intent.kind === "search") {
+    // Reuse search logic via internal query shape
+    const needle = intent.q;
+    const rows = await db.select({
+      id: schema.customers.id,
+      name: schema.customers.name,
+      phone: schema.customers.phone,
+    }).from(schema.customers).where(and(
+      or(
+        likeEscaped(schema.customers.name, needle),
+        likeEscaped(schema.customers.phone, needle),
+      )!,
+      brandFilter === null ? undefined : eq(schema.customers.brandId, brandFilter),
+    )).limit(5).all();
+    if (rows.length === 0) {
+      return c.json({
+        mode: "keyless",
+        intent: "search",
+        reply: `No customers matched “${needle}”.`,
+        actions: [{ label: "Open customers", href: "/customers", kind: "nav" }],
+        data: { q: needle, hits: [] },
+      }, 200);
+    }
+    return c.json({
+      mode: "keyless",
+      intent: "search",
+      reply: `Found ${rows.length} customer${rows.length === 1 ? "" : "s"} for “${needle}”.`,
+      actions: rows.map((r) => ({
+        label: r.name,
+        href: `/customers/${r.id}`,
+        kind: "customer",
+      })),
+      data: { q: needle, hits: rows },
+    }, 200);
+  }
+
+  if (intent.kind === "overdue_invoices") {
+    const rows = await db.select({
+      id: schema.invoices.id,
+      identifier: schema.invoices.identifier,
+      total: schema.invoices.total,
+      customer_name: schema.customers.name,
+    }).from(schema.invoices)
+      .leftJoin(schema.customers, eq(schema.invoices.customerId, schema.customers.id))
+      .where(and(
+        sql`(${schema.invoices.status} = 'overdue' OR (${schema.invoices.status} = 'sent' AND ${schema.invoices.dueDate} != '' AND ${schema.invoices.dueDate} < ${today}))`,
+        invBrand,
+      )).limit(8).all();
+    const sum = rows.reduce((s, r) => s + (r.total || 0), 0);
+    return c.json({
+      mode: "keyless",
+      intent: "overdue_invoices",
+      reply: rows.length
+        ? `${rows.length} overdue invoice${rows.length === 1 ? "" : "s"} totaling $${fromCents(sum).toFixed(0)}.`
+        : "No overdue invoices. AR looks clean.",
+      actions: rows.length
+        ? rows.map((r) => ({
+          label: `${r.identifier || "#" + r.id} · ${r.customer_name || "Customer"} · $${fromCents(r.total || 0).toFixed(0)}`,
+          href: `/invoices/${r.id}`,
+          kind: "invoice",
+        }))
+        : [{ label: "Invoices", href: "/invoices", kind: "nav" }],
+      data: { count: rows.length, total: fromCents(sum) },
+    }, 200);
+  }
+
+  if (intent.kind === "today_jobs") {
+    const rows = await db.select({
+      id: schema.jobs.id,
+      identifier: schema.jobs.identifier,
+      scheduled_time: schema.jobs.scheduledTime,
+      customer_name: schema.customers.name,
+      status: schema.jobs.status,
+    }).from(schema.jobs)
+      .leftJoin(schema.customers, eq(schema.jobs.customerId, schema.customers.id))
+      .where(and(eq(schema.jobs.scheduledDate, today), sql`${schema.jobs.status} != 'cancelled'`, jobBrand))
+      .orderBy(asc(schema.jobs.scheduledTime))
+      .all();
+    return c.json({
+      mode: "keyless",
+      intent: "today_jobs",
+      reply: rows.length
+        ? `${rows.length} job${rows.length === 1 ? "" : "s"} on the board today.`
+        : "No jobs scheduled for today.",
+      actions: rows.length
+        ? rows.map((r) => ({
+          label: `${r.scheduled_time || "—"} · ${r.identifier || "#" + r.id} · ${r.customer_name || "Customer"}`,
+          href: `/jobs/${r.id}`,
+          kind: "job",
+        }))
+        : [{ label: "Schedule", href: "/schedule", kind: "nav" }],
+      data: { date: today, count: rows.length },
+    }, 200);
+  }
+
+  if (intent.kind === "open_estimates" || intent.kind === "awaiting_signature") {
+    const rows = await db.select({
+      id: schema.estimates.id,
+      identifier: schema.estimates.identifier,
+      total: schema.estimates.total,
+      customer_name: schema.customers.name,
+      status: schema.estimates.status,
+    }).from(schema.estimates)
+      .leftJoin(schema.customers, eq(schema.estimates.customerId, schema.customers.id))
+      .where(and(eq(schema.estimates.status, "sent"), estBrand))
+      .limit(10).all();
+    const sum = rows.reduce((s, r) => s + (r.total || 0), 0);
+    return c.json({
+      mode: "keyless",
+      intent: intent.kind,
+      reply: rows.length
+        ? `${rows.length} estimate${rows.length === 1 ? "" : "s"} awaiting a response ($${fromCents(sum).toFixed(0)} pipeline).`
+        : "No open estimates waiting on customers.",
+      actions: rows.length
+        ? rows.map((r) => ({
+          label: `${r.identifier || "#" + r.id} · ${r.customer_name || "Customer"} · $${fromCents(r.total || 0).toFixed(0)}`,
+          href: `/estimates/${r.id}`,
+          kind: "estimate",
+        }))
+        : [{ label: "Estimates", href: "/estimates", kind: "nav" }],
+      data: { count: rows.length, total: fromCents(sum) },
+    }, 200);
+  }
+
+  if (intent.kind === "digest") {
+    // Inline thin digest for chat (full card uses GET /api/digest).
+    const overdue = await db.select({ count: sql<number>`COUNT(*)`, total: sql<number>`COALESCE(SUM(${schema.invoices.total}), 0)` })
+      .from(schema.invoices)
+      .where(and(
+        sql`(${schema.invoices.status} = 'overdue' OR (${schema.invoices.status} = 'sent' AND ${schema.invoices.dueDate} != '' AND ${schema.invoices.dueDate} < ${today}))`,
+        invBrand,
+      )).get();
+    const openEst = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.estimates)
+      .where(and(eq(schema.estimates.status, "sent"), estBrand)).get();
+    const todayJobs = await db.select({ count: sql<number>`COUNT(*)` }).from(schema.jobs)
+      .where(and(eq(schema.jobs.scheduledDate, today), sql`${schema.jobs.status} != 'cancelled'`, jobBrand)).get();
+    const sentences = buildDigestSentences({
+      collectedLast7DaysCents: 0,
+      collectedPrev7DaysCents: 0,
+      overdueCount: overdue?.count || 0,
+      overdueCents: overdue?.total || 0,
+      openEstimatesCount: openEst?.count || 0,
+      openEstimatesCents: 0,
+      todayJobsCount: todayJobs?.count || 0,
+      signedLast24h: 0,
+      brandLabel: "Noble",
+    });
+    return c.json({
+      mode: "keyless",
+      intent: "digest",
+      reply: sentences.map((s) => s.text).join(" "),
+      actions: sentences.map((s) => ({ label: s.text.slice(0, 48) + (s.text.length > 48 ? "…" : ""), href: s.href, kind: "digest" })),
+      data: { sentences, brand_query: brandQ },
+    }, 200);
+  }
+
+  return c.json({
+    mode,
+    intent: "unknown",
+    reply: "Something unexpected hit the assistant router.",
+    actions: [],
+    help: ASSISTANT_HELP,
   }, 200);
 });
 

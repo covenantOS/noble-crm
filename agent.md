@@ -1,42 +1,66 @@
-# Field Service Scheduler
+# Noble CRM — Agent Surface
 
-A scheduling and dispatch app for field service businesses — pest control, HVAC, plumbing, cleaning, landscaping, and more.
+Field-service CRM for Noble Tampa (multi-account: Westchase Painting, Tampa Kitchen Cabinets, Sunshine Demo, etc.).
 
-## Features
-- Job scheduling with date/time, priority, and status workflow (pending → confirmed → in progress → completed)
-- Weekly calendar view with technician color coding
-- Customer management with contact info, addresses, and service history
-- Technician dispatch and availability tracking
-- Service type catalog with default pricing and durations
-- Invoicing with draft/sent/paid/overdue tracking and line items
-- Materials tracking per job with costs and inventory
-- Job checklists for inspections and task lists
-- Dashboard with KPIs (today's schedule, upcoming jobs, revenue, outstanding invoices)
+**Live:** Cloudflare Worker `noble-crm` · GitHub `covenantOS/noble-crm`  
+**Agent UI:** append `?agent` to any path for large targets and always-visible actions.
 
-## When to use this template
-Use this template when the user wants to:
-- Schedule and dispatch field technicians or service workers
-- Manage a service business (pest control, HVAC, plumbing, cleaning, landscaping, electrical, pool service, etc.)
-- Track jobs, customers, and invoices for a field service operation
-- Build an alternative to PestPac, ServiceTitan, Jobber, Housecall Pro, or Fieldwork
+## Auth
 
-## Customization guide
+Session cookie via better-auth (`/api/auth/*`). Most `/api/*` routes require a signed-in user. Roles: `admin` | `office` | `estimator` | `technician` | `pending`.
 
-When customizing for a specific business vertical:
+Brand scope: pass `?brand_id=<id>` on list/stats/intelligence routes. Omit for All Accounts.
 
-**Terminology** — adapt labels to the industry:
-- "Technician" → "Stylist", "Cleaner", "Inspector", "Plumber", etc.
-- "Job" → "Appointment", "Service Call", "Visit", "Work Order"
-- "Service Type" → keep as-is or rename to "Treatment", "Service", "Package"
+## Capability map
 
-**Service types** — replace the default seed data in `schema.sql` with industry-specific services:
-- Pest control: General Pest Treatment, Termite Inspection, Rodent Control, Mosquito Spray, Bed Bug Treatment
-- HVAC: AC Repair, Furnace Installation, Duct Cleaning, Maintenance Plan, Emergency Service
-- Plumbing: Drain Cleaning, Pipe Repair, Water Heater Install, Sewer Inspection, Leak Detection
-- Cleaning: House Cleaning, Deep Clean, Move-in/Move-out, Carpet Cleaning, Window Washing
+`GET /api/agent/capabilities` — machine-readable list of actions.
 
-**Branding** — update the sidebar title, page headings, and any hardcoded company references to use the customer's company name.
+### Owner intelligence (AI-first slice)
 
-**Dashboard** — adjust KPI labels if needed (e.g. "Treatments today" instead of "Jobs today").
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/search?q=` | Global search: customers, jobs, estimates, invoices |
+| GET | `/api/today` | Today board: jobs, awaiting estimates, overdue AR, signed overnight |
+| GET | `/api/digest` | Narrative money/ops sentences |
+| POST | `/api/assistant` | Keyless intent assistant `{ message, brand_id? }` |
+| GET | `/api/agent/capabilities` | This surface |
 
-**Priority levels** — the default priorities (low, normal, high, urgent) work for most verticals. Only change if the business uses different terminology.
+### Core CRUD (brand-scoped lists)
+
+- `GET/POST /api/customers`, `GET/PUT/DELETE /api/customers/{id}`
+- `GET/POST /api/jobs`, `GET/PUT/DELETE /api/jobs/{id}` (+ notes, crew, checklist, materials, review-request)
+- `GET/POST /api/estimates`, estimate lines/rooms/surfaces, convert, send, deposit
+- `GET/POST /api/invoices`, payments, lines
+- `GET /api/stats` — KPIs
+- `GET /api/schedule` — week board
+- Brands, technicians, service types, materials, products, service agreements
+
+### Public (token-gated, no session)
+
+- `GET /api/public/estimates/{token}` · accept · decline · pdf
+- Customer-facing HTML under public estimate routes
+
+### Demo
+
+- `GET /api/demo/status`
+- `POST /api/demo/reset` — **admin only**; wipes Sunshine Painting demo brand data and reseeds
+
+## UI agent affordances
+
+- **⌘K / Ctrl+K** — command palette (search + jump actions)
+- **Assistant FAB** — bottom-right keyless assistant
+- **Owner brief** — dashboard narrative digest
+- **`?agent`** — automation-friendly chrome
+
+## Assistant intents (keyless)
+
+`overdue invoices` · `jobs today` · `open estimates` · `digest` · `find {name}` · `go to schedule|customers|invoices|estimates|jobs`
+
+When `ANTHROPIC_API_KEY` is set as a Worker secret, `claude_ready` flips true on digest/capabilities (full tool-use drafting is the next enhancer step; keyless remains the default product path).
+
+## Conventions
+
+- Money: integer **cents** in DB; API often dollars at the edge via `fromCents`
+- Timezone for "today": **America/New_York** (Tampa)
+- Deploy: push to `main` (Git-connected worker). Prefer `pnpm db:migrate:remote` before schema-dependent pushes
+- Do not `wrangler deploy` for production unless explicitly requested
